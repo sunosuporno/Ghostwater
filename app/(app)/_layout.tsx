@@ -34,6 +34,13 @@ export default function AppLayout() {
             tabBarIcon: ({ color }) => <TabBarIcon name="home" color={color} />,
           }}
         />
+        <Tabs.Screen
+          name="trading"
+          options={{
+            title: 'Margin',
+            tabBarIcon: ({ color }) => <TabBarIcon name="line-chart" color={color} />,
+          }}
+        />
       </Tabs>
     </AuthBoundary>
   );
