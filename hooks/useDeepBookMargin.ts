@@ -229,7 +229,7 @@ export function useOhlcv(
           setWindowStart((prev) => prev + (merged.length - current.length));
         } else {
           setCandles(list);
-          setWindowStart(0);
+          setWindowStart(Math.max(0, list.length - displayLimit));
         }
       })
       .catch((e) => {
@@ -241,18 +241,6 @@ export function useOhlcv(
         setLoading(false);
       });
   }, [poolName, interval, fetchLimit, displayLimit]);
-
-  const clampWindowStart = useCallback(
-    (start: number) => Math.max(0, Math.min(start, Math.max(0, candles.length - displayLimit))),
-    [candles.length, displayLimit]
-  );
-
-  const panWindow = useCallback(
-    (delta: number) => {
-      setWindowStart((prev) => clampWindowStart(prev + delta));
-    },
-    [clampWindowStart]
-  );
 
   const panToLatest = useCallback(() => {
     setWindowStart(Math.max(0, candles.length - displayLimit));
@@ -321,10 +309,8 @@ export function useOhlcv(
     error,
     refetch,
     loadOlder,
-    panWindow,
     panToLatest,
     setWindowStartClamped,
-    canPanLeft: windowStart > 0,
     canPanRight: windowStart + displayLimit < candles.length,
     displayLimit,
   };

@@ -86,11 +86,9 @@ export default function PairDetailScreen() {
     loadingOlder: ohlcvLoadingOlder,
     error: ohlcvError,
     loadOlder: ohlcvLoadOlder,
-    panWindow,
     panToLatest,
     setWindowStartClamped,
     windowStart,
-    canPanLeft,
     canPanRight,
   } = useOhlcv(decodedPoolName, {
     interval: chartInterval,
@@ -98,17 +96,6 @@ export default function PairDetailScreen() {
     fetchLimit: CHART_FETCH_LIMIT,
     refreshIntervalMs: CHART_POLL_MS,
   });
-
-  const initialWindowStartRef = useRef(0);
-  const handlePanStart = useCallback(() => {
-    initialWindowStartRef.current = windowStart;
-  }, [windowStart]);
-  const handlePanMove = useCallback(
-    (deltaCandles: number) => {
-      setWindowStartClamped(initialWindowStartRef.current - deltaCandles);
-    },
-    [setWindowStartClamped]
-  );
 
   useEffect(() => {
     if (__DEV__ && decodedPoolName) {
@@ -253,17 +240,12 @@ export default function PairDetailScreen() {
           loadingOlder={ohlcvLoadingOlder}
           error={ohlcvError}
           candleLimit={CHART_DISPLAY_LIMIT}
-          atLeftEdge={windowStart === 0}
           canGoToLatest={canPanRight}
           onGoToLatest={panToLatest}
           totalCandles={allCandles.length}
           windowStart={windowStart}
           onScrollbarChange={setWindowStartClamped}
           onReachedStart={ohlcvLoadOlder}
-          onPanStart={handlePanStart}
-          onPanMove={handlePanMove}
-          onPanLeft={() => (canPanLeft ? panWindow(-CHART_DISPLAY_LIMIT) : ohlcvLoadOlder())}
-          onPanRight={() => canPanRight && panWindow(CHART_DISPLAY_LIMIT)}
         />
       </View>
 

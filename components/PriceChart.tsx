@@ -15,11 +15,6 @@ const PADDING = { top: 16, right: 12, bottom: 28, left: 52 };
 const RIGHT_LABEL_MARGIN = 44;
 const Y_TICKS = 5;
 const X_TICKS = 4;
-/** Min horizontal drag (px) to trigger load older when at left edge. */
-const PAN_LOAD_OLDER_THRESHOLD = 60;
-/** 1 = full-width drag pans one screen; lower = more responsive (less swipe needed). */
-const PAN_SENSITIVITY = 1;
-
 interface PriceChartProps {
   candles: OhlcvCandle[];
   interval?: OhlcvInterval;
@@ -29,11 +24,10 @@ interface PriceChartProps {
   loadingOlder?: boolean;
   error?: string | null;
   candleLimit?: number;
-  atLeftEdge?: boolean;
   /** When true, show "Latest" button to jump back to present. */
   canGoToLatest?: boolean;
   onGoToLatest?: () => void;
-  /** Total candles (all loaded). When > candleLimit, show bottom scrollbar and disable chart drag. */
+  /** Total candles (all loaded). When > candleLimit, show bottom scrollbar. */
   totalCandles?: number;
   /** Current window start index (for scrollbar thumb position). */
   windowStart?: number;
@@ -41,10 +35,6 @@ interface PriceChartProps {
   onScrollbarChange?: (start: number) => void;
   /** Called when user scrolls to the left end (oldest data). Use to fetch more older data. */
   onReachedStart?: () => void;
-  onPanStart?: () => void;
-  onPanMove?: (deltaCandles: number) => void;
-  onPanLeft?: () => void;
-  onPanRight?: () => void;
 }
 
 function formatPriceAxis(value: number): string {
@@ -78,17 +68,12 @@ export function PriceChart({
   loadingOlder,
   error,
   candleLimit = 168,
-  atLeftEdge = false,
   canGoToLatest = false,
   onGoToLatest,
   totalCandles = 0,
   windowStart: windowStartProp = 0,
   onScrollbarChange,
   onReachedStart,
-  onPanStart,
-  onPanMove,
-  onPanLeft,
-  onPanRight,
 }: PriceChartProps) {
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? 'light'];
@@ -96,42 +81,7 @@ export function PriceChart({
   const lineColor = colors.tint;
 
   const useScrollbar = totalCandles > candleLimit && typeof onScrollbarChange === 'function';
-  const hasPan = !useScrollbar && !!(onPanStart || onPanMove || onPanLeft || onPanRight);
   const trackLayoutRef = useRef<{ x: number; width: number } | null>(null);
-  const chartPlotWidth = width - RIGHT_LABEL_MARGIN - PADDING.left - PADDING.right;
-  const lastDeltaRef = useRef(0);
-  const panResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => hasPan,
-        onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 5,
-        onPanResponderGrant: () => {
-          lastDeltaRef.current = 0;
-          onPanStart?.();
-        },
-        onPanResponderMove: (_, g) => {
-          if (loadingOlder || !onPanMove || chartPlotWidth <= 0) return;
-          const deltaCandles = Math.round((g.dx * candleLimit) / (chartPlotWidth * PAN_SENSITIVITY));
-          if (deltaCandles !== lastDeltaRef.current) {
-            lastDeltaRef.current = deltaCandles;
-            onPanMove(deltaCandles);
-          }
-        },
-        onPanResponderRelease: (_, g) => {
-          const dx = g.dx;
-          if (chartPlotWidth > 0 && onPanMove) {
-            const deltaCandles = Math.round((dx * candleLimit) / (chartPlotWidth * PAN_SENSITIVITY));
-            onPanMove(deltaCandles);
-          }
-          if (!loadingOlder) {
-            if (dx >= PAN_LOAD_OLDER_THRESHOLD && atLeftEdge && onPanLeft) onPanLeft();
-            else if (dx <= -PAN_LOAD_OLDER_THRESHOLD && onPanRight) onPanRight();
-          }
-        },
-      }),
-    [hasPan, onPanStart, onPanMove, onPanLeft, onPanRight, loadingOlder, atLeftEdge, candleLimit, chartPlotWidth]
-  );
-
   const scrollbarTrackRef = useRef<View>(null);
   const scrollbarPanResponder = useMemo(
     () =>
@@ -274,7 +224,7 @@ export function PriceChart({
   const yTicksHighToLow = [...yTicks].reverse();
 
   return (
-    <View style={[styles.wrapper, { width: contentWidth }]} {...(hasPan ? panResponder.panHandlers : {})}>
+    <View style={[styles.wrapper, { width: contentWidth }]}>
       {loadingOlder ? (
         <View style={[styles.loadingOlderBar, { backgroundColor: colors.tabIconDefault }]}>
           <Text style={[styles.loadingOlderText, { color: colors.text }]}>Loading older…</Text>
