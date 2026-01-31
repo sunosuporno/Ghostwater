@@ -2,6 +2,7 @@ import {
   useEmbeddedEthereumWallet,
   usePrivy,
 } from '@privy-io/expo';
+import { useCreateWallet } from '@privy-io/expo/extended-chains';
 import { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
@@ -20,15 +21,36 @@ function truncateAddress(address: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
+/** Find existing Sui wallet address from user's linked accounts (API may use snake_case or camelCase). */
+function getSuiAddressFromUser(user: { linked_accounts?: Array<{ type?: string; chain_type?: string; address?: string }>; linkedAccounts?: Array<{ type?: string; chainType?: string; address?: string }> } | null): string | null {
+  if (!user) return null;
+  const accounts = user.linked_accounts ?? user.linkedAccounts ?? [];
+  for (const a of accounts) {
+    const type = a.type;
+    const chain = (a as { chain_type?: string; chainType?: string }).chain_type ?? (a as { chainType?: string }).chainType;
+    if (type === 'wallet' && (chain === 'sui' || chain === 'Sui')) return (a as { address?: string }).address ?? null;
+  }
+  return null;
+}
+
 export default function HomeScreen() {
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? 'light'];
   const { user, logout } = usePrivy();
   const { wallets, create } = useEmbeddedEthereumWallet();
+  const { createWallet: createSuiWallet } = useCreateWallet();
+
+  // Ethereum wallet state (kept for future use, not shown in UI)
   const [address, setAddress] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [createError, setCreateError] = useState<string | null>(null);
 
+  // Sui wallet state (shown in UI)
+  const [suiAddress, setSuiAddress] = useState<string | null>(null);
+  const [suiLoading, setSuiLoading] = useState(true);
+  const [suiError, setSuiError] = useState<string | null>(null);
+
+  // Ethereum: create / fetch address (code kept, not displayed)
   useEffect(() => {
     let cancelled = false;
     setCreateError(null);
@@ -66,15 +88,49 @@ export default function HomeScreen() {
     };
   }, [wallets.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Sui: get existing or create, then show address
+  useEffect(() => {
+    let cancelled = false;
+    setSuiError(null);
+
+    const run = async () => {
+      const existing = getSuiAddressFromUser(user);
+      if (existing) {
+        if (!cancelled) {
+          setSuiAddress(existing);
+          setSuiLoading(false);
+        }
+        return;
+      }
+
+      try {
+        const { wallet } = await createSuiWallet({ chainType: 'sui' });
+        if (!cancelled && wallet?.address) setSuiAddress(wallet.address);
+      } catch (err) {
+        if (!cancelled) {
+          setSuiError(err instanceof Error ? err.message : 'Failed to create Sui wallet');
+        }
+      }
+      if (!cancelled) setSuiLoading(false);
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleLogout = useCallback(() => {
     logout();
   }, [logout]);
 
-  if (loading && !address) {
+  const showSuiLoading = suiLoading && !suiAddress && !suiError;
+
+  if (showSuiLoading) {
     return (
       <View style={styles.centered}>
         <ActivityIndicator size="large" color={colors.tint} />
-        <Text style={styles.loadingText}>Setting up your wallet...</Text>
+        <Text style={styles.loadingText}>Setting up your Sui wallet...</Text>
       </View>
     );
   }
@@ -91,18 +147,18 @@ export default function HomeScreen() {
       </Text>
 
       <View style={styles.card}>
-        <Text style={styles.cardLabel}>Your wallet address</Text>
-        {createError ? (
-          <Text style={styles.error}>{createError}</Text>
-        ) : address ? (
+        <Text style={styles.cardLabel}>Your Sui wallet address</Text>
+        {suiError ? (
+          <Text style={styles.error}>{suiError}</Text>
+        ) : suiAddress ? (
           <>
             <Text style={styles.address} selectable>
-              {address}
+              {suiAddress}
             </Text>
-            <Text style={styles.addressShort}>{truncateAddress(address)}</Text>
+            <Text style={styles.addressShort}>{truncateAddress(suiAddress)}</Text>
           </>
         ) : (
-          <Text style={styles.muted}>No wallet yet</Text>
+          <Text style={styles.muted}>No Sui wallet yet</Text>
         )}
       </View>
 
