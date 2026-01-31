@@ -69,6 +69,10 @@ export function getTradingViewChartHtml(w: number, h: number): string {
           if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', message: String(e && e.message) }));
         }
       };
+      if (window.__chartCandles && window.__chartCandles.length) {
+        window.updateChart(window.__chartCandles);
+        window.__chartCandles = null;
+      }
       if (window.ReactNativeWebView) {
         window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'chartReady' }));
       }

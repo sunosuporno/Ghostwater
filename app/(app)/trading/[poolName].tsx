@@ -1,6 +1,5 @@
 import { useLocalSearchParams, useNavigation } from 'expo-router';
-import { useEffect } from 'react';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -14,7 +13,7 @@ import { Text } from '@/components/Themed';
 
 import Colors from '@/constants/Colors';
 import { useColorScheme } from '@/components/useColorScheme';
-import { TradingViewChart } from '@/components/TradingViewChart';
+import { PriceChart } from '@/components/PriceChart';
 import {
   collateralUsdFromState,
   debtUsdFromState,
@@ -26,13 +25,19 @@ import {
   useStoredMarginManager,
   useTicker,
 } from '@/hooks/useDeepBookMargin';
-import { poolNameFromSymbols, type MarginManagerInfo } from '@/lib/deepbook-indexer';
+import { debugFetchOhlcv, poolNameFromSymbols, type MarginManagerInfo, type OhlcvCandle, type OhlcvInterval } from '@/lib/deepbook-indexer';
 import type { StoredMarginManager } from '@/lib/margin-manager-storage';
 import { getSuiAddressFromUser } from '@/lib/sui';
 import { usePrivy } from '@privy-io/expo';
 
 const PRICE_POLL_MS = 5000;
 const CHART_POLL_MS = 5000;
+
+const CHART_INTERVALS: OhlcvInterval[] = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'];
+/** Candles shown in chart (smaller = smoother pan). */
+const CHART_DISPLAY_LIMIT = 100;
+/** Candles fetched on load/poll (buffer for swipes without data lag). */
+const CHART_FETCH_LIMIT = 200;
 
 function poolLabel(info: MarginManagerInfo): string {
   return `${info.base_asset_symbol}/${info.quote_asset_symbol}`;
@@ -64,11 +69,54 @@ export default function PairDetailScreen() {
   const { ticker } = useTicker(PRICE_POLL_MS);
   const livePrice = decodedPoolName ? ticker[decodedPoolName]?.last_price : undefined;
 
-  const { candles, loading: ohlcvLoading, error: ohlcvError } = useOhlcv(decodedPoolName, {
-    interval: '1h',
-    limit: 168,
+  const prevPriceRef = useRef<number | null>(null);
+  const priceDirection = useMemo(() => {
+    if (typeof livePrice !== 'number') return null;
+    const prev = prevPriceRef.current;
+    const dir = prev === null ? null : livePrice > prev ? 'up' : livePrice < prev ? 'down' : null;
+    prevPriceRef.current = livePrice;
+    return dir;
+  }, [livePrice]);
+
+  const [chartInterval, setChartInterval] = useState<OhlcvInterval>('1m');
+  const {
+    candles,
+    allCandles,
+    loading: ohlcvLoading,
+    loadingOlder: ohlcvLoadingOlder,
+    error: ohlcvError,
+    loadOlder: ohlcvLoadOlder,
+    panWindow,
+    panToLatest,
+    setWindowStartClamped,
+    windowStart,
+    canPanLeft,
+    canPanRight,
+  } = useOhlcv(decodedPoolName, {
+    interval: chartInterval,
+    displayLimit: CHART_DISPLAY_LIMIT,
+    fetchLimit: CHART_FETCH_LIMIT,
     refreshIntervalMs: CHART_POLL_MS,
   });
+
+  const initialWindowStartRef = useRef(0);
+  const handlePanStart = useCallback(() => {
+    initialWindowStartRef.current = windowStart;
+  }, [windowStart]);
+  const handlePanMove = useCallback(
+    (deltaCandles: number) => {
+      setWindowStartClamped(initialWindowStartRef.current - deltaCandles);
+    },
+    [setWindowStartClamped]
+  );
+
+  useEffect(() => {
+    if (__DEV__ && decodedPoolName) {
+      debugFetchOhlcv(decodedPoolName, { interval: '1m', limit: 10 }).catch((e) =>
+        console.warn('[OHLCV debug] dummy call failed', e)
+      );
+    }
+  }, [decodedPoolName]);
 
   const { pools } = useMarginManagersInfo();
   const poolInfoForPair = useMemo(() => {
@@ -159,7 +207,13 @@ export default function PairDetailScreen() {
         <Text style={styles.cardLabel}>{displayPoolLabel}</Text>
         <View style={styles.row}>
           <Text style={styles.muted}>Price (live)</Text>
-          <Text style={styles.value}>
+          <Text
+            style={[
+              styles.value,
+              priceDirection === 'up' && styles.priceUp,
+              priceDirection === 'down' && styles.priceDown,
+            ]}
+          >
             {typeof livePrice === 'number'
               ? livePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })
               : '—'}
@@ -168,8 +222,49 @@ export default function PairDetailScreen() {
       </View>
 
       <View style={styles.card}>
-        <Text style={styles.cardLabel}>Chart (TradingView)</Text>
-        <TradingViewChart candles={candles} loading={ohlcvLoading} error={ohlcvError} />
+        <Text style={styles.cardLabel}>Chart</Text>
+        <View style={[styles.intervalRow, { borderColor: colors.tabIconDefault }]}>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+            {CHART_INTERVALS.map((int) => (
+              <Pressable
+                key={int}
+                onPress={() => setChartInterval(int)}
+                style={[
+                  styles.intervalButton,
+                  chartInterval === int && { backgroundColor: colors.tint },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.intervalButtonText,
+                    { color: chartInterval === int ? colors.background : colors.text },
+                  ]}
+                >
+                  {int.toUpperCase()}
+                </Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+        </View>
+        <PriceChart
+          candles={candles}
+          interval={chartInterval}
+          loading={ohlcvLoading}
+          loadingOlder={ohlcvLoadingOlder}
+          error={ohlcvError}
+          candleLimit={CHART_DISPLAY_LIMIT}
+          atLeftEdge={windowStart === 0}
+          canGoToLatest={canPanRight}
+          onGoToLatest={panToLatest}
+          totalCandles={allCandles.length}
+          windowStart={windowStart}
+          onScrollbarChange={setWindowStartClamped}
+          onReachedStart={ohlcvLoadOlder}
+          onPanStart={handlePanStart}
+          onPanMove={handlePanMove}
+          onPanLeft={() => (canPanLeft ? panWindow(-CHART_DISPLAY_LIMIT) : ohlcvLoadOlder())}
+          onPanRight={() => canPanRight && panWindow(CHART_DISPLAY_LIMIT)}
+        />
       </View>
 
       {!suiAddress && (
@@ -371,9 +466,14 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(128,128,128,0.3)',
   },
-  cardLabel: { fontSize: 12, fontWeight: '600', opacity: 0.8, marginBottom: 8, textTransform: 'uppercase' },
+  cardLabel: { fontSize: 11, fontWeight: '700', letterSpacing: 0.8, opacity: 0.85, marginBottom: 10, textTransform: 'uppercase' },
+  intervalRow: { flexDirection: 'row', marginBottom: 12, paddingVertical: 4 },
+  intervalButton: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, marginRight: 6, minWidth: 40, alignItems: 'center' },
+  intervalButtonText: { fontSize: 12, fontWeight: '600' },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
   value: { fontSize: 16, fontWeight: '600' },
+  priceUp: { color: '#22c55e' },
+  priceDown: { color: '#ef4444' },
   muted: { fontSize: 14, opacity: 0.7 },
   healthOk: { color: '#22c55e' },
   riskWarning: { color: '#ef4444' },

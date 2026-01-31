@@ -23,7 +23,7 @@ import {
   setStoredMarginManager,
   type StoredMarginManager,
 } from '@/lib/margin-manager-storage';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 const HISTORY_LIMIT = 20;
 
@@ -131,39 +131,203 @@ export function usePoolPrice(
   return { price, symbols, loading, error, refetch };
 }
 
-/** Fetch OHLCV candlestick data for a DeepBookV3 pool. Polls for live chart updates. */
+/** Normalize ts to seconds; API can return ms (>= 1e12) or seconds. */
+function tsToSeconds(ts: number): number {
+  return ts >= 1e12 ? ts / 1000 : ts;
+}
+
+/** Log OHLCV response for debugging: request params, candle count, first/last timestamps, span and gap; logs every candle. */
+function logOhlcvResponse(
+  poolName: string,
+  interval: OhlcvInterval,
+  limit: number,
+  candles: OhlcvCandle[]
+) {
+  if (!__DEV__ || !candles.length) return;
+  const sorted = [...candles].sort((a, b) => a[0] - b[0]);
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const tsFirst = first[0];
+  const tsLast = last[0];
+  const spanSec = tsToSeconds(tsLast) - tsToSeconds(tsFirst);
+  const gapSec = sorted.length > 1 ? spanSec / (sorted.length - 1) : 0;
+  console.log('[OHLCV] request', { poolName, interval, limit });
+  console.log('[OHLCV] response', {
+    candleCount: candles.length,
+    firstTs: tsFirst,
+    lastTs: tsLast,
+    spanSeconds: Math.round(spanSec),
+    spanMinutes: (spanSec / 60).toFixed(1),
+    spanHours: (spanSec / 3600).toFixed(1),
+    gapBetweenCandlesSeconds: gapSec.toFixed(1),
+    gapBetweenCandlesMinutes: (gapSec / 60).toFixed(2),
+  });
+  console.log('[OHLCV] all candles (sorted by ts, [ts, open, high, low, close, volume]):', sorted);
+}
+
+/** Candle timestamp to API time: indexer may expect seconds (10 digits) or ms (13 digits). We pass ms when ts is ms. */
+function candleTsForEndTime(ts: number): number {
+  return ts >= 1e12 ? ts : ts * 1000;
+}
+
+/** Chunk size when loading older candles on swipe (keeps fetches small and smooth). */
+const OHLCV_LOAD_OLDER_CHUNK = 100;
+
+/** Fetch OHLCV candlestick data for a DeepBookV3 pool. Polls for live chart updates. Ignores stale responses (e.g. 1h overwriting 1m). */
 export function useOhlcv(
   poolName: string | null,
-  params: { interval?: OhlcvInterval; limit?: number; refreshIntervalMs?: number } = {}
+  params: {
+    interval?: OhlcvInterval;
+    /** How many candles to show in the chart (window size). Default 100 for smooth panning. */
+    displayLimit?: number;
+    /** How many to fetch on initial load and poll. Default 200 so we have buffer for swipes. */
+    fetchLimit?: number;
+    refreshIntervalMs?: number;
+  } = {}
 ) {
-  const { interval = '1h', limit = 168, refreshIntervalMs = CHART_POLL_MS } = params;
+  const {
+    interval = '1m',
+    displayLimit = 100,
+    fetchLimit = 200,
+    refreshIntervalMs = CHART_POLL_MS,
+  } = params;
   const [candles, setCandles] = useState<OhlcvCandle[]>([]);
+  const [windowStart, setWindowStart] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
+  const candlesRef = useRef<OhlcvCandle[]>([]);
+  const loadingOlderRef = useRef(false);
+  candlesRef.current = candles;
+  loadingOlderRef.current = loadingOlder;
+
+  const visibleCandles = useMemo(() => {
+    const sorted = [...candles].sort((a, b) => a[0] - b[0]);
+    const start = Math.max(0, Math.min(windowStart, Math.max(0, sorted.length - displayLimit)));
+    return sorted.slice(start, start + displayLimit);
+  }, [candles, windowStart, displayLimit]);
 
   const refetch = useCallback((isInitial = false) => {
     if (!poolName) return;
+    const id = ++requestIdRef.current;
     if (isInitial) setLoading(true);
-    fetchOhlcv(poolName, { interval, limit })
-      .then((res) => setCandles(res.candles ?? []))
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load chart'))
-      .finally(() => setLoading(false));
-  }, [poolName, interval, limit]);
+    fetchOhlcv(poolName, { interval, limit: fetchLimit })
+      .then((res) => {
+        if (id !== requestIdRef.current) return;
+        if (loadingOlderRef.current) return;
+        const list = res.candles ?? [];
+        if (isInitial && __DEV__) logOhlcvResponse(poolName, interval, fetchLimit, list);
+        const current = candlesRef.current;
+        if (current.length > displayLimit && list.length > 0) {
+          const minNew = Math.min(...list.map((c) => c[0]));
+          const older = current.filter((c) => c[0] < minNew);
+          const byTs = new Map<number, OhlcvCandle>();
+          [...older, ...list].forEach((c) => byTs.set(c[0], c));
+          const merged = Array.from(byTs.values()).sort((a, b) => a[0] - b[0]);
+          setCandles(merged);
+          setWindowStart((prev) => prev + (merged.length - current.length));
+        } else {
+          setCandles(list);
+          setWindowStart(0);
+        }
+      })
+      .catch((e) => {
+        if (id !== requestIdRef.current) return;
+        setError(e instanceof Error ? e.message : 'Failed to load chart');
+      })
+      .finally(() => {
+        if (id !== requestIdRef.current) return;
+        setLoading(false);
+      });
+  }, [poolName, interval, fetchLimit, displayLimit]);
+
+  const clampWindowStart = useCallback(
+    (start: number) => Math.max(0, Math.min(start, Math.max(0, candles.length - displayLimit))),
+    [candles.length, displayLimit]
+  );
+
+  const panWindow = useCallback(
+    (delta: number) => {
+      setWindowStart((prev) => clampWindowStart(prev + delta));
+    },
+    [clampWindowStart]
+  );
+
+  const panToLatest = useCallback(() => {
+    setWindowStart(Math.max(0, candles.length - displayLimit));
+  }, [candles.length, displayLimit]);
+
+  /** Load older candles (before current oldest). Fetches OHLCV_LOAD_OLDER_CHUNK so swipes stay smooth. */
+  const loadOlder = useCallback(() => {
+    if (loadingOlderRef.current) return;
+    const current = candlesRef.current;
+    if (!poolName || current.length === 0) return;
+    loadingOlderRef.current = true;
+    setLoadingOlder(true);
+    const sorted = [...current].sort((a, b) => a[0] - b[0]);
+    const oldestTs = sorted[0][0];
+    const endTime = candleTsForEndTime(oldestTs);
+    fetchOhlcv(poolName, { interval, limit: OHLCV_LOAD_OLDER_CHUNK, end_time: endTime })
+      .then((res) => {
+        const older = res.candles ?? [];
+        if (older.length === 0) {
+          return;
+        }
+        const latest = candlesRef.current;
+        const byTs = new Map<number, OhlcvCandle>();
+        [...older, ...latest].forEach((c) => byTs.set(c[0], c));
+        const merged = Array.from(byTs.values()).sort((a, b) => a[0] - b[0]);
+        setCandles(merged);
+        setWindowStart(0);
+      })
+      .catch(() => {})
+      .finally(() => {
+        loadingOlderRef.current = false;
+        setLoadingOlder(false);
+      });
+  }, [poolName, interval]);
 
   useEffect(() => {
     if (!poolName) {
       setCandles([]);
+      setWindowStart(0);
       setLoading(false);
+      setLoadingOlder(false);
       setError(null);
       return;
     }
     setError(null);
+    setCandles([]);
+    setWindowStart(0);
     refetch(true);
     const id = setInterval(() => refetch(false), refreshIntervalMs);
     return () => clearInterval(id);
   }, [poolName, refetch, refreshIntervalMs]);
 
-  return { candles, loading, error, refetch };
+  const setWindowStartClamped = useCallback(
+    (absoluteIndex: number) => {
+      setWindowStart(Math.max(0, Math.min(absoluteIndex, Math.max(0, candles.length - displayLimit))));
+    },
+    [candles.length, displayLimit]
+  );
+
+  return {
+    candles: visibleCandles,
+    allCandles: candles,
+    windowStart,
+    loading,
+    loadingOlder,
+    error,
+    refetch,
+    loadOlder,
+    panWindow,
+    panToLatest,
+    setWindowStartClamped,
+    canPanLeft: windowStart > 0,
+    canPanRight: windowStart + displayLimit < candles.length,
+    displayLimit,
+  };
 }
 
 export function useStoredMarginManager(suiAddress: string | null) {

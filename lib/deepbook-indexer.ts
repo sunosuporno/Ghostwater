@@ -190,8 +190,13 @@ export async function fetchLiquidation(params: {
 
 export type OhlcvInterval = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d' | '1w';
 
-/** [timestamp, open, high, low, close, volume] per indexer docs */
+/** [timestamp, open, high, low, close, volume] – indexer returns timestamp in ms (13 digits, e.g. 1769886240000). */
 export type OhlcvCandle = [number, number, number, number, number, number];
+
+/** Indexer returns ms (13 digits) or seconds (10 digits). Normalize to ms for Date/display. */
+export function ohlcvTimestampToMs(ts: number): number {
+  return ts < 1e12 ? ts * 1000 : ts;
+}
 
 export interface OhlcvResponse {
   candles: OhlcvCandle[];
@@ -212,15 +217,42 @@ export async function fetchOhlcv(
   } = {}
 ): Promise<OhlcvResponse> {
   const { interval = '1h', limit = 168, start_time, end_time } = params;
-  const path = `/ohlcv/${encodeURIComponent(poolName)}`;
+  const path = `/ohclv/${encodeURIComponent(poolName)}`;
   const q: Query = { interval, limit };
   if (start_time != null) q.start_time = start_time;
   if (end_time != null) q.end_time = end_time;
+  if (typeof __DEV__ !== 'undefined' && __DEV__) {
+    console.log('[OHLCV] fetchOhlcv exact URL', buildUrl(path, q));
+  }
   const raw = await get<OhlcvResponse | unknown>(path, q);
   if (raw && typeof raw === 'object' && 'candles' in raw && Array.isArray((raw as OhlcvResponse).candles)) {
     return raw as OhlcvResponse;
   }
   return { candles: [] };
+}
+
+/** Dummy/debug call: fetch OHLCV with given params and log raw response (for debugging timeline). */
+export async function debugFetchOhlcv(
+  poolName: string,
+  params: { interval?: OhlcvInterval; limit?: number } = {}
+): Promise<OhlcvResponse> {
+  const { interval = '1m', limit = 10 } = params;
+  const path = `/ohclv/${encodeURIComponent(poolName)}`;
+  const url = buildUrl(path, { interval, limit });
+  console.log('[OHLCV debug] GET', url);
+  const res = await fetch(url);
+  const raw = await res.json();
+  console.log('[OHLCV debug] status', res.status, 'candles count', Array.isArray((raw as OhlcvResponse).candles) ? (raw as OhlcvResponse).candles.length : 0);
+  console.log('[OHLCV debug] raw response', JSON.stringify(raw, null, 2).slice(0, 2000));
+  const candles = (raw as OhlcvResponse).candles ?? [];
+  if (candles.length >= 2) {
+    const [first, second] = candles;
+    const ts0 = (first as OhlcvCandle)[0];
+    const ts1 = (second as OhlcvCandle)[0];
+    const gapMs = ts1 - ts0;
+    console.log('[OHLCV debug] first 2 timestamps (raw)', ts0, ts1, '| gap ms', gapMs, 'gap seconds', (gapMs / 1000).toFixed(1), 'gap minutes', (gapMs / 60000).toFixed(2), '| API returns newest-first:', ts0 > ts1);
+  }
+  return raw as OhlcvResponse;
 }
 
 /** Build DeepBookV3 pool name from base/quote symbols (e.g. SUI_USDC). */

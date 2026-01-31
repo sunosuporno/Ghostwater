@@ -17,9 +17,11 @@ interface TradingViewChartProps {
   error?: string | null;
 }
 
-/** Convert indexer format to Lightweight Charts format (time in seconds). */
+/** Convert indexer format to Lightweight Charts format (time in seconds, chronological order). */
 function toLightweightChartsData(candles: OhlcvCandle[]): Array<{ time: number; open: number; high: number; low: number; close: number }> {
-  return candles.map((c) => {
+  const tsToMs = (ts: number) => (ts >= 1e12 ? ts : ts * 1000);
+  const sorted = [...candles].sort((a, b) => tsToMs(a[0]) - tsToMs(b[0]));
+  return sorted.map((c) => {
     let ts = c[0];
     if (ts > 1e12) ts = Math.floor(ts / 1000);
     return {
@@ -47,7 +49,8 @@ export function TradingViewChart({
     (data: OhlcvCandle[]) => {
       if (!data.length || !webRef.current) return;
       const payload = toLightweightChartsData(data);
-      const script = `(function(){if(typeof window.updateChart==='function'){window.updateChart(${JSON.stringify(payload).replace(/</g, '\\u003c')});}})();`;
+      const payloadStr = JSON.stringify(payload).replace(/</g, '\\u003c');
+      const script = `(function(){var d=${payloadStr};if(typeof window.updateChart==='function'){window.updateChart(d);}else{window.__chartCandles=d;}})();`;
       webRef.current.injectJavaScript(script);
     },
     []
@@ -55,13 +58,16 @@ export function TradingViewChart({
 
   useEffect(() => {
     if (!candles.length) return;
-    if (chartReady) {
-      injectCandles(candles);
-      return;
-    }
-    const t = setTimeout(() => injectCandles(candles), 800);
-    return () => clearTimeout(t);
-  }, [chartReady, candles, injectCandles]);
+    injectCandles(candles);
+    const t1 = setTimeout(() => injectCandles(candles), 400);
+    const t2 = setTimeout(() => injectCandles(candles), 1200);
+    const t3 = setTimeout(() => injectCandles(candles), 2500);
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+    };
+  }, [candles, injectCandles]);
 
   const onMessage = useCallback((event: { nativeEvent: { data: string } }) => {
     try {
