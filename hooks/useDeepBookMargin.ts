@@ -55,7 +55,23 @@ export function useMarginManagersInfo() {
 }
 
 const PRICE_POLL_MS = 5000;
-const CHART_POLL_MS = 5000;
+
+/** OHLCV poll interval (ms) per chart interval: 1m → 1 min, 1h → 1 hr, etc. */
+function getOhlcvPollIntervalMs(interval: OhlcvInterval): number {
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  switch (interval) {
+    case '1m': return 1 * minute;
+    case '5m': return 5 * minute;
+    case '15m': return 15 * minute;
+    case '30m': return 30 * minute;
+    case '1h': return 1 * hour;
+    case '4h': return 4 * hour;
+    case '1d': return 24 * hour;
+    case '1w': return 7 * 24 * hour;
+    default: return minute;
+  }
+}
 
 /** All pairs with last_price (DeepBookV3 /ticker). Polls for live updates. */
 export function useTicker(refreshIntervalMs: number = PRICE_POLL_MS) {
@@ -74,6 +90,9 @@ export function useTicker(refreshIntervalMs: number = PRICE_POLL_MS) {
     setLoading(true);
     setError(null);
     refetch();
+    if (__DEV__) {
+      console.log(`[Ticker] polling prices every ${refreshIntervalMs / 1000}s`);
+    }
     const id = setInterval(refetch, refreshIntervalMs);
     return () => clearInterval(id);
   }, [refetch, refreshIntervalMs]);
@@ -189,8 +208,9 @@ export function useOhlcv(
     interval = '1m',
     displayLimit = 100,
     fetchLimit = 200,
-    refreshIntervalMs = CHART_POLL_MS,
+    refreshIntervalMs: refreshIntervalMsParam,
   } = params;
+  const refreshIntervalMs = refreshIntervalMsParam ?? getOhlcvPollIntervalMs(interval);
   const [candles, setCandles] = useState<OhlcvCandle[]>([]);
   const [windowStart, setWindowStart] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -289,9 +309,12 @@ export function useOhlcv(
     setCandles([]);
     setWindowStart(0);
     refetch(true);
+    if (__DEV__) {
+      console.log(`[OHLCV] polling ${poolName} (${interval}) every ${refreshIntervalMs / 1000}s`);
+    }
     const id = setInterval(() => refetch(false), refreshIntervalMs);
     return () => clearInterval(id);
-  }, [poolName, refetch, refreshIntervalMs]);
+  }, [poolName, refetch, refreshIntervalMs, interval]);
 
   const setWindowStartClamped = useCallback(
     (absoluteIndex: number) => {

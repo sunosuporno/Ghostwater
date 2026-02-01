@@ -271,6 +271,9 @@ export interface TickerEntry {
 
 /** GET /ticker – all trading pairs with last_price, volume. Good for list + polling. */
 export async function fetchTicker(): Promise<Record<string, TickerEntry>> {
+  if (typeof __DEV__ !== 'undefined' && __DEV__) {
+    console.log('[Ticker] fetchTicker', buildUrl('/ticker'));
+  }
   const raw = await get<Record<string, TickerEntry> | unknown>('/ticker');
   if (raw && typeof raw === 'object' && raw !== null) return raw as Record<string, TickerEntry>;
   return {};

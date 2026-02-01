@@ -31,7 +31,6 @@ import { getSuiAddressFromUser } from '@/lib/sui';
 import { usePrivy } from '@privy-io/expo';
 
 const PRICE_POLL_MS = 5000;
-const CHART_POLL_MS = 5000;
 
 const CHART_INTERVALS: OhlcvInterval[] = ['1m', '5m', '15m', '30m', '1h', '4h', '1d', '1w'];
 /** Candles shown in chart (smaller = smoother pan). */
@@ -70,10 +69,22 @@ export default function PairDetailScreen() {
   const livePrice = decodedPoolName ? ticker[decodedPoolName]?.last_price : undefined;
 
   const prevPriceRef = useRef<number | null>(null);
+  const lastDirectionRef = useRef<'up' | 'down' | null>(null);
   const priceDirection = useMemo(() => {
     if (typeof livePrice !== 'number') return null;
     const prev = prevPriceRef.current;
-    const dir = prev === null ? null : livePrice > prev ? 'up' : livePrice < prev ? 'down' : null;
+    let dir: 'up' | 'down' | null = null;
+    if (prev === null) {
+      dir = null;
+    } else if (livePrice > prev) {
+      dir = 'up';
+      lastDirectionRef.current = 'up';
+    } else if (livePrice < prev) {
+      dir = 'down';
+      lastDirectionRef.current = 'down';
+    } else {
+      dir = lastDirectionRef.current;
+    }
     prevPriceRef.current = livePrice;
     return dir;
   }, [livePrice]);
@@ -94,7 +105,6 @@ export default function PairDetailScreen() {
     interval: chartInterval,
     displayLimit: CHART_DISPLAY_LIMIT,
     fetchLimit: CHART_FETCH_LIMIT,
-    refreshIntervalMs: CHART_POLL_MS,
   });
 
   useEffect(() => {
@@ -190,21 +200,29 @@ export default function PairDetailScreen() {
       contentContainerStyle={styles.container}
       showsVerticalScrollIndicator={false}
     >
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>{displayPoolLabel}</Text>
-        <View style={styles.row}>
-          <Text style={styles.muted}>Price (live)</Text>
-          <Text
-            style={[
-              styles.value,
-              priceDirection === 'up' && styles.priceUp,
-              priceDirection === 'down' && styles.priceDown,
-            ]}
-          >
-            {typeof livePrice === 'number'
-              ? livePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })
-              : '—'}
-          </Text>
+      <View style={styles.pairHeader}>
+        <Text style={[styles.pairName, { color: colors.text }]}>{displayPoolLabel}</Text>
+        <View style={styles.priceRow}>
+          <Text style={[styles.muted, { color: colors.text }]}>Price</Text>
+          <View style={styles.priceWithArrow}>
+            {priceDirection === 'up' && (
+              <Text style={[styles.priceArrow, styles.priceUp]} allowFontScaling={false}>▲</Text>
+            )}
+            {priceDirection === 'down' && (
+              <Text style={[styles.priceArrow, styles.priceDown]} allowFontScaling={false}>▼</Text>
+            )}
+            <Text
+              style={[
+                styles.value,
+                priceDirection === 'up' && styles.priceUp,
+                priceDirection === 'down' && styles.priceDown,
+              ]}
+            >
+              {typeof livePrice === 'number'
+                ? livePrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })
+                : '—'}
+            </Text>
+          </View>
         </View>
       </View>
 
@@ -441,6 +459,9 @@ const styles = StyleSheet.create({
   scroll: { flex: 1 },
   container: { flexGrow: 1, padding: 24, paddingBottom: 48 },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  pairHeader: { marginBottom: 20 },
+  pairName: { fontSize: 28, fontWeight: '700', marginBottom: 8 },
+  priceRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   card: {
     padding: 20,
     borderRadius: 12,
@@ -453,6 +474,8 @@ const styles = StyleSheet.create({
   intervalButton: { paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, marginRight: 6, minWidth: 40, alignItems: 'center' },
   intervalButtonText: { fontSize: 12, fontWeight: '600' },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
+  priceWithArrow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  priceArrow: { fontSize: 12, fontWeight: '700' },
   value: { fontSize: 16, fontWeight: '600' },
   priceUp: { color: '#22c55e' },
   priceDown: { color: '#ef4444' },
