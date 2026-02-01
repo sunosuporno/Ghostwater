@@ -23,7 +23,7 @@ import {
   setStoredMarginManager,
   type StoredMarginManager,
 } from '@/lib/margin-manager-storage';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
 const HISTORY_LIMIT = 20;
 
@@ -56,25 +56,23 @@ export function useMarginManagersInfo() {
 
 const PRICE_POLL_MS = 5000;
 
-/** OHLCV poll interval (ms) per chart interval: 1m → 1 min, 1h → 1 hr, etc. */
-function getOhlcvPollIntervalMs(interval: OhlcvInterval): number {
-  const minute = 60 * 1000;
-  const hour = 60 * minute;
-  switch (interval) {
-    case '1m': return 1 * minute;
-    case '5m': return 5 * minute;
-    case '15m': return 15 * minute;
-    case '30m': return 30 * minute;
-    case '1h': return 1 * hour;
-    case '4h': return 4 * hour;
-    case '1d': return 24 * hour;
-    case '1w': return 7 * 24 * hour;
-    default: return minute;
-  }
-}
+type TickerContextValue = {
+  ticker: Record<string, TickerEntry>;
+  loading: boolean;
+  error: string | null;
+  refetch: () => void;
+};
 
-/** All pairs with last_price (DeepBookV3 /ticker). Polls for live updates. */
-export function useTicker(refreshIntervalMs: number = PRICE_POLL_MS) {
+const TickerContext = createContext<TickerContextValue | null>(null);
+
+/** Shared ticker provider so list and pair detail use the same data (no flash of '-' on navigate). */
+export function TickerProvider({
+  children,
+  refreshIntervalMs = PRICE_POLL_MS,
+}: {
+  children: ReactNode;
+  refreshIntervalMs?: number;
+}) {
   const [ticker, setTicker] = useState<Record<string, TickerEntry>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +94,58 @@ export function useTicker(refreshIntervalMs: number = PRICE_POLL_MS) {
     const id = setInterval(refetch, refreshIntervalMs);
     return () => clearInterval(id);
   }, [refetch, refreshIntervalMs]);
+
+  const value = useMemo(
+    () => ({ ticker, loading, error, refetch }),
+    [ticker, loading, error, refetch]
+  );
+
+  return React.createElement(TickerContext.Provider, { value }, children);
+}
+
+/** OHLCV poll interval (ms) per chart interval: 1m → 1 min, 1h → 1 hr, etc. */
+function getOhlcvPollIntervalMs(interval: OhlcvInterval): number {
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  switch (interval) {
+    case '1m': return 1 * minute;
+    case '5m': return 5 * minute;
+    case '15m': return 15 * minute;
+    case '30m': return 30 * minute;
+    case '1h': return 1 * hour;
+    case '4h': return 4 * hour;
+    case '1d': return 24 * hour;
+    case '1w': return 7 * 24 * hour;
+    default: return minute;
+  }
+}
+
+/** All pairs with last_price (DeepBookV3 /ticker). Uses shared TickerProvider when inside one (no flash of '-' on pair detail). */
+export function useTicker(_refreshIntervalMs: number = PRICE_POLL_MS) {
+  const ctx = useContext(TickerContext);
+  if (ctx) return ctx;
+
+  const [ticker, setTicker] = useState<Record<string, TickerEntry>>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refetch = useCallback(() => {
+    fetchTicker()
+      .then(setTicker)
+      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load prices'))
+      .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    setLoading(true);
+    setError(null);
+    refetch();
+    if (__DEV__) {
+      console.log(`[Ticker] polling prices every ${_refreshIntervalMs / 1000}s`);
+    }
+    const id = setInterval(refetch, _refreshIntervalMs);
+    return () => clearInterval(id);
+  }, [refetch, _refreshIntervalMs]);
 
   return { ticker, loading, error, refetch };
 }

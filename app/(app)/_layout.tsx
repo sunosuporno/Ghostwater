@@ -4,6 +4,7 @@ import FontAwesome from '@expo/vector-icons/FontAwesome';
 
 import Colors from '@/constants/Colors';
 import { useColorScheme } from '@/components/useColorScheme';
+import { TickerProvider } from '@/hooks/useDeepBookMargin';
 
 function TabBarIcon(props: {
   name: React.ComponentProps<typeof FontAwesome>['name'];
@@ -21,6 +22,7 @@ export default function AppLayout() {
       error={() => null}
       unauthenticated={<Redirect href="/(auth)" />}
     >
+      <TickerProvider>
       <Tabs
         screenOptions={{
           tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
@@ -42,6 +44,7 @@ export default function AppLayout() {
           }}
         />
       </Tabs>
+      </TickerProvider>
     </AuthBoundary>
   );
 }
