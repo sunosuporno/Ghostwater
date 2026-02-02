@@ -6,6 +6,7 @@
 import { toSerializedSignature } from "@mysten/sui/cryptography";
 import { getJsonRpcFullnodeUrl, SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { publicKeyFromRawBytes } from "@mysten/sui/verify";
+import { Buffer } from "buffer";
 
 export type ExecuteTransferParams = {
   txBytesBase64: string;
@@ -38,9 +39,13 @@ export async function executeTransfer(
     network = "mainnet",
   } = params;
 
-  const txBytes = new Uint8Array(Buffer.from(txBytesBase64, "base64"));
+  const txBytes = Buffer.from(txBytesBase64, "base64");
   const sigBytes = hexToBytes(signatureHex);
-  const publicKeyRaw = hexToBytes(publicKeyHex);
+  let publicKeyRaw = hexToBytes(publicKeyHex);
+  // Sui/Privy may send 33 bytes (0x00 scheme + 32 bytes ED25519)
+  if (publicKeyRaw.length === 33 && publicKeyRaw[0] === 0x00) {
+    publicKeyRaw = publicKeyRaw.slice(1);
+  }
   if (publicKeyRaw.length !== 32) {
     throw new Error("Invalid public key: expected 32 bytes (64 hex chars)");
   }

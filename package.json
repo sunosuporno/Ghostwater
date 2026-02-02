@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@ethersproject/shims": "^5.8.0",
+    "buffer": "^6.0.3",
     "@expo/vector-icons": "^15.0.3",
     "@mysten/sui": "^2.1.0",
     "@privy-io/expo": "^0.63.4",

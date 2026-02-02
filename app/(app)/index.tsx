@@ -1,6 +1,6 @@
 import { Text } from "@/components/Themed";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
-import { useEmbeddedEthereumWallet, usePrivy } from "@privy-io/expo";
+import { usePrivy } from "@privy-io/expo";
 import {
   useCreateWallet,
   useSignRawHash,
@@ -81,15 +81,11 @@ export default function HomeScreen() {
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
   const { user, logout } = usePrivy();
-  const { wallets, create } = useEmbeddedEthereumWallet();
   const { createWallet: createSuiWallet } = useCreateWallet();
 
-  // Ethereum wallet state (kept for future use, not shown in UI)
-  const [address, setAddress] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [createError, setCreateError] = useState<string | null>(null);
+  // Ethereum wallet: re-add when needed — useEmbeddedEthereumWallet(), state: address, loading, createError, and a useEffect that creates/fetches wallet when wallets.length changes (see git history for full snippet).
 
-  // Sui wallet state (shown in UI)
+  // Sui wallet state
   const [suiAddress, setSuiAddress] = useState<string | null>(null);
   const [suiWalletPublicKey, setSuiWalletPublicKey] = useState<
     string | Uint8Array | null
@@ -136,7 +132,7 @@ export default function HomeScreen() {
       .finally(() => setBalanceLoading(false));
   }, [suiAddress]);
 
-  // Initial fetch when address is set
+  // Initial fetch when Sui address is set
   useEffect(() => {
     if (!suiAddress) {
       setAllBalances([]);
@@ -231,46 +227,6 @@ export default function HomeScreen() {
     setCopiedAddress(true);
     setTimeout(() => setCopiedAddress(false), 2000);
   }, [suiAddress]);
-
-  // Ethereum: create / fetch address (code kept, not displayed)
-  useEffect(() => {
-    let cancelled = false;
-    setCreateError(null);
-
-    const run = async () => {
-      if (wallets.length > 0) {
-        try {
-          const provider = await wallets[0].getProvider();
-          const accounts = (await provider.request({
-            method: "eth_requestAccounts",
-          })) as string[];
-          if (!cancelled && accounts[0]) setAddress(accounts[0]);
-        } catch {
-          if (!cancelled) setCreateError("Could not get wallet address");
-        }
-        if (!cancelled) setLoading(false);
-        return;
-      }
-
-      try {
-        await create({});
-      } catch (err) {
-        if (!cancelled) {
-          setCreateError(
-            err instanceof Error ? err.message : "Failed to create wallet"
-          );
-          setLoading(false);
-        }
-        return;
-      }
-      if (!cancelled) setLoading(false);
-    };
-
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [wallets.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sui: get existing or create, then show address and public key (needed for sending)
   useEffect(() => {
@@ -385,7 +341,7 @@ export default function HomeScreen() {
           publicKeyHex,
           network: "mainnet",
         });
-        setSendSuccess(`Sent! Digest: ${digest}`);
+        setSendSuccess(`Transaction sent. Txn hash: ${digest}`);
         setDestinationAddress("");
         setAmount("");
         setAmountExceedsBalance(false);
@@ -414,7 +370,7 @@ export default function HomeScreen() {
           suiAddress,
           publicKeyBytes
         );
-        setSendSuccess(`Sent! Digest: ${digest}`);
+        setSendSuccess(`Transaction sent. Txn hash: ${digest}`);
         setDestinationAddress("");
         setAmount("");
         setAmountExceedsBalance(false);
@@ -424,11 +380,11 @@ export default function HomeScreen() {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Send failed";
-      setSendError(
-        msg.includes("prototype") || msg.includes("undefined")
-          ? "Send not available on app. Use web."
-          : msg
-      );
+      // Only show "use web" when on web and the SDK crashed (prototype). On native, show the real error (e.g. backend unreachable).
+      const useWebMessage =
+        Platform.OS === "web" &&
+        (msg.includes("prototype") || msg.includes("undefined"));
+      setSendError(useWebMessage ? "Send not available on app. Use web." : msg);
     } finally {
       setSendLoading(false);
     }

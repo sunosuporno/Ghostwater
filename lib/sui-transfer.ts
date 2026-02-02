@@ -1,5 +1,5 @@
 /**
- * Sui transfer helpers: get balance, build "send full balance" tx, sign with Privy and execute.
+ * Sui transfer helpers for web: get balance, build transfer tx, sign with Privy and execute.
  * Uses @mysten/sui client + Transaction; signing via Privy useSignRawHash (Tier 2 Sui).
  */
 
@@ -10,10 +10,15 @@ import {
 import { getJsonRpcFullnodeUrl, SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { Transaction } from "@mysten/sui/transactions";
 import { publicKeyFromRawBytes } from "@mysten/sui/verify";
-import { bytesToHex } from "@noble/hashes/utils";
 
 const SUI_COIN_TYPE = "0x2::sui::SUI";
-const GAS_BUDGET_RESERVE_MIST = 100_000_000n; // 0.1 SUI reserved for gas when sending full SUI
+const GAS_BUDGET_RESERVE_MIST = 100_000_000n; // 0.1 SUI reserved for gas
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 export type SuiClientNetwork = "mainnet" | "testnet";
 
@@ -36,56 +41,6 @@ export async function getBalance(
     totalBalance: res.totalBalance,
     coinType: res.coinType,
   };
-}
-
-/**
- * Build a Transaction that transfers the full balance of the given coin type
- * from sender to recipient. For SUI, reserves GAS_BUDGET_RESERVE_MIST for gas.
- */
-export async function buildTransferFullBalanceTx(
-  client: SuiJsonRpcClient,
-  sender: string,
-  recipient: string,
-  coinType: string
-): Promise<Transaction> {
-  const tx = new Transaction();
-  tx.setSender(sender);
-
-  const balanceRes = await getBalance(client, sender, coinType);
-  const totalBalance = BigInt(balanceRes.totalBalance);
-  if (totalBalance === 0n) {
-    throw new Error("No balance to transfer");
-  }
-
-  const isSui = coinType === SUI_COIN_TYPE;
-  if (isSui) {
-    // Transfer (total - gas reserve); gas coin pays for the tx
-    const transferAmount =
-      totalBalance > GAS_BUDGET_RESERVE_MIST
-        ? totalBalance - GAS_BUDGET_RESERVE_MIST
-        : 0n;
-    if (transferAmount === 0n) {
-      throw new Error("Balance too low to transfer (need reserve for gas)");
-    }
-    const [coin] = tx.splitCoins(tx.gas, [transferAmount]);
-    tx.transferObjects([coin], tx.pure.address(recipient));
-  } else {
-    // Non-SUI: list coin objects and transfer all
-    const { data: coins } = await client.core.listCoins({
-      owner: sender,
-      coinType,
-    });
-    if (!coins?.length) {
-      throw new Error("No coins to transfer");
-    }
-    const coinRefs = coins.map((c) => c.coinObjectId);
-    tx.transferObjects(
-      coinRefs.map((id) => tx.object(id)),
-      tx.pure.address(recipient)
-    );
-  }
-
-  return tx;
 }
 
 /**

@@ -1,15 +1,16 @@
 /**
- * Build a Sui transfer transaction and return intent message (for client to sign)
+ * Build a Sui transfer transaction and return intent message hash (for client to sign)
  * and raw tx bytes (for execute step). Uses @mysten/sui (runs only on backend).
+ * Expo useSignRawHash only accepts `hash`, so we compute blake2b256(intentMessage) here.
  */
 
 import { messageWithIntent } from "@mysten/sui/cryptography";
 import { getJsonRpcFullnodeUrl, SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { Transaction } from "@mysten/sui/transactions";
-import { bytesToHex } from "@noble/hashes/utils";
+import { blake2b } from "@noble/hashes/blake2.js";
+import { Buffer } from "buffer";
 
 const SUI_COIN_TYPE = "0x2::sui::SUI";
-const GAS_BUDGET_RESERVE_MIST = 100_000_000n;
 
 export type PrepareTransferParams = {
   sender: string;
@@ -20,7 +21,8 @@ export type PrepareTransferParams = {
 };
 
 export type PrepareTransferResult = {
-  intentMessageHex: string;
+  /** Blake2b256 hash of intent message (0x-prefixed hex). Pass to signRawHash({ hash }). */
+  intentMessageHashHex: string;
   txBytesBase64: string;
 };
 
@@ -34,6 +36,10 @@ export async function prepareTransfer(
     amountMist: amountStr,
     network = "mainnet",
   } = params;
+
+  if (amountStr == null || amountStr === "") {
+    throw new Error("Amount is required (amountMist)");
+  }
   const amountMist = BigInt(amountStr);
 
   if (amountMist <= 0n) {
@@ -46,20 +52,9 @@ export async function prepareTransfer(
   const tx = new Transaction();
   tx.setSender(sender);
 
-  const balanceRes = await client.core.getBalance({ owner: sender, coinType });
-  const totalBalance = BigInt(balanceRes.totalBalance);
-
+  // Balance is validated in the app. We just build the tx; if insufficient, execution will fail on-chain.
   const isSui = coinType === SUI_COIN_TYPE;
   if (isSui) {
-    const maxTransfer =
-      totalBalance > GAS_BUDGET_RESERVE_MIST
-        ? totalBalance - GAS_BUDGET_RESERVE_MIST
-        : 0n;
-    if (amountMist > maxTransfer) {
-      throw new Error(
-        `Amount exceeds available balance (max ${maxTransfer} mist after gas reserve)`
-      );
-    }
     const [coin] = tx.splitCoins(tx.gas, [amountMist]);
     tx.transferObjects([coin], tx.pure.address(recipient));
   } else {
@@ -91,8 +86,9 @@ export async function prepareTransfer(
 
   const txBytes = await tx.build({ client });
   const intentMessage = messageWithIntent("TransactionData", txBytes);
-  const intentMessageHex = "0x" + bytesToHex(intentMessage);
+  const intentHash = blake2b(intentMessage, { dkLen: 32 });
+  const intentMessageHashHex = "0x" + Buffer.from(intentHash).toString("hex");
   const txBytesBase64 = Buffer.from(txBytes).toString("base64");
 
-  return { intentMessageHex, txBytesBase64 };
+  return { intentMessageHashHex, txBytesBase64 };
 }

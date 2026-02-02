@@ -4,8 +4,8 @@ const { getDefaultConfig } = require("expo/metro-config");
 const config = getDefaultConfig(__dirname);
 
 // Privy / jose: use browser build so we don't pull in Node's "crypto" (not available in RN)
-// uuid: Privy's nested uuid@9 uses wrapper.mjs which expects default.v1; on web that resolves to
-// ESM browser build with no default → undefined.v1. Force root uuid@7 CJS for web so default export exists.
+// uuid: Root uuid@7 uses Node's crypto in dist/rng.js → undefined in RN. Use a shim on native
+// that uses crypto.getRandomValues (polyfilled by react-native-get-random-values).
 const resolveRequestWithPackageExports = (context, moduleName, platform) => {
   if (moduleName === "jose") {
     const ctx = { ...context, unstable_conditionNames: ["browser"] };
@@ -19,7 +19,13 @@ const resolveRequestWithPackageExports = (context, moduleName, platform) => {
     const ctx = { ...context, unstable_enablePackageExports: false };
     return context.resolveRequest(ctx, moduleName, platform);
   }
-  if (moduleName === "uuid" && platform === "web") {
+  if (moduleName === "uuid") {
+    if (platform === "ios" || platform === "android") {
+      return {
+        type: "sourceFile",
+        filePath: path.resolve(__dirname, "lib/uuid-rn-shim.js"),
+      };
+    }
     const rootUuid = path.resolve(__dirname, "node_modules/uuid/dist/index.js");
     return { type: "sourceFile", filePath: rootUuid };
   }

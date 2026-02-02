@@ -1,8 +1,12 @@
+import { Buffer } from "buffer";
 import cors from "cors";
 import "dotenv/config";
 import express from "express";
 import { executeTransfer } from "./sui/execute-transfer.js";
 import { prepareTransfer } from "./sui/prepare-transfer.js";
+if (typeof globalThis.Buffer === "undefined") {
+  (globalThis as unknown as { Buffer: typeof Buffer }).Buffer = Buffer;
+}
 
 const app = express();
 const PORT = process.env.PORT ?? 3001;
@@ -10,10 +14,15 @@ const PORT = process.env.PORT ?? 3001;
 app.use(cors());
 app.use(express.json());
 
+app.use((req, _res, next) => {
+  console.log(`${req.method} ${req.url}`);
+  next();
+});
+
 /**
  * POST /api/prepare-transfer
  * Body: { sender, recipient, coinType, amountMist, network? }
- * Returns: { intentMessageHex, txBytesBase64 } for the client to sign.
+ * Returns: { intentMessageHashHex, txBytesBase64 } for the client to sign (hash = blake2b256 of intent message).
  */
 app.post("/api/prepare-transfer", async (req, res) => {
   try {
