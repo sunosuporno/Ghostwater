@@ -1,8 +1,8 @@
 import {
   fetchCollateralEvents,
+  fetchLiquidation,
   fetchLoanBorrowed,
   fetchLoanRepaid,
-  fetchLiquidation,
   fetchMarginManagerStates,
   fetchMarginManagersInfo,
   fetchOhlcv,
@@ -17,13 +17,73 @@ import {
   type OhlcvCandle,
   type OhlcvInterval,
   type TickerEntry,
-} from '@/lib/deepbook-indexer';
+} from "@/lib/deepbook-indexer";
 import {
   getStoredMarginManager,
   setStoredMarginManager,
   type StoredMarginManager,
-} from '@/lib/margin-manager-storage';
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+} from "@/lib/margin-manager-storage";
+import { fetchOwnedMarginManagers } from "@/lib/owned-margin-managers-api";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+
+const DEFAULT_API_URL =
+  typeof process !== "undefined" && process.env?.EXPO_PUBLIC_API_URL
+    ? process.env.EXPO_PUBLIC_API_URL
+    : "http://localhost:3001";
+
+export type OwnedMarginManagerEntry = {
+  margin_manager_id: string;
+  deepbook_pool_id: string;
+};
+
+/** Fetch margin managers owned by the wallet from chain (no local storage). */
+export function useOwnedMarginManagers(
+  suiAddress: string | null,
+  apiUrl: string = DEFAULT_API_URL,
+  network: "mainnet" | "testnet" = "mainnet"
+) {
+  const [managers, setManagers] = useState<OwnedMarginManagerEntry[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!suiAddress) {
+      setManagers([]);
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const { managers: list } = await fetchOwnedMarginManagers({
+        apiUrl,
+        owner: suiAddress,
+        network,
+      });
+      setManagers(list ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load");
+      setManagers([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [suiAddress, apiUrl, network]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  return { managers, loading, error, refresh };
+}
 
 const HISTORY_LIMIT = 20;
 
@@ -41,7 +101,8 @@ export function useMarginManagersInfo() {
         if (!cancelled) setData(list ?? []);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load pools');
+        if (!cancelled)
+          setError(e instanceof Error ? e.message : "Failed to load pools");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -80,7 +141,9 @@ export function TickerProvider({
   const refetch = useCallback(() => {
     fetchTicker()
       .then(setTicker)
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load prices'))
+      .catch((e) =>
+        setError(e instanceof Error ? e.message : "Failed to load prices")
+      )
       .finally(() => setLoading(false));
   }, []);
 
@@ -108,15 +171,24 @@ function getOhlcvPollIntervalMs(interval: OhlcvInterval): number {
   const minute = 60 * 1000;
   const hour = 60 * minute;
   switch (interval) {
-    case '1m': return 1 * minute;
-    case '5m': return 5 * minute;
-    case '15m': return 15 * minute;
-    case '30m': return 30 * minute;
-    case '1h': return 1 * hour;
-    case '4h': return 4 * hour;
-    case '1d': return 24 * hour;
-    case '1w': return 7 * 24 * hour;
-    default: return minute;
+    case "1m":
+      return 1 * minute;
+    case "5m":
+      return 5 * minute;
+    case "15m":
+      return 15 * minute;
+    case "30m":
+      return 30 * minute;
+    case "1h":
+      return 1 * hour;
+    case "4h":
+      return 4 * hour;
+    case "1d":
+      return 24 * hour;
+    case "1w":
+      return 7 * 24 * hour;
+    default:
+      return minute;
   }
 }
 
@@ -132,7 +204,9 @@ export function useTicker(_refreshIntervalMs: number = PRICE_POLL_MS) {
   const refetch = useCallback(() => {
     fetchTicker()
       .then(setTicker)
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load prices'))
+      .catch((e) =>
+        setError(e instanceof Error ? e.message : "Failed to load prices")
+      )
       .finally(() => setLoading(false));
   }, []);
 
@@ -141,7 +215,9 @@ export function useTicker(_refreshIntervalMs: number = PRICE_POLL_MS) {
     setError(null);
     refetch();
     if (__DEV__) {
-      console.log(`[Ticker] polling prices every ${_refreshIntervalMs / 1000}s`);
+      console.log(
+        `[Ticker] polling prices every ${_refreshIntervalMs / 1000}s`
+      );
     }
     const id = setInterval(refetch, _refreshIntervalMs);
     return () => clearInterval(id);
@@ -157,7 +233,10 @@ export function usePoolPrice(
 ) {
   const { refreshIntervalMs = PRICE_POLL_MS } = options;
   const [price, setPrice] = useState<string | null>(null);
-  const [symbols, setSymbols] = useState<{ base: string; quote: string } | null>(null);
+  const [symbols, setSymbols] = useState<{
+    base: string;
+    quote: string;
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -178,7 +257,9 @@ export function usePoolPrice(
           setSymbols(null);
         }
       })
-      .catch((e) => setError(e instanceof Error ? e.message : 'Failed to load price'))
+      .catch((e) =>
+        setError(e instanceof Error ? e.message : "Failed to load price")
+      )
       .finally(() => setLoading(false));
   }, [deepbookPoolId]);
 
@@ -220,8 +301,8 @@ function logOhlcvResponse(
   const tsLast = last[0];
   const spanSec = tsToSeconds(tsLast) - tsToSeconds(tsFirst);
   const gapSec = sorted.length > 1 ? spanSec / (sorted.length - 1) : 0;
-  console.log('[OHLCV] request', { poolName, interval, limit });
-  console.log('[OHLCV] response', {
+  console.log("[OHLCV] request", { poolName, interval, limit });
+  console.log("[OHLCV] response", {
     candleCount: candles.length,
     firstTs: tsFirst,
     lastTs: tsLast,
@@ -231,7 +312,10 @@ function logOhlcvResponse(
     gapBetweenCandlesSeconds: gapSec.toFixed(1),
     gapBetweenCandlesMinutes: (gapSec / 60).toFixed(2),
   });
-  console.log('[OHLCV] all candles (sorted by ts, [ts, open, high, low, close, volume]):', sorted);
+  console.log(
+    "[OHLCV] all candles (sorted by ts, [ts, open, high, low, close, volume]):",
+    sorted
+  );
 }
 
 /** Candle timestamp to API time: indexer may expect seconds (10 digits) or ms (13 digits). We pass ms when ts is ms. */
@@ -255,12 +339,13 @@ export function useOhlcv(
   } = {}
 ) {
   const {
-    interval = '1m',
+    interval = "1m",
     displayLimit = 100,
     fetchLimit = 200,
     refreshIntervalMs: refreshIntervalMsParam,
   } = params;
-  const refreshIntervalMs = refreshIntervalMsParam ?? getOhlcvPollIntervalMs(interval);
+  const refreshIntervalMs =
+    refreshIntervalMsParam ?? getOhlcvPollIntervalMs(interval);
   const [candles, setCandles] = useState<OhlcvCandle[]>([]);
   const [windowStart, setWindowStart] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -274,43 +359,52 @@ export function useOhlcv(
 
   const visibleCandles = useMemo(() => {
     const sorted = [...candles].sort((a, b) => a[0] - b[0]);
-    const start = Math.max(0, Math.min(windowStart, Math.max(0, sorted.length - displayLimit)));
+    const start = Math.max(
+      0,
+      Math.min(windowStart, Math.max(0, sorted.length - displayLimit))
+    );
     return sorted.slice(start, start + displayLimit);
   }, [candles, windowStart, displayLimit]);
 
-  const refetch = useCallback((isInitial = false) => {
-    if (!poolName) return;
-    const id = ++requestIdRef.current;
-    if (isInitial) setLoading(true);
-    fetchOhlcv(poolName, { interval, limit: fetchLimit })
-      .then((res) => {
-        if (id !== requestIdRef.current) return;
-        if (loadingOlderRef.current) return;
-        const list = res.candles ?? [];
-        if (isInitial && __DEV__) logOhlcvResponse(poolName, interval, fetchLimit, list);
-        const current = candlesRef.current;
-        if (current.length > displayLimit && list.length > 0) {
-          const minNew = Math.min(...list.map((c) => c[0]));
-          const older = current.filter((c) => c[0] < minNew);
-          const byTs = new Map<number, OhlcvCandle>();
-          [...older, ...list].forEach((c) => byTs.set(c[0], c));
-          const merged = Array.from(byTs.values()).sort((a, b) => a[0] - b[0]);
-          setCandles(merged);
-          setWindowStart((prev) => prev + (merged.length - current.length));
-        } else {
-          setCandles(list);
-          setWindowStart(Math.max(0, list.length - displayLimit));
-        }
-      })
-      .catch((e) => {
-        if (id !== requestIdRef.current) return;
-        setError(e instanceof Error ? e.message : 'Failed to load chart');
-      })
-      .finally(() => {
-        if (id !== requestIdRef.current) return;
-        setLoading(false);
-      });
-  }, [poolName, interval, fetchLimit, displayLimit]);
+  const refetch = useCallback(
+    (isInitial = false) => {
+      if (!poolName) return;
+      const id = ++requestIdRef.current;
+      if (isInitial) setLoading(true);
+      fetchOhlcv(poolName, { interval, limit: fetchLimit })
+        .then((res) => {
+          if (id !== requestIdRef.current) return;
+          if (loadingOlderRef.current) return;
+          const list = res.candles ?? [];
+          if (isInitial && __DEV__)
+            logOhlcvResponse(poolName, interval, fetchLimit, list);
+          const current = candlesRef.current;
+          if (current.length > displayLimit && list.length > 0) {
+            const minNew = Math.min(...list.map((c) => c[0]));
+            const older = current.filter((c) => c[0] < minNew);
+            const byTs = new Map<number, OhlcvCandle>();
+            [...older, ...list].forEach((c) => byTs.set(c[0], c));
+            const merged = Array.from(byTs.values()).sort(
+              (a, b) => a[0] - b[0]
+            );
+            setCandles(merged);
+            setWindowStart((prev) => prev + (merged.length - current.length));
+          } else {
+            setCandles(list);
+            setWindowStart(Math.max(0, list.length - displayLimit));
+          }
+        })
+        .catch((e) => {
+          if (id !== requestIdRef.current) return;
+          setError(e instanceof Error ? e.message : "Failed to load chart");
+        })
+        .finally(() => {
+          if (id !== requestIdRef.current) return;
+          setLoading(false);
+        });
+    },
+    [poolName, interval, fetchLimit, displayLimit]
+  );
 
   const panToLatest = useCallback(() => {
     setWindowStart(Math.max(0, candles.length - displayLimit));
@@ -326,7 +420,11 @@ export function useOhlcv(
     const sorted = [...current].sort((a, b) => a[0] - b[0]);
     const oldestTs = sorted[0][0];
     const endTime = candleTsForEndTime(oldestTs);
-    fetchOhlcv(poolName, { interval, limit: OHLCV_LOAD_OLDER_CHUNK, end_time: endTime })
+    fetchOhlcv(poolName, {
+      interval,
+      limit: OHLCV_LOAD_OLDER_CHUNK,
+      end_time: endTime,
+    })
       .then((res) => {
         const older = res.candles ?? [];
         if (older.length === 0) {
@@ -360,7 +458,11 @@ export function useOhlcv(
     setWindowStart(0);
     refetch(true);
     if (__DEV__) {
-      console.log(`[OHLCV] polling ${poolName} (${interval}) every ${refreshIntervalMs / 1000}s`);
+      console.log(
+        `[OHLCV] polling ${poolName} (${interval}) every ${
+          refreshIntervalMs / 1000
+        }s`
+      );
     }
     const id = setInterval(() => refetch(false), refreshIntervalMs);
     return () => clearInterval(id);
@@ -368,7 +470,12 @@ export function useOhlcv(
 
   const setWindowStartClamped = useCallback(
     (absoluteIndex: number) => {
-      setWindowStart(Math.max(0, Math.min(absoluteIndex, Math.max(0, candles.length - displayLimit))));
+      setWindowStart(
+        Math.max(
+          0,
+          Math.min(absoluteIndex, Math.max(0, candles.length - displayLimit))
+        )
+      );
     },
     [candles.length, displayLimit]
   );
@@ -447,11 +554,13 @@ export function useMarginManagerState(
     fetchMarginManagerStates({ deepbook_pool_id: deepbookPoolId })
       .then((list) => {
         if (cancelled) return;
-        const mine = list.find((s) => s.margin_manager_id === marginManagerId) ?? null;
+        const mine =
+          list.find((s) => s.margin_manager_id === marginManagerId) ?? null;
         setState(mine);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load state');
+        if (!cancelled)
+          setError(e instanceof Error ? e.message : "Failed to load state");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -540,7 +649,8 @@ export function useMarginHistory(
         setLiquidations(allLiq);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : 'Failed to load history');
+        if (!cancelled)
+          setError(e instanceof Error ? e.message : "Failed to load history");
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -555,7 +665,7 @@ export function useMarginHistory(
 
 /** Approximate collateral USD from state (base * basePrice + quote * quotePrice with Pyth decimals). */
 export function collateralUsdFromState(s: MarginManagerState | null): string {
-  if (!s) return '0';
+  if (!s) return "0";
   const baseVal =
     (Number(s.base_asset) / 10 ** s.base_pyth_decimals) *
     (s.base_pyth_price / 10 ** s.base_pyth_decimals);
@@ -563,12 +673,15 @@ export function collateralUsdFromState(s: MarginManagerState | null): string {
     (Number(s.quote_asset) / 10 ** s.quote_pyth_decimals) *
     (s.quote_pyth_price / 10 ** s.quote_pyth_decimals);
   const sum = baseVal + quoteVal;
-  return sum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return sum.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
 /** Approximate debt USD from state. */
 export function debtUsdFromState(s: MarginManagerState | null): string {
-  if (!s) return '0';
+  if (!s) return "0";
   const baseDebt =
     (Number(s.base_debt) / 10 ** s.base_pyth_decimals) *
     (s.base_pyth_price / 10 ** s.base_pyth_decimals);
@@ -576,7 +689,10 @@ export function debtUsdFromState(s: MarginManagerState | null): string {
     (Number(s.quote_debt) / 10 ** s.quote_pyth_decimals) *
     (s.quote_pyth_price / 10 ** s.quote_pyth_decimals);
   const sum = baseDebt + quoteDebt;
-  return sum.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return sum.toLocaleString("en-US", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
 export { fromPythRaw };

@@ -9,6 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@mysten/deepbook-v3": "^1.0.1",
     "@mysten/sui": "^2.1.0",
     "buffer": "^6.0.3",
     "cors": "^2.8.5",

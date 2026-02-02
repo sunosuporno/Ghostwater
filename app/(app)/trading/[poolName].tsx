@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -17,23 +18,29 @@ import Colors from "@/constants/Colors";
 import {
   collateralUsdFromState,
   debtUsdFromState,
-  formatRiskRatio,
   useMarginHistory,
   useMarginManagerState,
   useMarginManagersInfo,
   useOhlcv,
-  useStoredMarginManager,
+  useOwnedMarginManagers,
   useTicker,
 } from "@/hooks/useDeepBookMargin";
+import { createMarginManagerViaBackend } from "@/lib/create-margin-manager-via-backend";
 import {
   debugFetchOhlcv,
+  formatRiskRatio,
   poolNameFromSymbols,
   type MarginManagerInfo,
   type OhlcvInterval,
 } from "@/lib/deepbook-indexer";
-import type { StoredMarginManager } from "@/lib/margin-manager-storage";
-import { getSuiAddressFromUser } from "@/lib/sui";
+import {
+  getSelectedMarginManagerId,
+  setSelectedMarginManagerId,
+} from "@/lib/margin-manager-storage";
+import { getSuiAddressFromUser, getSuiWalletFromUser } from "@/lib/sui";
+import { publicKeyToHex } from "@/lib/sui-transfer-via-backend";
 import { usePrivy } from "@privy-io/expo";
+import { useSignRawHash } from "@privy-io/expo/extended-chains";
 
 const PRICE_POLL_MS = 5000;
 
@@ -132,6 +139,30 @@ export default function PairDetailScreen() {
   }, [decodedPoolName]);
 
   const { pools } = useMarginManagersInfo();
+
+  // Unique pairs that support margin: /margin_managers_info returns one row per
+  // margin manager; we dedupe by pool to get the set. Doc confirms mainnet has
+  // exactly DEEP_USDC, SUI_USDC, WAL_USDC (see constants/deepbook-margin-mainnet).
+  // @see https://docs.sui.io/standards/deepbook-margin-indexer (Get margin managers information)
+  const uniquePairKeys = useMemo(() => {
+    if (!pools?.length) return [];
+    const keys = new Set(
+      pools.map((p) =>
+        poolNameFromSymbols(p.base_asset_symbol, p.quote_asset_symbol)
+      )
+    );
+    return [...keys].sort();
+  }, [pools]);
+
+  const prevLoggedKeysRef = useRef<string>("");
+  useEffect(() => {
+    if (!__DEV__ || !uniquePairKeys.length) return;
+    const key = uniquePairKeys.join(",");
+    if (key === prevLoggedKeysRef.current) return;
+    prevLoggedKeysRef.current = key;
+    console.log("[Margin] Supported pairs:", uniquePairKeys.join(", "));
+  }, [uniquePairKeys]);
+
   const poolInfoForPair = useMemo(() => {
     if (!decodedPoolName) return null;
     return (
@@ -143,15 +174,76 @@ export default function PairDetailScreen() {
     );
   }, [pools, decodedPoolName]);
 
-  const { stored, save } = useStoredMarginManager(suiAddress);
-  const isManagerForThisPool =
-    stored?.deepbook_pool_id === poolInfoForPair?.deepbook_pool_id;
+  const apiUrl =
+    (typeof process !== "undefined" && process.env?.EXPO_PUBLIC_API_URL) ||
+    "http://localhost:3001";
+  const {
+    managers: ownedManagers,
+    loading: ownedLoading,
+    refresh: refreshOwned,
+  } = useOwnedMarginManagers(suiAddress, apiUrl, "mainnet");
+
+  const poolIdForMatch = poolInfoForPair?.deepbook_pool_id?.toLowerCase();
+  /** User's chosen margin manager for this pool when they have multiple (e.g. created elsewhere). */
+  const [selectedMarginManagerIdForPool, setSelectedMarginManagerIdForPool] =
+    useState<string | null>(null);
+
+  // Load stored selection when wallet/pool/owned list changes
+  useEffect(() => {
+    if (!suiAddress || !decodedPoolName) {
+      setSelectedMarginManagerIdForPool(null);
+      return;
+    }
+    getSelectedMarginManagerId(suiAddress, decodedPoolName).then((id) => {
+      setSelectedMarginManagerIdForPool(id ?? null);
+    });
+  }, [suiAddress, decodedPoolName, ownedManagers.length]);
+
+  const matchesForThisPool = useMemo(() => {
+    if (!poolIdForMatch) return [];
+    return ownedManagers.filter(
+      (m) => m.deepbook_pool_id?.toLowerCase() === poolIdForMatch
+    );
+  }, [ownedManagers, poolIdForMatch]);
+
+  // Resolve which manager to use: single match → that one; multiple → user's choice or default
+  const managerForThisPool = useMemo(() => {
+    if (!poolIdForMatch) return null;
+    if (matchesForThisPool.length === 0) {
+      if (
+        justCreatedManager &&
+        justCreatedManager.deepbook_pool_id?.toLowerCase() === poolIdForMatch
+      ) {
+        return justCreatedManager;
+      }
+      return null;
+    }
+    if (matchesForThisPool.length === 1) {
+      return matchesForThisPool[0];
+    }
+    const sorted = [...matchesForThisPool].sort((a, b) =>
+      a.margin_manager_id.localeCompare(b.margin_manager_id)
+    );
+    const chosen = selectedMarginManagerIdForPool
+      ? sorted.find(
+          (m) => m.margin_manager_id === selectedMarginManagerIdForPool
+        )
+      : null;
+    return chosen ?? sorted[sorted.length - 1];
+  }, [
+    poolIdForMatch,
+    matchesForThisPool,
+    justCreatedManager,
+    selectedMarginManagerIdForPool,
+  ]);
+
+  const marginManagerId = managerForThisPool?.margin_manager_id ?? null;
   const {
     state,
     loading: stateLoading,
     error: stateError,
   } = useMarginManagerState(
-    isManagerForThisPool ? stored?.margin_manager_id ?? null : null,
+    marginManagerId,
     poolInfoForPair?.deepbook_pool_id ?? null
   );
   const {
@@ -162,31 +254,37 @@ export default function PairDetailScreen() {
     loading: historyLoading,
     error: historyError,
   } = useMarginHistory(
-    isManagerForThisPool ? stored?.margin_manager_id ?? null : null,
-    stored?.base_margin_pool_id ?? null,
-    stored?.quote_margin_pool_id ?? null
+    marginManagerId,
+    poolInfoForPair?.base_margin_pool_id ?? null,
+    poolInfoForPair?.quote_margin_pool_id ?? null
   );
 
-  const [linkManagerId, setLinkManagerId] = useState("");
   const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy");
   const [price, setPrice] = useState("");
   const [quantity, setQuantity] = useState("");
   const [payWithDeep, setPayWithDeep] = useState(true);
+  const [createManagerLoading, setCreateManagerLoading] = useState(false);
+  /** Optimistic entry after create so CTA hides before RPC includes the new object. */
+  const [justCreatedManager, setJustCreatedManager] = useState<{
+    margin_manager_id: string;
+    deepbook_pool_id: string;
+  } | null>(null);
+  const [accountPickerVisible, setAccountPickerVisible] = useState(false);
 
-  const onSaveLinkedManager = useCallback(() => {
-    if (!suiAddress || !linkManagerId.trim() || !poolInfoForPair) {
-      Alert.alert("Link manager", "Enter your margin manager ID.");
-      return;
-    }
-    const data: StoredMarginManager = {
-      margin_manager_id: linkManagerId.trim(),
-      deepbook_pool_id: poolInfoForPair.deepbook_pool_id,
-      base_margin_pool_id: poolInfoForPair.base_margin_pool_id,
-      quote_margin_pool_id: poolInfoForPair.quote_margin_pool_id,
-    };
-    save(data);
-    setLinkManagerId("");
-  }, [suiAddress, linkManagerId, poolInfoForPair, save]);
+  useEffect(() => {
+    if (!justCreatedManager || !poolIdForMatch || !ownedManagers.length) return;
+    const apiHasManager = ownedManagers.some(
+      (m) => m.deepbook_pool_id?.toLowerCase() === poolIdForMatch
+    );
+    if (apiHasManager) setJustCreatedManager(null);
+  }, [justCreatedManager, poolIdForMatch, ownedManagers]);
+
+  useEffect(() => {
+    setJustCreatedManager(null);
+  }, [decodedPoolName]);
+
+  const { signRawHash } = useSignRawHash();
+  const suiWallet = getSuiWalletFromUser(user);
 
   const onDeposit = () =>
     Alert.alert("Deposit", "Deposit flow will connect to SDK/backend.");
@@ -196,11 +294,68 @@ export default function PairDetailScreen() {
     Alert.alert("Borrow", "Borrow flow will connect to SDK/backend.");
   const onRepay = () =>
     Alert.alert("Repay", "Repay flow will connect to SDK/backend.");
-  const onCreateManager = () =>
-    Alert.alert(
-      "Create margin manager",
-      "Create margin manager will connect to SDK/backend."
-    );
+
+  const onCreateManager = useCallback(async () => {
+    if (!suiAddress || !decodedPoolName) {
+      Alert.alert("Error", "Wallet and pool are required.");
+      return;
+    }
+    if (!poolInfoForPair) {
+      Alert.alert(
+        "Pool not available",
+        "This trading pair is not available for margin yet. Try SUI/USDC or another pair from the list."
+      );
+      return;
+    }
+    if (!signRawHash) {
+      Alert.alert("Error", "Signing not available. Please try again.");
+      return;
+    }
+    const publicKey = suiWallet?.publicKey;
+    if (!publicKey) {
+      Alert.alert(
+        "Error",
+        "Sui wallet public key not found. Link your Sui wallet on Home."
+      );
+      return;
+    }
+    const poolKey = decodedPoolName;
+    setCreateManagerLoading(true);
+    try {
+      const publicKeyHex = publicKeyToHex(publicKey);
+      const result = await createMarginManagerViaBackend({
+        apiUrl,
+        sender: suiAddress,
+        poolKey,
+        signRawHash,
+        publicKeyHex,
+        network: "mainnet",
+      });
+      setJustCreatedManager({
+        margin_manager_id: result.margin_manager_id,
+        deepbook_pool_id: poolInfoForPair.deepbook_pool_id,
+      });
+      await refreshOwned();
+      Alert.alert(
+        "Success",
+        "Margin manager created. You can now deposit and trade."
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Create failed";
+      Alert.alert("Create margin manager failed", msg);
+    } finally {
+      setCreateManagerLoading(false);
+    }
+  }, [
+    suiAddress,
+    decodedPoolName,
+    poolInfoForPair,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    refreshOwned,
+  ]);
+
   const onPlaceOrder = () => {
     if (!price.trim() || !quantity.trim()) {
       Alert.alert("Place order", "Enter price and quantity.");
@@ -212,7 +367,23 @@ export default function PairDetailScreen() {
     );
   };
 
-  const hasManager = !!stored?.margin_manager_id && isManagerForThisPool;
+  const onSwitchMarginAccount = useCallback(() => {
+    if (!suiAddress || !decodedPoolName || matchesForThisPool.length <= 1)
+      return;
+    setAccountPickerVisible(true);
+  }, [suiAddress, decodedPoolName, matchesForThisPool]);
+
+  const onSelectMarginAccount = useCallback(
+    (id: string) => {
+      if (!suiAddress || !decodedPoolName) return;
+      setSelectedMarginManagerId(suiAddress, decodedPoolName, id);
+      setSelectedMarginManagerIdForPool(id);
+      setAccountPickerVisible(false);
+    },
+    [suiAddress, decodedPoolName]
+  );
+
+  const hasManager = !!managerForThisPool;
   const displayPoolLabel = decodedPoolName
     ? formatPairLabel(decodedPoolName)
     : "—";
@@ -359,68 +530,86 @@ export default function PairDetailScreen() {
         <>
           <View style={styles.card}>
             <Text style={styles.cardLabel}>Margin account</Text>
-            {!hasManager ? (
+            {ownedLoading && !hasManager ? (
+              <View style={styles.row}>
+                <ActivityIndicator size="small" color={colors.tint} />
+                <Text style={styles.muted}>Checking for margin manager…</Text>
+              </View>
+            ) : !hasManager ? (
               <>
                 <Text style={styles.muted}>
-                  No margin manager linked for this pair.
+                  No margin manager for this pair. Create one to trade with
+                  margin.
                 </Text>
+                {!poolInfoForPair && (
+                  <Text
+                    style={[styles.muted, styles.errorText, { marginTop: 8 }]}
+                  >
+                    This pair is not available for margin yet.
+                  </Text>
+                )}
                 <Pressable
                   onPress={onCreateManager}
+                  disabled={createManagerLoading}
                   style={({ pressed }) => [
                     styles.primaryButton,
                     {
                       backgroundColor: colors.tint,
-                      opacity: pressed ? 0.8 : 1,
+                      opacity: pressed || createManagerLoading ? 0.8 : 1,
                       marginTop: 16,
+                      minHeight: 48,
+                      justifyContent: "center",
                     },
                   ]}
+                  accessibilityRole="button"
+                  accessibilityLabel="Create margin manager"
                 >
-                  <Text
-                    style={[
-                      styles.primaryButtonText,
-                      { color: colors.background },
-                    ]}
-                  >
-                    Create margin manager
-                  </Text>
-                </Pressable>
-                <Text style={[styles.inputLabel, { marginTop: 20 }]}>
-                  Link existing manager
-                </Text>
-                <TextInput
-                  style={[
-                    styles.input,
-                    { color: colors.text, borderColor: colors.tabIconDefault },
-                  ]}
-                  placeholder="Margin manager ID (0x…)"
-                  placeholderTextColor={colors.tabIconDefault}
-                  value={linkManagerId}
-                  onChangeText={setLinkManagerId}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                />
-                <Pressable
-                  onPress={onSaveLinkedManager}
-                  style={({ pressed }) => [
-                    styles.primaryButton,
-                    {
-                      backgroundColor: colors.tint,
-                      opacity: pressed ? 0.8 : 1,
-                    },
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.primaryButtonText,
-                      { color: colors.background },
-                    ]}
-                  >
-                    Save & load
-                  </Text>
+                  {createManagerLoading ? (
+                    <ActivityIndicator size="small" color={colors.background} />
+                  ) : (
+                    <Text
+                      style={[
+                        styles.primaryButtonText,
+                        { color: colors.background },
+                      ]}
+                    >
+                      Create margin manager
+                    </Text>
+                  )}
                 </Pressable>
               </>
             ) : (
               <>
+                {matchesForThisPool.length > 1 && (
+                  <Pressable
+                    onPress={onSwitchMarginAccount}
+                    style={({ pressed }) => [
+                      styles.row,
+                      { marginBottom: 12, opacity: pressed ? 0.8 : 1 },
+                    ]}
+                  >
+                    <Text style={styles.muted}>Account</Text>
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      <Text style={styles.muted} numberOfLines={1}>
+                        {marginManagerId && marginManagerId.length > 16
+                          ? `${marginManagerId.slice(
+                              0,
+                              8
+                            )}…${marginManagerId.slice(-8)}`
+                          : marginManagerId}
+                      </Text>
+                      <Text style={[styles.value, { color: colors.tint }]}>
+                        Switch
+                      </Text>
+                    </View>
+                  </Pressable>
+                )}
                 {stateLoading && !state && (
                   <View style={styles.row}>
                     <ActivityIndicator size="small" color={colors.tint} />
@@ -706,6 +895,101 @@ export default function PairDetailScreen() {
           </View>
         </>
       )}
+
+      <Modal
+        visible={accountPickerVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setAccountPickerVisible(false)}
+      >
+        <Pressable
+          style={styles.accountPickerBackdrop}
+          onPress={() => setAccountPickerVisible(false)}
+        >
+          <Pressable
+            style={[
+              styles.accountPickerCard,
+              {
+                backgroundColor: colors.background,
+                borderColor: colors.tabIconDefault,
+              },
+            ]}
+            onPress={() => {}}
+          >
+            <Text style={[styles.accountPickerTitle, { color: colors.text }]}>
+              Choose margin account
+            </Text>
+            <Text style={[styles.accountPickerMessage, { color: colors.text }]}>
+              You have multiple margin accounts for this pair. Select which one
+              to use (e.g. if you created one elsewhere).
+            </Text>
+            <ScrollView
+              style={styles.accountPickerList}
+              showsVerticalScrollIndicator={false}
+              keyboardShouldPersistTaps="handled"
+            >
+              {matchesForThisPool.map((m) => {
+                const id = m.margin_manager_id;
+                const label =
+                  id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-8)}` : id;
+                const isSelected = marginManagerId === id;
+                return (
+                  <Pressable
+                    key={id}
+                    onPress={() => onSelectMarginAccount(id)}
+                    style={({ pressed }) => [
+                      styles.accountPickerOption,
+                      { borderColor: colors.tabIconDefault },
+                      isSelected && {
+                        borderColor: colors.tint,
+                        backgroundColor: `${colors.tint}18`,
+                      },
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.accountPickerOptionText,
+                        { color: colors.text },
+                        isSelected && { color: colors.tint, fontWeight: "600" },
+                      ]}
+                      numberOfLines={1}
+                    >
+                      {label}
+                    </Text>
+                    {isSelected && (
+                      <Text
+                        style={[
+                          styles.accountPickerCheck,
+                          { color: colors.tint },
+                        ]}
+                      >
+                        ✓
+                      </Text>
+                    )}
+                  </Pressable>
+                );
+              })}
+            </ScrollView>
+            <Pressable
+              onPress={() => setAccountPickerVisible(false)}
+              style={({ pressed }) => [
+                styles.accountPickerCancel,
+                {
+                  borderColor: colors.tabIconDefault,
+                  opacity: pressed ? 0.8 : 1,
+                },
+              ]}
+            >
+              <Text
+                style={[styles.accountPickerCancelText, { color: colors.text }]}
+              >
+                Cancel
+              </Text>
+            </Pressable>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </ScrollView>
   );
 }
@@ -854,4 +1138,63 @@ const styles = StyleSheet.create({
   orderDetail: { flex: 1, fontSize: 14 },
   buy: { color: "#22c55e", fontWeight: "700", width: 56 },
   sell: { color: "#ef4444", fontWeight: "700", width: 56 },
+  accountPickerBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 24,
+  },
+  accountPickerCard: {
+    width: "100%",
+    maxWidth: 400,
+    borderRadius: 16,
+    borderWidth: 1,
+    padding: 24,
+    maxHeight: "80%",
+  },
+  accountPickerTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+    marginBottom: 10,
+  },
+  accountPickerMessage: {
+    fontSize: 14,
+    opacity: 0.85,
+    marginBottom: 20,
+    lineHeight: 20,
+  },
+  accountPickerList: {
+    maxHeight: 280,
+    marginBottom: 16,
+  },
+  accountPickerOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 14,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    borderWidth: 1,
+    marginBottom: 10,
+  },
+  accountPickerOptionText: {
+    fontSize: 15,
+    flex: 1,
+  },
+  accountPickerCheck: {
+    fontSize: 16,
+    fontWeight: "700",
+    marginLeft: 8,
+  },
+  accountPickerCancel: {
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 1,
+    alignItems: "center",
+  },
+  accountPickerCancelText: {
+    fontSize: 16,
+    fontWeight: "600",
+  },
 });

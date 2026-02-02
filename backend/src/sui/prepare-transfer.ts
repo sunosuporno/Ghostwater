@@ -58,17 +58,17 @@ export async function prepareTransfer(
     const [coin] = tx.splitCoins(tx.gas, [amountMist]);
     tx.transferObjects([coin], tx.pure.address(recipient));
   } else {
-    const { data: coins } = await client.core.listCoins({
+    const { objects: coins } = await client.core.listCoins({
       owner: sender,
       coinType,
     });
     if (!coins?.length) throw new Error("No coins to transfer");
-    const totalAvailable = coins.reduce(
+    const totalAvailable = coins.reduce<bigint>(
       (sum, c) => sum + BigInt(c.balance ?? 0),
       0n
     );
     if (amountMist > totalAvailable) throw new Error("Amount exceeds balance");
-    const coinRefs = coins.map((c) => c.coinObjectId);
+    const coinRefs = coins.map((c) => c.objectId);
     if (coinRefs.length === 1) {
       const [coin] = tx.splitCoins(tx.object(coinRefs[0]), [amountMist]);
       tx.transferObjects([coin], tx.pure.address(recipient));

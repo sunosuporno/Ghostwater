@@ -1,22 +1,24 @@
 /**
- * Take signed intent (signature + public key) and tx bytes, build serialized
- * signature, then execute on Sui. Uses @mysten/sui (runs only on backend).
+ * Execute a signed "create margin manager" transaction and return the new manager ID.
+ * Reuses the same signing/execute flow as transfer; parses result for created MarginManager.
  */
 
+import type { SuiClientTypes } from "@mysten/sui/client";
 import { toSerializedSignature } from "@mysten/sui/cryptography";
 import { getJsonRpcFullnodeUrl, SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { publicKeyFromRawBytes } from "@mysten/sui/verify";
 import { Buffer } from "buffer";
 
-export type ExecuteTransferParams = {
+export type ExecuteCreateMarginManagerParams = {
   txBytesBase64: string;
   signatureHex: string;
-  publicKeyHex: string; // 0x + 64 hex chars (32 bytes)
+  publicKeyHex: string;
   network?: "mainnet" | "testnet";
 };
 
-export type ExecuteTransferResult = {
+export type ExecuteCreateMarginManagerResult = {
   digest: string;
+  margin_manager_id: string;
 };
 
 function hexToBytes(hex: string): Uint8Array {
@@ -29,9 +31,9 @@ function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
-export async function executeTransfer(
-  params: ExecuteTransferParams
-): Promise<ExecuteTransferResult> {
+export async function executeCreateMarginManager(
+  params: ExecuteCreateMarginManagerParams
+): Promise<ExecuteCreateMarginManagerResult> {
   const {
     txBytesBase64,
     signatureHex,
@@ -42,7 +44,6 @@ export async function executeTransfer(
   const txBytes = Buffer.from(txBytesBase64, "base64");
   const sigBytes = hexToBytes(signatureHex);
   let publicKeyRaw = hexToBytes(publicKeyHex);
-  // Sui/Privy may send 33 bytes (0x00 scheme + 32 bytes ED25519)
   if (publicKeyRaw.length === 33 && publicKeyRaw[0] === 0x00) {
     publicKeyRaw = publicKeyRaw.slice(1);
   }
@@ -63,7 +64,7 @@ export async function executeTransfer(
   const result = await client.core.executeTransaction({
     transaction: txBytes,
     signatures: [serializedSig],
-    include: { effects: true },
+    include: { effects: true, objectTypes: true },
   });
 
   if (result.$kind === "FailedTransaction") {
@@ -78,5 +79,28 @@ export async function executeTransfer(
     throw new Error(err);
   }
 
-  return { digest: result.Transaction.digest };
+  const tx = result.Transaction as SuiClientTypes.Transaction<{
+    effects: true;
+    objectTypes: true;
+  }>;
+  const effects = tx.effects;
+  const objectTypes = tx.objectTypes ?? {};
+  const changedObjects = effects?.changedObjects ?? [];
+
+  const created = changedObjects.find(
+    (obj) =>
+      obj.idOperation === "Created" &&
+      objectTypes[obj.objectId]?.includes("MarginManager")
+  );
+
+  if (!created?.objectId) {
+    throw new Error(
+      "Could not find created MarginManager in transaction result"
+    );
+  }
+
+  return {
+    digest: tx.digest,
+    margin_manager_id: created.objectId,
+  };
 }
