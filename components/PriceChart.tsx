@@ -1,10 +1,25 @@
-import React, { useMemo, useRef } from 'react';
-import { View, StyleSheet, Dimensions, PanResponder, Pressable } from 'react-native';
-import Svg, { ClipPath, Defs, G, Line, LinearGradient, Path, Rect, Stop } from 'react-native-svg';
-import { Text } from '@/components/Themed';
-import { useColorScheme } from '@/components/useColorScheme';
-import Colors from '@/constants/Colors';
-import { ohlcvTimestampToMs, type OhlcvInterval } from '@/lib/deepbook-indexer';
+import { Text } from "@/components/Themed";
+import { useColorScheme } from "@/components/useColorScheme";
+import Colors from "@/constants/Colors";
+import { ohlcvTimestampToMs, type OhlcvInterval } from "@/lib/deepbook-indexer";
+import React, { useMemo, useRef } from "react";
+import {
+  Dimensions,
+  PanResponder,
+  Pressable,
+  StyleSheet,
+  View,
+} from "react-native";
+import Svg, {
+  ClipPath,
+  Defs,
+  G,
+  Line,
+  LinearGradient,
+  Path,
+  Rect,
+  Stop,
+} from "react-native-svg";
 
 /** OHLCV candle: [timestamp, open, high, low, close, volume] */
 type OhlcvCandle = [number, number, number, number, number, number];
@@ -38,8 +53,13 @@ interface PriceChartProps {
 }
 
 function formatPriceAxis(value: number): string {
-  if (value >= 1000) return value.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  if (value >= 1) return value.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 2 });
+  if (value >= 1000)
+    return value.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  if (value >= 1)
+    return value.toLocaleString(undefined, {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 2,
+    });
   if (value >= 0.01) return value.toFixed(2);
   return value.toFixed(4);
 }
@@ -53,16 +73,20 @@ function formatTimeAxis(
   const ms = ohlcvTimestampToMs(timestamp);
   const d = new Date(ms);
   const hour12 = false;
-  if (options?.showDate ?? ['4h', '1d', '1w'].includes(interval)) {
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  if (options?.showDate ?? ["4h", "1d", "1w"].includes(interval)) {
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
   }
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12 });
+  return d.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12,
+  });
 }
 
-export function PriceChart({
+function PriceChartInner({
   candles,
-  interval = '1h',
-  width = Dimensions.get('window').width - 48,
+  interval = "1h",
+  width = Dimensions.get("window").width - 48,
   height = CHART_HEIGHT,
   loading,
   loadingOlder,
@@ -76,11 +100,13 @@ export function PriceChart({
   onReachedStart,
 }: PriceChartProps) {
   const colorScheme = useColorScheme();
-  const colors = Colors[colorScheme ?? 'light'];
-  const gridColor = colorScheme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)';
+  const colors = Colors[colorScheme ?? "light"];
+  const gridColor =
+    colorScheme === "dark" ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)";
   const lineColor = colors.tint;
 
-  const useScrollbar = totalCandles > candleLimit && typeof onScrollbarChange === 'function';
+  const useScrollbar =
+    totalCandles > candleLimit && typeof onScrollbarChange === "function";
   const trackLayoutRef = useRef<{ x: number; width: number } | null>(null);
   const scrollbarTrackRef = useRef<View>(null);
   const scrollbarPanResponder = useMemo(
@@ -120,12 +146,19 @@ export function PriceChart({
   const scrollbarTrackWidth = contentWidth - PADDING.left - PADDING.right;
   const maxScroll = Math.max(0, totalCandles - candleLimit);
   const scrollbarThumbWidth =
-    maxScroll > 0 ? Math.max(24, (candleLimit / totalCandles) * scrollbarTrackWidth) : scrollbarTrackWidth;
+    maxScroll > 0
+      ? Math.max(24, (candleLimit / totalCandles) * scrollbarTrackWidth)
+      : scrollbarTrackWidth;
   const scrollbarThumbLeft =
-    maxScroll > 0 ? (windowStartProp / maxScroll) * (scrollbarTrackWidth - scrollbarThumbWidth) : 0;
+    maxScroll > 0
+      ? (windowStartProp / maxScroll) *
+        (scrollbarTrackWidth - scrollbarThumbWidth)
+      : 0;
   const chart = useMemo(() => {
     if (!candles.length) return null;
-    const sorted = [...candles].sort((a, b) => ohlcvTimestampToMs(a[0]) - ohlcvTimestampToMs(b[0]));
+    const sorted = [...candles].sort(
+      (a, b) => ohlcvTimestampToMs(a[0]) - ohlcvTimestampToMs(b[0])
+    );
     const lows = sorted.map((c) => c[3]);
     const highs = sorted.map((c) => c[2]);
     const minP = Math.min(...lows);
@@ -145,12 +178,16 @@ export function PriceChart({
       const y = PADDING.top + h - ((c[4] - scaleMin) / scaleRange) * h;
       return { x, y };
     });
-    const lineD = points.length ? `M ${points.map((p) => `${p.x},${p.y}`).join(' L ')}` : '';
+    const lineD = points.length
+      ? `M ${points.map((p) => `${p.x},${p.y}`).join(" L ")}`
+      : "";
     const bottom = height - PADDING.bottom;
     const areaD =
       points.length > 0
-        ? `${lineD} L ${points[points.length - 1].x},${bottom} L ${points[0].x},${bottom} Z`
-        : '';
+        ? `${lineD} L ${points[points.length - 1].x},${bottom} L ${
+            points[0].x
+          },${bottom} Z`
+        : "";
 
     const yTickValues: number[] = [];
     for (let i = 0; i <= Y_TICKS; i++) {
@@ -166,9 +203,10 @@ export function PriceChart({
     for (let i = 0; i <= X_TICKS; i++) {
       xTickIndices.push(Math.round((i / X_TICKS) * (sorted.length - 1)));
     }
-    const dayKey = (ts: number) => new Date(ohlcvTimestampToMs(ts)).toDateString();
-    const firstDay = sorted.length ? dayKey(sorted[0][0]) : '';
-    const lastDay = sorted.length ? dayKey(sorted[sorted.length - 1][0]) : '';
+    const dayKey = (ts: number) =>
+      new Date(ohlcvTimestampToMs(ts)).toDateString();
+    const firstDay = sorted.length ? dayKey(sorted[0][0]) : "";
+    const lastDay = sorted.length ? dayKey(sorted[sorted.length - 1][0]) : "";
     const crossesMidnight = firstDay !== lastDay;
     const sortedIndices = [...new Set(xTickIndices)].sort((a, b) => a - b);
     const xTicks = sortedIndices
@@ -177,10 +215,23 @@ export function PriceChart({
         if (!c) return null;
         const x = PADDING.left + (idx / (sorted.length - 1 || 1)) * w;
         const prevIdx = arrIdx > 0 ? sortedIndices[arrIdx - 1] : null;
-        const showDate = crossesMidnight && (arrIdx === 0 || (prevIdx != null && dayKey(c[0]) !== dayKey(sorted[prevIdx][0])));
-        return { x, ts: c[0], label: formatTimeAxis(c[0], interval, { showDate }), isDateOnly: showDate };
+        const showDate =
+          crossesMidnight &&
+          (arrIdx === 0 ||
+            (prevIdx != null && dayKey(c[0]) !== dayKey(sorted[prevIdx][0])));
+        return {
+          x,
+          ts: c[0],
+          label: formatTimeAxis(c[0], interval, { showDate }),
+          isDateOnly: showDate,
+        };
       })
-      .filter(Boolean) as { x: number; ts: number; label: string; isDateOnly?: boolean }[];
+      .filter(Boolean) as {
+      x: number;
+      ts: number;
+      label: string;
+      isDateOnly?: boolean;
+    }[];
 
     const gridLines = {
       horizontal: yTicks.map((t) => ({ y: t.y })),
@@ -210,7 +261,7 @@ export function PriceChart({
     return (
       <View style={[styles.container, { width, minHeight: height }]}>
         <Text style={[styles.muted, { color: colors.text }]}>
-          {loading ? 'Loading chart…' : 'No chart data'}
+          {loading ? "Loading chart…" : "No chart data"}
         </Text>
       </View>
     );
@@ -226,13 +277,24 @@ export function PriceChart({
   return (
     <View style={[styles.wrapper, { width: contentWidth }]}>
       {loadingOlder ? (
-        <View style={[styles.loadingOlderBar, { backgroundColor: colors.tabIconDefault }]}>
-          <Text style={[styles.loadingOlderText, { color: colors.text }]}>Loading older…</Text>
+        <View
+          style={[
+            styles.loadingOlderBar,
+            { backgroundColor: colors.tabIconDefault },
+          ]}
+        >
+          <Text style={[styles.loadingOlderText, { color: colors.text }]}>
+            Loading older…
+          </Text>
         </View>
       ) : null}
       <View style={styles.yAxis}>
         {yTicksHighToLow.map((t, i) => (
-          <Text key={i} style={[styles.yLabel, { color: colors.text }]} numberOfLines={1}>
+          <Text
+            key={i}
+            style={[styles.yLabel, { color: colors.text }]}
+            numberOfLines={1}
+          >
             {t.label}
           </Text>
         ))}
@@ -242,18 +304,31 @@ export function PriceChart({
           onPress={onGoToLatest}
           style={[styles.latestButton, { backgroundColor: colors.tint }]}
         >
-          <Text style={[styles.latestButtonText, { color: colors.background }]}>Latest</Text>
+          <Text style={[styles.latestButtonText, { color: colors.background }]}>
+            Latest
+          </Text>
         </Pressable>
       ) : null}
       <View style={styles.chartRow}>
-        <Svg width={contentWidth} height={height} style={styles.svg} viewBox={`0 0 ${contentWidth} ${height}`} preserveAspectRatio="xMidYMid meet">
+        <Svg
+          width={contentWidth}
+          height={height}
+          style={styles.svg}
+          viewBox={`0 0 ${contentWidth} ${height}`}
+          preserveAspectRatio="xMidYMid meet"
+        >
           <Defs>
             <LinearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
               <Stop offset="0" stopColor={lineColor} stopOpacity="0.25" />
               <Stop offset="1" stopColor={lineColor} stopOpacity="0" />
             </LinearGradient>
             <ClipPath id="chartClip">
-              <Rect x={PADDING.left} y={PADDING.top} width={chartWidth} height={chartHeight} />
+              <Rect
+                x={PADDING.left}
+                y={PADDING.top}
+                width={chartWidth}
+                height={chartHeight}
+              />
             </ClipPath>
           </Defs>
           {/* Plot area background */}
@@ -262,7 +337,11 @@ export function PriceChart({
             y={PADDING.top}
             width={chartWidth}
             height={chartHeight}
-            fill={colorScheme === 'dark' ? 'rgba(255,255,255,0.02)' : 'rgba(0,0,0,0.02)'}
+            fill={
+              colorScheme === "dark"
+                ? "rgba(255,255,255,0.02)"
+                : "rgba(0,0,0,0.02)"
+            }
           />
           {/* Grid */}
           {gridLines.horizontal.map((g, i) => (
@@ -300,11 +379,17 @@ export function PriceChart({
           </G>
         </Svg>
       </View>
-      <View style={[styles.xAxis, { width: chartWidth, marginLeft: PADDING.left }]}>
+      <View
+        style={[styles.xAxis, { width: chartWidth, marginLeft: PADDING.left }]}
+      >
         {xTicks.map((t, i) => (
           <Text
             key={i}
-            style={[styles.xLabel, { color: colors.text }, t.isDateOnly && styles.xLabelBold]}
+            style={[
+              styles.xLabel,
+              { color: colors.text },
+              t.isDateOnly && styles.xLabelBold,
+            ]}
             numberOfLines={1}
           >
             {t.label}
@@ -320,7 +405,10 @@ export function PriceChart({
               {
                 width: scrollbarTrackWidth,
                 marginLeft: PADDING.left,
-                backgroundColor: colorScheme === 'dark' ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.08)',
+                backgroundColor:
+                  colorScheme === "dark"
+                    ? "rgba(255,255,255,0.1)"
+                    : "rgba(0,0,0,0.08)",
               },
             ]}
             onLayout={(e) => {
@@ -347,33 +435,35 @@ export function PriceChart({
   );
 }
 
+export const PriceChart = React.memo(PriceChartInner);
+
 const styles = StyleSheet.create({
   container: {
     marginVertical: 8,
-    justifyContent: 'center',
+    justifyContent: "center",
   },
   wrapper: {
     marginVertical: 4,
     minHeight: CHART_HEIGHT,
-    overflow: 'hidden',
+    overflow: "hidden",
   },
   loadingOlderBar: {
-    position: 'absolute',
+    position: "absolute",
     top: 0,
     left: 0,
     right: 0,
     height: 24,
     zIndex: 2,
-    justifyContent: 'center',
-    alignItems: 'center',
+    justifyContent: "center",
+    alignItems: "center",
     opacity: 0.9,
   },
   loadingOlderText: {
     fontSize: 11,
-    fontWeight: '500',
+    fontWeight: "500",
   },
   latestButton: {
-    position: 'absolute',
+    position: "absolute",
     top: 8,
     right: 12,
     zIndex: 3,
@@ -383,52 +473,52 @@ const styles = StyleSheet.create({
   },
   latestButtonText: {
     fontSize: 12,
-    fontWeight: '600',
+    fontWeight: "600",
   },
   svg: {
-    position: 'absolute',
+    position: "absolute",
     left: 0,
     top: 0,
-    overflow: 'hidden',
+    overflow: "hidden",
   },
   chartRow: {
     height: CHART_HEIGHT,
-    width: '100%',
-    overflow: 'hidden',
+    width: "100%",
+    overflow: "hidden",
   },
   yAxis: {
-    position: 'absolute',
+    position: "absolute",
     left: 0,
     top: PADDING.top,
     width: PADDING.left - 8,
     height: CHART_HEIGHT - PADDING.top - PADDING.bottom,
-    justifyContent: 'space-between',
+    justifyContent: "space-between",
     zIndex: 1,
   },
   yLabel: {
     fontSize: 11,
-    fontWeight: '500',
+    fontWeight: "500",
     opacity: 0.85,
   },
   xAxis: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
+    flexDirection: "row",
+    justifyContent: "space-between",
     paddingHorizontal: 4,
     paddingRight: 8,
     marginTop: -4,
     height: 22,
-    alignItems: 'center',
+    alignItems: "center",
   },
   xLabel: {
     fontSize: 10,
-    fontWeight: '600',
+    fontWeight: "600",
     opacity: 0.85,
     maxWidth: 64,
-    textAlign: 'center',
+    textAlign: "center",
     letterSpacing: 0.2,
   },
   xLabelBold: {
-    fontWeight: '700',
+    fontWeight: "700",
   },
   scrollbarBox: {
     marginTop: 12,
@@ -436,20 +526,20 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 0,
     borderRadius: 12,
-    alignSelf: 'stretch',
+    alignSelf: "stretch",
   },
   scrollbarTrack: {
     height: 10,
-    justifyContent: 'center',
+    justifyContent: "center",
     borderRadius: 5,
-    overflow: 'hidden',
+    overflow: "hidden",
   },
   scrollbarThumb: {
-    position: 'absolute',
+    position: "absolute",
     height: 10,
     borderRadius: 5,
     top: 0,
-    shadowColor: '#000',
+    shadowColor: "#000",
     shadowOffset: { width: 0, height: 1 },
     shadowOpacity: 0.2,
     shadowRadius: 2,
@@ -458,13 +548,13 @@ const styles = StyleSheet.create({
   muted: {
     fontSize: 14,
     opacity: 0.7,
-    textAlign: 'center',
+    textAlign: "center",
     paddingVertical: 24,
   },
   error: {
     fontSize: 14,
-    color: '#ef4444',
-    textAlign: 'center',
+    color: "#ef4444",
+    textAlign: "center",
     paddingVertical: 24,
   },
 });

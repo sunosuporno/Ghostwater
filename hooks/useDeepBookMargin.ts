@@ -541,36 +541,52 @@ export function useMarginManagerState(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const fetchState = useCallback(async () => {
     if (!marginManagerId || !deepbookPoolId) {
       setState(null);
       setLoading(false);
       setError(null);
       return;
     }
-    let cancelled = false;
     setLoading(true);
     setError(null);
-    fetchMarginManagerStates({ deepbook_pool_id: deepbookPoolId })
-      .then((list) => {
-        if (cancelled) return;
-        const mine =
-          list.find((s) => s.margin_manager_id === marginManagerId) ?? null;
-        setState(mine);
-      })
-      .catch((e) => {
-        if (!cancelled)
-          setError(e instanceof Error ? e.message : "Failed to load state");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
+    try {
+      const list = await fetchMarginManagerStates({
+        deepbook_pool_id: deepbookPoolId,
       });
-    return () => {
-      cancelled = true;
-    };
+      const mine =
+        list.find((s) => s.margin_manager_id === marginManagerId) ?? null;
+      setState(mine);
+      if (__DEV__) {
+        console.log("[Margin] Refresh state result", {
+          deepbook_pool_id: deepbookPoolId,
+          marginManagerId,
+          listLength: list.length,
+          found: !!mine,
+          state: mine
+            ? {
+                base_asset: mine.base_asset,
+                quote_asset: mine.quote_asset,
+                risk_ratio: mine.risk_ratio,
+              }
+            : null,
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load state");
+      if (__DEV__) {
+        console.warn("[Margin] Refresh state error", e);
+      }
+    } finally {
+      setLoading(false);
+    }
   }, [marginManagerId, deepbookPoolId]);
 
-  return { state, loading, error };
+  useEffect(() => {
+    fetchState();
+  }, [fetchState]);
+
+  return { state, loading, error, refresh: fetchState };
 }
 
 export function useMarginHistory(
@@ -585,7 +601,7 @@ export function useMarginHistory(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const fetchHistory = useCallback(async () => {
     if (!marginManagerId || !baseMarginPoolId || !quoteMarginPoolId) {
       setCollateral([]);
       setBorrowed([]);
@@ -595,83 +611,98 @@ export function useMarginHistory(
       setError(null);
       return;
     }
-    let cancelled = false;
     setLoading(true);
     setError(null);
     const limit = HISTORY_LIMIT;
-    Promise.all([
-      fetchCollateralEvents({ margin_manager_id: marginManagerId, limit }),
-      fetchLoanBorrowed({
-        margin_manager_id: marginManagerId,
-        margin_pool_id: baseMarginPoolId,
-        limit,
-      }),
-      fetchLoanBorrowed({
-        margin_manager_id: marginManagerId,
-        margin_pool_id: quoteMarginPoolId,
-        limit,
-      }),
-      fetchLoanRepaid({
-        margin_manager_id: marginManagerId,
-        margin_pool_id: baseMarginPoolId,
-        limit,
-      }),
-      fetchLoanRepaid({
-        margin_manager_id: marginManagerId,
-        margin_pool_id: quoteMarginPoolId,
-        limit,
-      }),
-      fetchLiquidation({
-        margin_manager_id: marginManagerId,
-        margin_pool_id: baseMarginPoolId,
-        limit,
-      }),
-      fetchLiquidation({
-        margin_manager_id: marginManagerId,
-        margin_pool_id: quoteMarginPoolId,
-        limit,
-      }),
-    ])
-      .then(([col, bBase, bQuote, rBase, rQuote, liqBase, liqQuote]) => {
-        if (cancelled) return;
-        setCollateral(col ?? []);
-        const allBorrowed = [...(bBase ?? []), ...(bQuote ?? [])].sort(
-          (a, b) => b.onchain_timestamp - a.onchain_timestamp
-        );
-        setBorrowed(allBorrowed.slice(0, limit));
-        const allRepaid = [...(rBase ?? []), ...(rQuote ?? [])].sort(
-          (a, b) => b.onchain_timestamp - a.onchain_timestamp
-        );
-        setRepaid(allRepaid.slice(0, limit));
-        const allLiq = [...(liqBase ?? []), ...(liqQuote ?? [])].sort(
-          (a, b) => b.onchain_timestamp - a.onchain_timestamp
-        );
-        setLiquidations(allLiq);
-      })
-      .catch((e) => {
-        if (!cancelled)
-          setError(e instanceof Error ? e.message : "Failed to load history");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const [col, bBase, bQuote, rBase, rQuote, liqBase, liqQuote] =
+        await Promise.all([
+          fetchCollateralEvents({ margin_manager_id: marginManagerId, limit }),
+          fetchLoanBorrowed({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: baseMarginPoolId,
+            limit,
+          }),
+          fetchLoanBorrowed({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: quoteMarginPoolId,
+            limit,
+          }),
+          fetchLoanRepaid({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: baseMarginPoolId,
+            limit,
+          }),
+          fetchLoanRepaid({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: quoteMarginPoolId,
+            limit,
+          }),
+          fetchLiquidation({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: baseMarginPoolId,
+            limit,
+          }),
+          fetchLiquidation({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: quoteMarginPoolId,
+            limit,
+          }),
+        ]);
+      setCollateral(col ?? []);
+      const allBorrowed = [...(bBase ?? []), ...(bQuote ?? [])].sort(
+        (a, b) => b.onchain_timestamp - a.onchain_timestamp
+      );
+      setBorrowed(allBorrowed.slice(0, limit));
+      const allRepaid = [...(rBase ?? []), ...(rQuote ?? [])].sort(
+        (a, b) => b.onchain_timestamp - a.onchain_timestamp
+      );
+      setRepaid(allRepaid.slice(0, limit));
+      const allLiq = [...(liqBase ?? []), ...(liqQuote ?? [])].sort(
+        (a, b) => b.onchain_timestamp - a.onchain_timestamp
+      );
+      setLiquidations(allLiq);
+      if (__DEV__) {
+        console.log("[Margin] Refresh history result", {
+          marginManagerId,
+          collateralCount: (col ?? []).length,
+          borrowedCount: (bBase ?? []).length + (bQuote ?? []).length,
+          repaidCount: (rBase ?? []).length + (rQuote ?? []).length,
+          liquidationsCount: (liqBase ?? []).length + (liqQuote ?? []).length,
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load history");
+      if (__DEV__) {
+        console.warn("[Margin] Refresh history error", e);
+      }
+    } finally {
+      setLoading(false);
+    }
   }, [marginManagerId, baseMarginPoolId, quoteMarginPoolId]);
 
-  return { collateral, borrowed, repaid, liquidations, loading, error };
+  useEffect(() => {
+    fetchHistory();
+  }, [fetchHistory]);
+
+  return {
+    collateral,
+    borrowed,
+    repaid,
+    liquidations,
+    loading,
+    error,
+    refresh: fetchHistory,
+  };
 }
 
 /** Approximate collateral USD from state (base * basePrice + quote * quotePrice with Pyth decimals). */
 export function collateralUsdFromState(s: MarginManagerState | null): string {
   if (!s) return "0";
   const baseVal =
-    (Number(s.base_asset) / 10 ** s.base_pyth_decimals) *
-    (s.base_pyth_price / 10 ** s.base_pyth_decimals);
+    Number(s.base_asset) * (s.base_pyth_price / 10 ** s.base_pyth_decimals);
   const quoteVal =
-    (Number(s.quote_asset) / 10 ** s.quote_pyth_decimals) *
-    (s.quote_pyth_price / 10 ** s.quote_pyth_decimals);
+    Number(s.quote_asset) * (s.quote_pyth_price / 10 ** s.quote_pyth_decimals);
   const sum = baseVal + quoteVal;
   return sum.toLocaleString("en-US", {
     minimumFractionDigits: 2,
@@ -683,11 +714,9 @@ export function collateralUsdFromState(s: MarginManagerState | null): string {
 export function debtUsdFromState(s: MarginManagerState | null): string {
   if (!s) return "0";
   const baseDebt =
-    (Number(s.base_debt) / 10 ** s.base_pyth_decimals) *
-    (s.base_pyth_price / 10 ** s.base_pyth_decimals);
+    Number(s.base_debt) * (s.base_pyth_price / 10 ** s.base_pyth_decimals);
   const quoteDebt =
-    (Number(s.quote_debt) / 10 ** s.quote_pyth_decimals) *
-    (s.quote_pyth_price / 10 ** s.quote_pyth_decimals);
+    Number(s.quote_debt) * (s.quote_pyth_price / 10 ** s.quote_pyth_decimals);
   const sum = baseDebt + quoteDebt;
   return sum.toLocaleString("en-US", {
     minimumFractionDigits: 2,

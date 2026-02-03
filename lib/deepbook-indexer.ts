@@ -133,6 +133,11 @@ export async function fetchMarginManagersInfo(): Promise<MarginManagerInfo[]> {
   return Array.isArray(raw) ? raw : [];
 }
 
+/**
+ * Returns current state of margin managers. We filter by deepbook_pool_id,
+ * then client-side by margin_manager_id. Note: this view can lag behind
+ * collateral_events (activity) by 1–2 min; activity updates first.
+ */
 export async function fetchMarginManagerStates(params: {
   deepbook_pool_id?: string;
   max_risk_ratio?: number;

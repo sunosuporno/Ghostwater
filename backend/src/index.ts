@@ -6,6 +6,8 @@ import { executeCreateMarginManager } from "./sui/execute-create-margin-manager.
 import { executeTransfer } from "./sui/execute-transfer.js";
 import { getOwnedMarginManagers } from "./sui/owned-margin-managers.js";
 import { prepareCreateMarginManager } from "./sui/prepare-create-margin-manager.js";
+import { prepareMarginDeposit } from "./sui/prepare-margin-deposit.js";
+import { prepareMarginWithdraw } from "./sui/prepare-margin-withdraw.js";
 import { prepareTransfer } from "./sui/prepare-transfer.js";
 if (typeof globalThis.Buffer === "undefined") {
   (globalThis as unknown as { Buffer: typeof Buffer }).Buffer = Buffer;
@@ -116,6 +118,80 @@ app.post("/api/prepare-create-margin-manager", async (req, res) => {
     const result = await prepareCreateMarginManager({
       sender,
       poolKey,
+      network: network ?? "mainnet",
+    });
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Prepare failed";
+    res.status(400).json({ error: message });
+  }
+});
+
+/**
+ * POST /api/prepare-margin-deposit
+ * Body: { sender, marginManagerId, poolKey, asset: 'base'|'quote'|'deep', amount, network? }
+ * Returns: { intentMessageHashHex, txBytesBase64 }. Execute via POST /api/execute-transfer.
+ */
+app.post("/api/prepare-margin-deposit", async (req, res) => {
+  try {
+    const { sender, marginManagerId, poolKey, asset, amount, network } =
+      req.body;
+    if (
+      !sender ||
+      !marginManagerId ||
+      !poolKey ||
+      asset == null ||
+      amount == null
+    ) {
+      res.status(400).json({
+        error:
+          "Missing required fields: sender, marginManagerId, poolKey, asset, amount",
+      });
+      return;
+    }
+    const result = await prepareMarginDeposit({
+      sender,
+      marginManagerId,
+      poolKey,
+      asset,
+      amount: Number(amount),
+      network: network ?? "mainnet",
+    });
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Prepare failed";
+    res.status(400).json({ error: message });
+  }
+});
+
+/**
+ * POST /api/prepare-margin-withdraw
+ * Body: { sender, marginManagerId, poolKey, asset: 'base'|'quote'|'deep', amount, network? }
+ * Returns: { intentMessageHashHex, txBytesBase64 }. Execute via POST /api/execute-transfer.
+ */
+app.post("/api/prepare-margin-withdraw", async (req, res) => {
+  try {
+    const { sender, marginManagerId, poolKey, asset, amount, network } =
+      req.body;
+    if (
+      !sender ||
+      !marginManagerId ||
+      !poolKey ||
+      asset == null ||
+      amount == null
+    ) {
+      res.status(400).json({
+        error:
+          "Missing required fields: sender, marginManagerId, poolKey, asset, amount",
+      });
+      return;
+    }
+    const result = await prepareMarginWithdraw({
+      sender,
+      marginManagerId,
+      poolKey,
+      asset,
+      amount: Number(amount),
       network: network ?? "mainnet",
     });
     res.json(result);
