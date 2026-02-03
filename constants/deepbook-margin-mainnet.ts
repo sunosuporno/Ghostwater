@@ -38,6 +38,16 @@ export type SupportedMarginPairMainnet =
 export const MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT = 0.01;
 
 /**
+ * Margin pool config (all pools: SUI, USDC, DEEP, WAL).
+ * Min borrow: 0.1 in human units; orders below this fail at protocol level.
+ * Max utilization ratio: 0.8 (e.g. borrows limited by pool supply).
+ */
+export const MIN_ORDER_QUANTITY = 0.1;
+
+/** Max utilization ratio for margin pools (0.8 = 80%). */
+export const MAX_UTILIZATION_RATIO = 0.8;
+
+/**
  * Max leverage per pool (from integration doc). Used to show max position size.
  * SUI_USDC: 5x; DEEP_USDC, WAL_USDC: 3x.
  */

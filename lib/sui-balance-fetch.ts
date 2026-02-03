@@ -38,23 +38,63 @@ export type SuiBalanceItem = {
   lockedBalance?: Record<string, unknown>;
 };
 
-/** Known coin types: symbol and decimals for display */
-const KNOWN_COINS: Record<string, { symbol: string; decimals: number }> = {
-  "0x2::sui::SUI": { symbol: "SUI", decimals: 9 },
-  "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC":
-    { symbol: "USDC", decimals: 6 },
+/** Sui coin metadata from suix_getCoinMetadata (decimals from chain). */
+type SuiCoinMetadata = {
+  decimals?: number;
+  symbol?: string;
+  name?: string;
+  description?: string;
+  iconUrl?: string;
+  id?: string;
 };
 
-function getSymbolAndDecimals(coinType: string): {
+/** Fallback when suix_getCoinMetadata is missing or fails (e.g. some tokens don't publish metadata). */
+const KNOWN_COINS_FALLBACK: Record<
+  string,
+  { symbol: string; decimals: number }
+> = {
+  "0x2::sui::SUI": { symbol: "SUI", decimals: 9 },
+  "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI":
+    { symbol: "SUI", decimals: 9 },
+  "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC":
+    { symbol: "USDC", decimals: 6 },
+  "0xdeeb7a4662eec9f2f3def03fb937a663dddaa2e215b8078a284d026b7946c270::deep::DEEP":
+    { symbol: "DEEP", decimals: 6 },
+};
+
+function getSymbolAndDecimalsFallback(coinType: string): {
   symbol: string;
   decimals: number;
 } {
   return (
-    KNOWN_COINS[coinType] ?? {
+    KNOWN_COINS_FALLBACK[coinType] ?? {
       symbol: coinType.split("::").pop() ?? coinType.slice(-8),
       decimals: 9,
     }
   );
+}
+
+/** Fetch coin metadata (decimals, symbol) from chain via suix_getCoinMetadata. */
+async function fetchCoinMetadata(
+  coinType: string
+): Promise<SuiCoinMetadata | null> {
+  try {
+    const res = await fetch(MAINNET_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "suix_getCoinMetadata",
+        params: [coinType],
+        id: 1,
+      }),
+    });
+    const json = await res.json();
+    if (json.error || json.result == null) return null;
+    return json.result as SuiCoinMetadata;
+  } catch {
+    return null;
+  }
 }
 
 /** Format raw balance string to human-readable amount */
@@ -69,6 +109,8 @@ export function formatBalance(totalBalance: string, decimals: number): string {
 
 /**
  * Fetch all coin balances for an address (suix_getAllBalances).
+ * Uses each token's actual decimals from suix_getCoinMetadata when available;
+ * otherwise falls back to known coins (e.g. DEEP = 6) or a safe default.
  * Returns array with totalBalance, coinType, symbol, formatted amount, and decimals.
  */
 export async function fetchAllSuiBalances(owner: string): Promise<
@@ -95,8 +137,19 @@ export async function fetchAllSuiBalances(owner: string): Promise<
     throw new Error(json.error.message ?? "RPC error");
   }
   const list = (json.result ?? []) as SuiBalanceItem[];
-  const mapped = list.map((item) => {
-    const { symbol, decimals } = getSymbolAndDecimals(item.coinType);
+  // Fetch metadata (decimals, symbol) from chain for each coin type in parallel
+  const metadataList = await Promise.all(
+    list.map((item) => fetchCoinMetadata(item.coinType))
+  );
+  const mapped = list.map((item, i) => {
+    const meta = metadataList[i];
+    const fallback = getSymbolAndDecimalsFallback(item.coinType);
+    const decimals =
+      typeof meta?.decimals === "number" ? meta.decimals : fallback.decimals;
+    const symbol =
+      typeof meta?.symbol === "string" && meta.symbol.trim() !== ""
+        ? meta.symbol.trim()
+        : fallback.symbol;
     const formatted = formatBalance(item.totalBalance ?? "0", decimals);
     return {
       coinType: item.coinType,

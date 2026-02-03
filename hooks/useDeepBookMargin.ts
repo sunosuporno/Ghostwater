@@ -615,41 +615,78 @@ export function useMarginHistory(
     setError(null);
     const limit = HISTORY_LIMIT;
     try {
-      const [col, bBase, bQuote, rBase, rQuote, liqBase, liqQuote] =
-        await Promise.all([
-          fetchCollateralEvents({ margin_manager_id: marginManagerId, limit }),
-          fetchLoanBorrowed({
-            margin_manager_id: marginManagerId,
-            margin_pool_id: baseMarginPoolId,
-            limit,
-          }),
-          fetchLoanBorrowed({
-            margin_manager_id: marginManagerId,
-            margin_pool_id: quoteMarginPoolId,
-            limit,
-          }),
-          fetchLoanRepaid({
-            margin_manager_id: marginManagerId,
-            margin_pool_id: baseMarginPoolId,
-            limit,
-          }),
-          fetchLoanRepaid({
-            margin_manager_id: marginManagerId,
-            margin_pool_id: quoteMarginPoolId,
-            limit,
-          }),
-          fetchLiquidation({
-            margin_manager_id: marginManagerId,
-            margin_pool_id: baseMarginPoolId,
-            limit,
-          }),
-          fetchLiquidation({
-            margin_manager_id: marginManagerId,
-            margin_pool_id: quoteMarginPoolId,
-            limit,
-          }),
-        ]);
-      setCollateral(col ?? []);
+      // Fetch collateral events: base (e.g. SUI), quote (e.g. USDC), and unfiltered (to include DEEP).
+      // DEEP is a third collateral type (depositDeep); indexer only documents is_base (base/quote).
+      const [
+        colBase,
+        colQuote,
+        colAll,
+        bBase,
+        bQuote,
+        rBase,
+        rQuote,
+        liqBase,
+        liqQuote,
+      ] = await Promise.all([
+        fetchCollateralEvents({
+          margin_manager_id: marginManagerId,
+          is_base: true,
+          limit,
+        }),
+        fetchCollateralEvents({
+          margin_manager_id: marginManagerId,
+          is_base: false,
+          limit,
+        }),
+        fetchCollateralEvents({
+          margin_manager_id: marginManagerId,
+          limit: limit * 2,
+        }),
+        fetchLoanBorrowed({
+          margin_manager_id: marginManagerId,
+          margin_pool_id: baseMarginPoolId,
+          limit,
+        }),
+        fetchLoanBorrowed({
+          margin_manager_id: marginManagerId,
+          margin_pool_id: quoteMarginPoolId,
+          limit,
+        }),
+        fetchLoanRepaid({
+          margin_manager_id: marginManagerId,
+          margin_pool_id: baseMarginPoolId,
+          limit,
+        }),
+        fetchLoanRepaid({
+          margin_manager_id: marginManagerId,
+          margin_pool_id: quoteMarginPoolId,
+          limit,
+        }),
+        fetchLiquidation({
+          margin_manager_id: marginManagerId,
+          margin_pool_id: baseMarginPoolId,
+          limit,
+        }),
+        fetchLiquidation({
+          margin_manager_id: marginManagerId,
+          margin_pool_id: quoteMarginPoolId,
+          limit,
+        }),
+      ]);
+      // Merge base + quote + unfiltered collateral events, dedupe by event_digest, sort newest first, cap at limit
+      const seen = new Set<string>();
+      const merged: CollateralEvent[] = [];
+      const allCol = [
+        ...(colBase ?? []),
+        ...(colQuote ?? []),
+        ...(colAll ?? []),
+      ].sort((a, b) => b.onchain_timestamp - a.onchain_timestamp);
+      for (const e of allCol) {
+        if (seen.has(e.event_digest)) continue;
+        seen.add(e.event_digest);
+        merged.push(e);
+      }
+      setCollateral(merged.slice(0, limit));
       const allBorrowed = [...(bBase ?? []), ...(bQuote ?? [])].sort(
         (a, b) => b.onchain_timestamp - a.onchain_timestamp
       );
@@ -665,7 +702,10 @@ export function useMarginHistory(
       if (__DEV__) {
         console.log("[Margin] Refresh history result", {
           marginManagerId,
-          collateralCount: (col ?? []).length,
+          collateralCount: merged.length,
+          baseEvents: (colBase ?? []).length,
+          quoteEvents: (colQuote ?? []).length,
+          allEvents: (colAll ?? []).length,
           borrowedCount: (bBase ?? []).length + (bQuote ?? []).length,
           repaidCount: (rBase ?? []).length + (rQuote ?? []).length,
           liquidationsCount: (liqBase ?? []).length + (liqQuote ?? []).length,

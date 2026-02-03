@@ -5,9 +5,11 @@ import express from "express";
 import { executeCreateMarginManager } from "./sui/execute-create-margin-manager.js";
 import { executeTransfer } from "./sui/execute-transfer.js";
 import { getOwnedMarginManagers } from "./sui/owned-margin-managers.js";
+import { prepareAddTpsl } from "./sui/prepare-add-tpsl.js";
 import { prepareCreateMarginManager } from "./sui/prepare-create-margin-manager.js";
 import { prepareMarginDeposit } from "./sui/prepare-margin-deposit.js";
 import { prepareMarginWithdraw } from "./sui/prepare-margin-withdraw.js";
+import { preparePlaceOrder } from "./sui/prepare-place-order.js";
 import { prepareTransfer } from "./sui/prepare-transfer.js";
 if (typeof globalThis.Buffer === "undefined") {
   (globalThis as unknown as { Buffer: typeof Buffer }).Buffer = Buffer;
@@ -197,6 +199,124 @@ app.post("/api/prepare-margin-withdraw", async (req, res) => {
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Prepare failed";
+    res.status(400).json({ error: message });
+  }
+});
+
+/**
+ * POST /api/prepare-place-order
+ * Body: { sender, marginManagerId, poolKey, orderType: 'limit'|'market', isBid, quantity, price? (limit), clientOrderId, payWithDeep?, network? }
+ * Returns: { intentMessageHashHex, txBytesBase64 }. Execute via POST /api/execute-transfer.
+ */
+app.post("/api/prepare-place-order", async (req, res) => {
+  try {
+    const {
+      sender,
+      marginManagerId,
+      poolKey,
+      orderType,
+      isBid,
+      quantity,
+      price,
+      clientOrderId,
+      payWithDeep,
+      network,
+    } = req.body;
+    if (
+      !sender ||
+      !marginManagerId ||
+      !poolKey ||
+      orderType == null ||
+      isBid == null ||
+      quantity == null ||
+      clientOrderId == null
+    ) {
+      res.status(400).json({
+        error:
+          "Missing required fields: sender, marginManagerId, poolKey, orderType, isBid, quantity, clientOrderId",
+      });
+      return;
+    }
+    if (orderType !== "limit" && orderType !== "market") {
+      res.status(400).json({ error: "orderType must be 'limit' or 'market'" });
+      return;
+    }
+    // Only treat explicit boolean false as false; otherwise default true (avoids string "false" → true).
+    const payWithDeepFlag =
+      typeof payWithDeep === "boolean" ? payWithDeep : true;
+
+    const result = await preparePlaceOrder({
+      sender,
+      marginManagerId,
+      poolKey,
+      orderType,
+      isBid: Boolean(isBid),
+      quantity: Number(quantity),
+      price: price != null ? Number(price) : undefined,
+      clientOrderId: Number(clientOrderId),
+      payWithDeep: payWithDeepFlag,
+      network: network ?? "mainnet",
+    });
+    res.json(result);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Prepare place order failed";
+    res.status(400).json({ error: message });
+  }
+});
+
+/**
+ * POST /api/prepare-add-tpsl
+ * Body: { sender, marginManagerId, poolKey, isLong, quantity, tpPrice?, slPrice?, payWithDeep?, network? }
+ * Returns: { intentMessageHashHex, txBytesBase64 }. Execute via POST /api/execute-transfer.
+ */
+app.post("/api/prepare-add-tpsl", async (req, res) => {
+  try {
+    const {
+      sender,
+      marginManagerId,
+      poolKey,
+      isLong,
+      quantity,
+      tpPrice,
+      slPrice,
+      payWithDeep,
+      network,
+    } = req.body;
+    if (
+      !sender ||
+      !marginManagerId ||
+      !poolKey ||
+      isLong == null ||
+      quantity == null
+    ) {
+      res.status(400).json({
+        error:
+          "Missing required fields: sender, marginManagerId, poolKey, isLong, quantity",
+      });
+      return;
+    }
+    if (tpPrice == null && slPrice == null) {
+      res.status(400).json({
+        error: "At least one of tpPrice or slPrice is required",
+      });
+      return;
+    }
+    const result = await prepareAddTpsl({
+      sender,
+      marginManagerId,
+      poolKey,
+      isLong: Boolean(isLong),
+      quantity: Number(quantity),
+      tpPrice: tpPrice != null ? Number(tpPrice) : undefined,
+      slPrice: slPrice != null ? Number(slPrice) : undefined,
+      payWithDeep: payWithDeep != null ? Boolean(payWithDeep) : true,
+      network: network ?? "mainnet",
+    });
+    res.json(result);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Prepare add TP/SL failed";
     res.status(400).json({ error: message });
   }
 });

@@ -19,9 +19,9 @@ import {
   getDecimalsForCoinType,
   getMaxLeverageForPool,
   MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT,
+  MIN_ORDER_QUANTITY,
 } from "@/constants/deepbook-margin-mainnet";
 import {
-  collateralUsdFromState,
   debtUsdFromState,
   useMarginHistory,
   useMarginManagersInfo,
@@ -30,6 +30,7 @@ import {
   useOwnedMarginManagers,
   useTicker,
 } from "@/hooks/useDeepBookMargin";
+import { addTpslViaBackend } from "@/lib/add-tpsl-via-backend";
 import { createMarginManagerViaBackend } from "@/lib/create-margin-manager-via-backend";
 import {
   debugFetchOhlcv,
@@ -46,6 +47,7 @@ import {
   getSelectedMarginManagerId,
   setSelectedMarginManagerId,
 } from "@/lib/margin-manager-storage";
+import { placeOrderViaBackend } from "@/lib/place-order-via-backend";
 import { getSuiAddressFromUser, getSuiWalletFromUser } from "@/lib/sui";
 import { fetchSuiBalance } from "@/lib/sui-balance-fetch";
 import { publicKeyToHex } from "@/lib/sui-transfer-via-backend";
@@ -303,9 +305,10 @@ export default function PairDetailScreen() {
   }, [marginManagerId, state]);
 
   const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy");
+  const [orderType, setOrderType] = useState<"limit" | "market">("limit");
+  const [leverage, setLeverage] = useState(1);
   const [price, setPrice] = useState("");
   const [quantity, setQuantity] = useState("");
-  const [payWithDeep, setPayWithDeep] = useState(true);
   const [createManagerLoading, setCreateManagerLoading] = useState(false);
   /** Optimistic entry after create so CTA hides before RPC includes the new object. */
   const [justCreatedManager, setJustCreatedManager] = useState<{
@@ -333,6 +336,10 @@ export default function PairDetailScreen() {
     useState(false);
   const [withdrawAmountExceedsBalance, setWithdrawAmountExceedsBalance] =
     useState(false);
+  const [orderLoading, setOrderLoading] = useState(false);
+  const [tpPrice, setTpPrice] = useState("");
+  const [slPrice, setSlPrice] = useState("");
+  const [tpslLoading, setTpslLoading] = useState(false);
   const marginRefreshPollRef = useRef<ReturnType<typeof setInterval> | null>(
     null
   );
@@ -425,21 +432,26 @@ export default function PairDetailScreen() {
     getDecimalsForAsset,
   ]);
 
-  // Derive available base/quote by summing activity: +deposits -withdrawals per asset.
+  // Derive available base/quote/deep by summing activity: +deposits -withdrawals per asset.
   // Matches what the user sees in the Activity list and updates as soon as new events load.
   const availableFromEventSum = useMemo(() => {
-    if (!collateral.length || !poolInfoForPair) return null;
+    if (!collateral.length) return null;
     let base = 0;
     let quote = 0;
+    let deep = 0;
     for (const e of collateral) {
       const decimals = getDecimalsForCoinType(e.asset_type);
       const humanAmount = Number(e.amount) / Math.pow(10, decimals);
-      const delta = e.event_type === "Deposit" ? humanAmount : -humanAmount;
+      const delta =
+        e.event_type?.toLowerCase() === "deposit" ? humanAmount : -humanAmount;
       const symbol = symbolFromAssetType(e.asset_type);
-      if (symbol === poolInfoForPair.base_asset_symbol) base += delta;
-      else if (symbol === poolInfoForPair.quote_asset_symbol) quote += delta;
+      if (poolInfoForPair && symbol === poolInfoForPair.base_asset_symbol)
+        base += delta;
+      else if (poolInfoForPair && symbol === poolInfoForPair.quote_asset_symbol)
+        quote += delta;
+      else if (symbol === "DEEP") deep += delta;
     }
-    return { base, quote };
+    return { base, quote, deep };
   }, [collateral, poolInfoForPair]);
 
   // Available balance for withdraw: use summed activity first, else state.
@@ -462,6 +474,126 @@ export default function PairDetailScreen() {
     if (withdrawAsset === "quote") return Number(state.quote_asset);
     return null;
   }, [withdrawAsset, availableFromEventSum, state]);
+
+  const maxLeverageForPool = decodedPoolName
+    ? getMaxLeverageForPool(decodedPoolName)
+    : 3;
+  const leverageOptions = useMemo(
+    () =>
+      Array.from({ length: maxLeverageForPool }, (_, i) => (i + 1) as number),
+    [maxLeverageForPool]
+  );
+  useEffect(() => {
+    setLeverage((prev) =>
+      prev > maxLeverageForPool ? maxLeverageForPool : prev < 1 ? 1 : prev
+    );
+  }, [maxLeverageForPool]);
+
+  const [paymentAsset, setPaymentAsset] = useState<"base" | "quote" | "deep">(
+    "quote"
+  );
+
+  const paymentAssetBalance = useMemo(() => {
+    if (!availableFromEventSum) {
+      if (state && paymentAsset === "base") return Number(state.base_asset);
+      if (state && paymentAsset === "quote") return Number(state.quote_asset);
+      return null;
+    }
+    if (paymentAsset === "base") return availableFromEventSum.base;
+    if (paymentAsset === "quote") return availableFromEventSum.quote;
+    if (paymentAsset === "deep") return availableFromEventSum.deep;
+    return null;
+  }, [paymentAsset, availableFromEventSum, state]);
+
+  // Margin account token balances for display (like home screen balances).
+  // Source A: Event sum from GET /collateral_events?margin_manager_id=...
+  //   (https://deepbook-indexer.mainnet.mystenlabs.com/collateral_events)
+  //   Sum of (+Deposit -Withdraw) per asset from activity. Used when collateral.length > 0.
+  // Source B: State from GET /margin_manager_states?deepbook_pool_id=...
+  //   (https://deepbook-indexer.mainnet.mystenlabs.com/margin_manager_states)
+  //   Uses state.base_asset, state.quote_asset. Used when no collateral events yet.
+  const marginBalances = useMemo(() => {
+    const base =
+      availableFromEventSum?.base ??
+      (state ? Number(state.base_asset) : undefined);
+    const quote =
+      availableFromEventSum?.quote ??
+      (state ? Number(state.quote_asset) : undefined);
+    const deep = availableFromEventSum?.deep ?? 0;
+    return { base, quote, deep };
+  }, [availableFromEventSum, state]);
+
+  // Collateral (USD) = base + quote + DEEP, each decimal-adjusted amount × decimal-adjusted price.
+  // Base/quote prices from state Pyth; DEEP price from ticker DEEP_USDC.
+  const collateralUsdTotal = useMemo(() => {
+    const baseAmt = marginBalances.base ?? 0;
+    const quoteAmt = marginBalances.quote ?? 0;
+    const deepAmt = marginBalances.deep ?? 0;
+    const basePrice = state
+      ? Number(state.base_pyth_price) / Math.pow(10, state.base_pyth_decimals)
+      : 0;
+    const quotePrice = state
+      ? Number(state.quote_pyth_price) / Math.pow(10, state.quote_pyth_decimals)
+      : 0;
+    const deepPrice = ticker["DEEP_USDC"]?.last_price ?? 0;
+    return baseAmt * basePrice + quoteAmt * quotePrice + deepAmt * deepPrice;
+  }, [
+    state,
+    marginBalances.base,
+    marginBalances.quote,
+    marginBalances.deep,
+    ticker,
+  ]);
+
+  // Debug: log event_sum (and raw collateral events that produced it)
+  useEffect(() => {
+    if (!__DEV__) return;
+    console.log("[Margin] event_sum", {
+      event_sum: availableFromEventSum ?? null,
+      collateralEventCount: collateral.length,
+      rawCollateralEvents: collateral.map((e) => ({
+        event_type: e.event_type,
+        asset_type: e.asset_type,
+        amount: e.amount,
+      })),
+    });
+  }, [availableFromEventSum, collateral]);
+
+  // Debug: log which source is used and raw values (for tracing wrong balance e.g. -3.1)
+  useEffect(() => {
+    if (!__DEV__ || (!state && !availableFromEventSum)) return;
+    const source =
+      availableFromEventSum != null
+        ? "collateral_events"
+        : "margin_manager_states";
+    console.log("[Margin] Balances source and raw values", {
+      source,
+      collateralEventCount: collateral.length,
+      fromEventSum:
+        availableFromEventSum != null
+          ? {
+              base: availableFromEventSum.base,
+              quote: availableFromEventSum.quote,
+              deep: availableFromEventSum.deep,
+            }
+          : null,
+      fromState:
+        state != null
+          ? {
+              base_asset: state.base_asset,
+              quote_asset: state.quote_asset,
+            }
+          : null,
+      displayed: marginBalances,
+    });
+  }, [
+    state,
+    availableFromEventSum,
+    collateral.length,
+    marginBalances.base,
+    marginBalances.quote,
+    marginBalances.deep,
+  ]);
 
   useEffect(() => {
     if (withdrawAsset === "deep" || withdrawAvailableHuman === null) {
@@ -735,16 +867,201 @@ export default function PairDetailScreen() {
     refreshOwned,
   ]);
 
-  const onPlaceOrder = () => {
-    if (!price.trim() || !quantity.trim()) {
+  const onPlaceOrder = useCallback(async () => {
+    if (orderType === "limit" && (!price.trim() || !quantity.trim())) {
       Alert.alert("Place order", "Enter price and quantity.");
       return;
     }
-    Alert.alert(
-      "Place order",
-      `Limit ${orderSide}: ${quantity} @ ${price} (Pay with DEEP: ${payWithDeep}). Will connect to SDK/backend.`
-    );
-  };
+    if (orderType === "market" && !quantity.trim()) {
+      Alert.alert("Place order", "Enter quantity.");
+      return;
+    }
+    if (!marginManagerId || !decodedPoolName || !suiAddress) {
+      Alert.alert("Place order", "Select a margin account first.");
+      return;
+    }
+    if (!signRawHash || !suiWallet?.publicKey) {
+      Alert.alert("Place order", "Wallet signing not available.");
+      return;
+    }
+    const qty = parseFloat(quantity.trim());
+    if (!Number.isFinite(qty) || qty <= 0) {
+      Alert.alert("Place order", "Enter a valid quantity.");
+      return;
+    }
+    if (qty < MIN_ORDER_QUANTITY) {
+      Alert.alert(
+        "Place order",
+        `Minimum order size is ${MIN_ORDER_QUANTITY} (protocol min borrow).`
+      );
+      return;
+    }
+    const pr = orderType === "limit" ? parseFloat(price.trim()) : undefined;
+    if (
+      orderType === "limit" &&
+      (pr == null || !Number.isFinite(pr) || pr <= 0)
+    ) {
+      Alert.alert("Place order", "Enter a valid price.");
+      return;
+    }
+    // Light client-side check; chain does the real balance check.
+    if (paymentAssetBalance != null) {
+      const priceForMargin =
+        orderType === "limit" && pr != null ? pr : livePrice;
+      if (paymentAsset === "base" && paymentAssetBalance < qty) {
+        Alert.alert(
+          "Place order",
+          `Insufficient ${assetLabel(
+            paymentAsset
+          )}. Max ${paymentAssetBalance.toLocaleString(undefined, {
+            maximumFractionDigits: 6,
+          })} available.`
+        );
+        return;
+      }
+      if (
+        paymentAsset === "quote" &&
+        priceForMargin != null &&
+        priceForMargin > 0
+      ) {
+        const quoteNeeded = qty * priceForMargin;
+        if (paymentAssetBalance < quoteNeeded) {
+          Alert.alert(
+            "Place order",
+            `Insufficient ${assetLabel(
+              paymentAsset
+            )}. Need ~${quoteNeeded.toLocaleString(undefined, {
+              maximumFractionDigits: 2,
+            })}. Max ${paymentAssetBalance.toLocaleString(undefined, {
+              maximumFractionDigits: 6,
+            })} available.`
+          );
+          return;
+        }
+      }
+    }
+    setOrderLoading(true);
+    try {
+      const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
+      await placeOrderViaBackend({
+        apiUrl,
+        sender: suiAddress,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        orderType,
+        isBid: orderSide === "buy",
+        quantity: qty,
+        price: orderType === "limit" ? pr : undefined,
+        payWithDeep: paymentAsset === "deep",
+        signRawHash,
+        publicKeyHex,
+        network: "mainnet",
+      });
+      refreshMarginHistory?.();
+      setPrice("");
+      setQuantity("");
+      Alert.alert("Place order", "Order submitted.");
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : "Place order failed";
+      const isInsufficientMargin =
+        raw.includes("withdraw_with_proof") ||
+        raw.includes("abort code: 3") ||
+        raw.includes("could not automatically determine a budget");
+      const msg = isInsufficientMargin
+        ? "Insufficient margin for this order. Try reducing quantity or add more collateral."
+        : raw;
+      Alert.alert("Place order", msg);
+    } finally {
+      setOrderLoading(false);
+    }
+  }, [
+    orderType,
+    price,
+    quantity,
+    orderSide,
+    paymentAsset,
+    paymentAssetBalance,
+    livePrice,
+    assetLabel,
+    marginManagerId,
+    decodedPoolName,
+    suiAddress,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    refreshMarginHistory,
+  ]);
+
+  const onSetTpsl = useCallback(async () => {
+    const tp = tpPrice.trim() ? parseFloat(tpPrice.trim()) : undefined;
+    const sl = slPrice.trim() ? parseFloat(slPrice.trim()) : undefined;
+    if (tp == null && sl == null) {
+      Alert.alert("TP/SL", "Enter at least one of TP or SL price.");
+      return;
+    }
+    if (
+      !marginManagerId ||
+      !decodedPoolName ||
+      !suiAddress ||
+      !signRawHash ||
+      !suiWallet?.publicKey
+    ) {
+      Alert.alert("TP/SL", "Select margin account and wallet first.");
+      return;
+    }
+    const qty = quantity.trim() ? parseFloat(quantity.trim()) : 0;
+    if (!Number.isFinite(qty) || qty <= 0) {
+      Alert.alert("TP/SL", "Enter a valid quantity (used for closing size).");
+      return;
+    }
+    if (
+      (tp != null && !Number.isFinite(tp)) ||
+      (sl != null && !Number.isFinite(sl))
+    ) {
+      Alert.alert("TP/SL", "Enter valid TP and/or SL prices.");
+      return;
+    }
+    setTpslLoading(true);
+    try {
+      const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
+      await addTpslViaBackend({
+        apiUrl,
+        sender: suiAddress,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        isLong: orderSide === "buy",
+        quantity: qty,
+        tpPrice: tp,
+        slPrice: sl,
+        payWithDeep: paymentAsset === "deep",
+        signRawHash,
+        publicKeyHex,
+        network: "mainnet",
+      });
+      refreshMarginHistory?.();
+      setTpPrice("");
+      setSlPrice("");
+      Alert.alert("TP/SL", "Take profit and/or stop loss set.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Set TP/SL failed";
+      Alert.alert("TP/SL", msg);
+    } finally {
+      setTpslLoading(false);
+    }
+  }, [
+    tpPrice,
+    slPrice,
+    quantity,
+    orderSide,
+    paymentAsset,
+    marginManagerId,
+    decodedPoolName,
+    suiAddress,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    refreshMarginHistory,
+  ]);
 
   const onSwitchMarginAccount = useCallback(() => {
     if (!suiAddress || !decodedPoolName || matchesForThisPool.length <= 1)
@@ -1025,7 +1342,11 @@ export default function PairDetailScreen() {
                       <View style={styles.row}>
                         <Text style={styles.muted}>Collateral (USD)</Text>
                         <Text style={styles.value}>
-                          ${collateralUsdFromState(state)}
+                          $
+                          {collateralUsdTotal.toLocaleString("en-US", {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2,
+                          })}
                         </Text>
                       </View>
                       <View style={styles.row}>
@@ -1054,22 +1375,72 @@ export default function PairDetailScreen() {
                             : `${formatRiskRatio(state.risk_ratio)}×`}
                         </Text>
                       </View>
+                      <View style={{ marginTop: 8, marginBottom: 4 }}>
+                        <Text style={styles.muted}>Balances</Text>
+                      </View>
+                      {[
+                        {
+                          key: "base" as const,
+                          value: marginBalances.base,
+                          label: poolInfoForPair?.base_asset_symbol ?? "Base",
+                        },
+                        {
+                          key: "quote" as const,
+                          value: marginBalances.quote,
+                          label: poolInfoForPair?.quote_asset_symbol ?? "Quote",
+                        },
+                        {
+                          key: "deep" as const,
+                          value: marginBalances.deep,
+                          label: "DEEP",
+                        },
+                      ].map(({ key, value, label }) => {
+                        const isNegative =
+                          value != null && !Number.isNaN(value) && value < 0;
+                        const absValue =
+                          value != null && !Number.isNaN(value)
+                            ? Math.abs(value)
+                            : null;
+                        return (
+                          <View
+                            key={key}
+                            style={[styles.row, { marginTop: 4 }]}
+                          >
+                            <Text style={styles.muted}>{label}</Text>
+                            <Text
+                              style={[
+                                styles.value,
+                                isNegative && styles.riskWarning,
+                              ]}
+                            >
+                              {absValue != null
+                                ? isNegative
+                                  ? `-${absValue.toLocaleString(undefined, {
+                                      minimumFractionDigits: 0,
+                                      maximumFractionDigits: 6,
+                                    })} (borrowed)`
+                                  : absValue.toLocaleString(undefined, {
+                                      minimumFractionDigits: 0,
+                                      maximumFractionDigits: 6,
+                                    })
+                                : "—"}
+                            </Text>
+                          </View>
+                        );
+                      })}
                       {decodedPoolName && (
                         <View style={styles.row}>
                           <Text style={styles.muted}>Max position (est.)</Text>
                           <Text style={styles.value}>
                             $
                             {(() => {
-                              const colStr = collateralUsdFromState(
-                                state
-                              ).replace(/,/g, "");
                               const debtStr = debtUsdFromState(state).replace(
                                 /,/g,
                                 ""
                               );
                               const equity = Math.max(
                                 0,
-                                parseFloat(colStr) - parseFloat(debtStr)
+                                collateralUsdTotal - parseFloat(debtStr)
                               );
                               const leverage =
                                 getMaxLeverageForPool(decodedPoolName);
@@ -1086,9 +1457,7 @@ export default function PairDetailScreen() {
                         </View>
                       )}
                       {collateral.length > 0 &&
-                        parseFloat(
-                          collateralUsdFromState(state).replace(/,/g, "")
-                        ) === 0 &&
+                        collateralUsdTotal === 0 &&
                         parseFloat(
                           debtUsdFromState(state).replace(/,/g, "")
                         ) === 0 && (
@@ -1175,7 +1544,9 @@ export default function PairDetailScreen() {
                     >
                       <Text
                         style={
-                          e.event_type === "Deposit" ? styles.buy : styles.sell
+                          e.event_type?.toLowerCase() === "deposit"
+                            ? styles.buy
+                            : styles.sell
                         }
                       >
                         {e.event_type}
@@ -1220,7 +1591,7 @@ export default function PairDetailScreen() {
               </>
             )}
 
-            <Text style={styles.sectionTitle}>Place limit order</Text>
+            <Text style={styles.sectionTitle}>Place order</Text>
             <View style={styles.card}>
               <View style={styles.orderSideRow}>
                 <Pressable
@@ -1262,18 +1633,74 @@ export default function PairDetailScreen() {
                   </Text>
                 </Pressable>
               </View>
-              <Text style={styles.inputLabel}>Price</Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  { color: colors.text, borderColor: colors.tabIconDefault },
-                ]}
-                placeholder="0.00"
-                placeholderTextColor={colors.tabIconDefault}
-                value={price}
-                onChangeText={setPrice}
-                keyboardType="decimal-pad"
-              />
+              <Text style={styles.inputLabel}>Order type</Text>
+              <View style={styles.orderSideRow}>
+                <Pressable
+                  onPress={() => setOrderType("limit")}
+                  style={[
+                    styles.sideButton,
+                    orderType === "limit" && {
+                      backgroundColor: colors.tint,
+                      opacity: 1,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.sideButtonText,
+                      orderType === "limit" && {
+                        color: colors.background,
+                        opacity: 1,
+                        fontWeight: "600",
+                      },
+                    ]}
+                  >
+                    Limit
+                  </Text>
+                </Pressable>
+                <Pressable
+                  onPress={() => setOrderType("market")}
+                  style={[
+                    styles.sideButton,
+                    orderType === "market" && {
+                      backgroundColor: colors.tint,
+                      opacity: 1,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.sideButtonText,
+                      orderType === "market" && {
+                        color: colors.background,
+                        opacity: 1,
+                        fontWeight: "600",
+                      },
+                    ]}
+                  >
+                    Market
+                  </Text>
+                </Pressable>
+              </View>
+              {orderType === "limit" && (
+                <>
+                  <Text style={styles.inputLabel}>Price</Text>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      {
+                        color: colors.text,
+                        borderColor: colors.tabIconDefault,
+                      },
+                    ]}
+                    placeholder="0.00"
+                    placeholderTextColor={colors.tabIconDefault}
+                    value={price}
+                    onChangeText={setPrice}
+                    keyboardType="decimal-pad"
+                  />
+                </>
+              )}
               <Text style={styles.inputLabel}>Quantity</Text>
               <TextInput
                 style={[
@@ -1286,35 +1713,169 @@ export default function PairDetailScreen() {
                 onChangeText={setQuantity}
                 keyboardType="decimal-pad"
               />
-              <Pressable
-                onPress={() => setPayWithDeep((p) => !p)}
-                style={styles.checkRow}
-              >
-                <Text style={styles.muted}>Pay with DEEP</Text>
-                <View
+              <Text style={styles.optionsHint}>
+                Min order: {MIN_ORDER_QUANTITY} (protocol min borrow)
+              </Text>
+              <Text style={styles.inputLabel}>Leverage</Text>
+              <View style={styles.leverageRow}>
+                {leverageOptions.map((x) => (
+                  <Pressable
+                    key={x}
+                    onPress={() => setLeverage(x)}
+                    style={[
+                      styles.optionChip,
+                      {
+                        borderColor: colors.tabIconDefault,
+                        backgroundColor:
+                          leverage === x ? colors.tint : "transparent",
+                      },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.optionChipText,
+                        {
+                          color:
+                            leverage === x ? colors.background : colors.text,
+                          opacity: leverage === x ? 1 : 0.8,
+                        },
+                      ]}
+                    >
+                      {x}×
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={styles.inputLabel}>Pay with</Text>
+              <View style={styles.payWithRow}>
+                {(["base", "quote", "deep"] as const).map((a) => {
+                  const isSelected = paymentAsset === a;
+                  return (
+                    <Pressable
+                      key={a}
+                      onPress={() => setPaymentAsset(a)}
+                      style={[
+                        styles.optionChip,
+                        {
+                          borderColor: isSelected
+                            ? colors.tint
+                            : colors.tabIconDefault,
+                          backgroundColor: isSelected
+                            ? `${colors.tint}20`
+                            : "transparent",
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.optionChipText,
+                          {
+                            color: isSelected ? colors.tint : colors.text,
+                            opacity: isSelected ? 1 : 0.7,
+                          },
+                        ]}
+                      >
+                        {assetLabel(a)}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <Text style={styles.optionsHint}>
+                {paymentAssetBalance != null
+                  ? `Max ${paymentAssetBalance.toLocaleString(undefined, {
+                      minimumFractionDigits: 0,
+                      maximumFractionDigits: 6,
+                    })} ${assetLabel(paymentAsset)}`
+                  : `Pay with ${assetLabel(paymentAsset)}`}
+              </Text>
+              <Text style={styles.optionsLabel}>Take profit · Stop loss</Text>
+              <View style={styles.tpslRow}>
+                <View style={styles.tpslInputWrap}>
+                  <Text style={styles.tpslInputLabel}>TP</Text>
+                  <TextInput
+                    style={[
+                      styles.tpslInput,
+                      {
+                        color: colors.text,
+                        borderColor: colors.tabIconDefault,
+                      },
+                    ]}
+                    placeholder="—"
+                    placeholderTextColor={colors.tabIconDefault}
+                    value={tpPrice}
+                    onChangeText={setTpPrice}
+                    keyboardType="decimal-pad"
+                  />
+                </View>
+                <View style={styles.tpslInputWrap}>
+                  <Text style={styles.tpslInputLabel}>SL</Text>
+                  <TextInput
+                    style={[
+                      styles.tpslInput,
+                      {
+                        color: colors.text,
+                        borderColor: colors.tabIconDefault,
+                      },
+                    ]}
+                    placeholder="—"
+                    placeholderTextColor={colors.tabIconDefault}
+                    value={slPrice}
+                    onChangeText={setSlPrice}
+                    keyboardType="decimal-pad"
+                  />
+                </View>
+                <Pressable
+                  onPress={onSetTpsl}
+                  disabled={tpslLoading || (!tpPrice.trim() && !slPrice.trim())}
                   style={[
-                    styles.checkbox,
-                    payWithDeep && { backgroundColor: colors.tint },
+                    styles.tpslButton,
+                    {
+                      backgroundColor: colors.tint,
+                      opacity:
+                        tpslLoading || (!tpPrice.trim() && !slPrice.trim())
+                          ? 0.5
+                          : 1,
+                    },
                   ]}
                 >
-                  {payWithDeep && <Text style={styles.checkmark}>✓</Text>}
-                </View>
-              </Pressable>
+                  {tpslLoading ? (
+                    <ActivityIndicator size="small" color={colors.background} />
+                  ) : (
+                    <Text
+                      style={[
+                        styles.tpslButtonText,
+                        { color: colors.background },
+                      ]}
+                    >
+                      Set
+                    </Text>
+                  )}
+                </Pressable>
+              </View>
               <Pressable
                 onPress={onPlaceOrder}
+                disabled={orderLoading}
                 style={({ pressed }) => [
                   styles.primaryButton,
-                  { backgroundColor: colors.tint, opacity: pressed ? 0.8 : 1 },
+                  {
+                    backgroundColor: colors.tint,
+                    opacity: orderLoading ? 0.7 : pressed ? 0.8 : 1,
+                  },
                 ]}
               >
-                <Text
-                  style={[
-                    styles.primaryButtonText,
-                    { color: colors.background },
-                  ]}
-                >
-                  Place order
-                </Text>
+                {orderLoading ? (
+                  <ActivityIndicator size="small" color={colors.background} />
+                ) : (
+                  <Text
+                    style={[
+                      styles.primaryButtonText,
+                      { color: colors.background },
+                    ]}
+                  >
+                    Place order
+                  </Text>
+                )}
               </Pressable>
             </View>
 
@@ -1907,6 +2468,69 @@ const styles = StyleSheet.create({
   },
   checkmark: { color: "#fff", fontWeight: "bold", fontSize: 14 },
   orderSideRow: { flexDirection: "row", gap: 12, marginBottom: 16 },
+  optionsLabel: {
+    fontSize: 11,
+    fontWeight: "600",
+    marginBottom: 6,
+    opacity: 0.65,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  leverageRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 16,
+  },
+  payWithRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginBottom: 6,
+  },
+  optionChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 6,
+    borderWidth: 1,
+  },
+  optionChipText: { fontSize: 13, fontWeight: "600" },
+  optionsHint: {
+    fontSize: 11,
+    opacity: 0.6,
+    marginBottom: 16,
+  },
+  tpslRow: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 8,
+    marginBottom: 16,
+  },
+  tpslInputWrap: {
+    flex: 1,
+    minWidth: 0,
+  },
+  tpslInputLabel: {
+    fontSize: 11,
+    fontWeight: "600",
+    marginBottom: 4,
+    opacity: 0.65,
+  },
+  tpslInput: {
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 14,
+  },
+  tpslButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 6,
+    justifyContent: "center",
+    minWidth: 52,
+  },
+  tpslButtonText: { fontSize: 13, fontWeight: "600" },
   sideButton: {
     flex: 1,
     paddingVertical: 12,
