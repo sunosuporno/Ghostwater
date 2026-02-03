@@ -290,10 +290,6 @@ export default function PairDetailScreen() {
     Alert.alert("Deposit", "Deposit flow will connect to SDK/backend.");
   const onWithdraw = () =>
     Alert.alert("Withdraw", "Withdraw flow will connect to SDK/backend.");
-  const onBorrow = () =>
-    Alert.alert("Borrow", "Borrow flow will connect to SDK/backend.");
-  const onRepay = () =>
-    Alert.alert("Repay", "Repay flow will connect to SDK/backend.");
 
   const onCreateManager = useCallback(async () => {
     if (!suiAddress || !decodedPoolName) {
@@ -638,12 +634,19 @@ export default function PairDetailScreen() {
                       <Text
                         style={[
                           styles.value,
-                          parseFloat(state.risk_ratio) < 1.2
+                          // If no debt, show neutral styling; otherwise color by simple health band.
+                          (Number(state.base_debt) ||
+                            Number(state.quote_debt)) === 0
+                            ? styles.muted
+                            : parseFloat(state.risk_ratio) < 1.1
                             ? styles.riskWarning
                             : styles.healthOk,
                         ]}
                       >
-                        {formatRiskRatio(state.risk_ratio)}
+                        {(Number(state.base_debt) ||
+                          Number(state.quote_debt)) === 0
+                          ? "No debt"
+                          : `${formatRiskRatio(state.risk_ratio)}×`}
                       </Text>
                     </View>
                   </>
@@ -683,35 +686,6 @@ export default function PairDetailScreen() {
                     style={[styles.actionButtonText, { color: colors.text }]}
                   >
                     Withdraw
-                  </Text>
-                </Pressable>
-                <Pressable
-                  onPress={onBorrow}
-                  style={({ pressed }) => [
-                    styles.actionButton,
-                    { borderColor: colors.tint, opacity: pressed ? 0.8 : 1 },
-                  ]}
-                >
-                  <Text
-                    style={[styles.actionButtonText, { color: colors.tint }]}
-                  >
-                    Borrow
-                  </Text>
-                </Pressable>
-                <Pressable
-                  onPress={onRepay}
-                  style={({ pressed }) => [
-                    styles.actionButton,
-                    {
-                      borderColor: colors.tabIconDefault,
-                      opacity: pressed ? 0.8 : 1,
-                    },
-                  ]}
-                >
-                  <Text
-                    style={[styles.actionButtonText, { color: colors.text }]}
-                  >
-                    Repay
                   </Text>
                 </Pressable>
               </View>
