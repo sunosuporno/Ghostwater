@@ -1,0 +1,103 @@
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
+
+export type NetworkId = "sui-mainnet" | "base-sepolia";
+
+export type NetworkCapabilities = {
+  /** Whether the Margin tab and trading screens should be visible. */
+  showMarginTab: boolean;
+  /** Whether Sui-specific wallet UI (balances, send) should be rendered. */
+  showSuiWallet: boolean;
+  /** Whether EVM-style wallet UI (e.g. Base) should be rendered. */
+  showEvmWallet: boolean;
+};
+
+export type NetworkConfig = {
+  id: NetworkId;
+  label: string;
+  shortLabel: string;
+  description: string;
+  kind: "sui" | "evm";
+  accentColor: string;
+  capabilities: NetworkCapabilities;
+};
+
+export const NETWORKS: NetworkConfig[] = [
+  {
+    id: "sui-mainnet",
+    label: "Sui Mainnet",
+    shortLabel: "Sui",
+    description: "All margin trading and transfers run on Sui.",
+    kind: "sui",
+    accentColor: "#32D583",
+    capabilities: {
+      showMarginTab: true,
+      showSuiWallet: true,
+      showEvmWallet: false,
+    },
+  },
+  {
+    id: "base-sepolia",
+    label: "Base Sepolia",
+    shortLabel: "Base Sepolia",
+    description: "Experimental L2 test network. No margin trading here yet.",
+    kind: "evm",
+    accentColor: "#4C6FFF",
+    capabilities: {
+      showMarginTab: false,
+      showSuiWallet: false,
+      showEvmWallet: true,
+    },
+  },
+];
+
+type NetworkContextValue = {
+  currentNetworkId: NetworkId;
+  currentNetwork: NetworkConfig;
+  setCurrentNetworkId: (id: NetworkId) => void;
+};
+
+const NetworkContext = createContext<NetworkContextValue | null>(null);
+
+export function NetworkProvider({ children }: { children: ReactNode }) {
+  const [currentNetworkId, setCurrentNetworkId] =
+    useState<NetworkId>("sui-mainnet");
+
+  const setNetwork = useCallback((id: NetworkId) => {
+    setCurrentNetworkId(id);
+  }, []);
+
+  const currentNetwork =
+    useMemo(
+      () => NETWORKS.find((n) => n.id === currentNetworkId) ?? NETWORKS[0],
+      [currentNetworkId]
+    );
+
+  const value = useMemo(
+    () => ({
+      currentNetworkId,
+      currentNetwork,
+      setCurrentNetworkId: setNetwork,
+    }),
+    [currentNetworkId, currentNetwork, setNetwork]
+  );
+
+  return (
+    <NetworkContext.Provider value={value}>{children}</NetworkContext.Provider>
+  );
+}
+
+export function useNetwork(): NetworkContextValue {
+  const ctx = useContext(NetworkContext);
+  if (!ctx) {
+    throw new Error("useNetwork must be used within a NetworkProvider");
+  }
+  return ctx;
+}
+

@@ -24,6 +24,7 @@ import {
 
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
+import { NETWORKS, useNetwork } from "@/lib/network";
 import { fetchAllSuiBalances } from "../../lib/sui-balance-fetch";
 import {
   publicKeyToHex,
@@ -31,6 +32,15 @@ import {
 } from "../../lib/sui-transfer-via-backend";
 
 const BALANCE_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+
+type LinkedAccount = {
+  type?: string;
+  chain_type?: string;
+  chainType?: string;
+  address?: string;
+  public_key?: string;
+  publicKey?: string;
+};
 
 function truncateAddress(address: string) {
   if (!address || address.length < 12) return address;
@@ -40,21 +50,8 @@ function truncateAddress(address: string) {
 /** Find existing Sui wallet address and public key from user's linked accounts (API may use snake_case or camelCase). */
 function getSuiWalletFromUser(
   user: {
-    linked_accounts?: Array<{
-      type?: string;
-      chain_type?: string;
-      chainType?: string;
-      address?: string;
-      public_key?: string;
-      publicKey?: string;
-    }>;
-    linkedAccounts?: Array<{
-      type?: string;
-      chainType?: string;
-      address?: string;
-      publicKey?: string;
-      public_key?: string;
-    }>;
+    linked_accounts?: LinkedAccount[];
+    linkedAccounts?: LinkedAccount[];
   } | null
 ): { address: string; publicKey: string | null } | null {
   if (!user) return null;
@@ -62,16 +59,46 @@ function getSuiWalletFromUser(
   for (const a of accounts) {
     const type = a.type;
     const chain =
-      (a as { chain_type?: string; chainType?: string }).chain_type ??
-      (a as { chainType?: string }).chainType;
+      (a as LinkedAccount).chain_type ?? (a as LinkedAccount).chainType;
     if (type === "wallet" && (chain === "sui" || chain === "Sui")) {
-      const address = (a as { address?: string }).address ?? null;
+      const address = (a as LinkedAccount).address ?? null;
       const publicKey =
-        (a as { publicKey?: string; public_key?: string }).publicKey ??
-        (a as { publicKey?: string; public_key?: string }).public_key ??
+        (a as LinkedAccount).publicKey ??
+        (a as LinkedAccount).public_key ??
         null;
       if (address) return { address, publicKey };
       return null;
+    }
+  }
+  return null;
+}
+
+/** Try to find an EVM-style wallet (e.g. Base / Ethereum) from Privy linked accounts. */
+function getEvmWalletFromUser(
+  user: {
+    linked_accounts?: LinkedAccount[];
+    linkedAccounts?: LinkedAccount[];
+  } | null
+): { address: string } | null {
+  if (!user) return null;
+  const accounts = user.linked_accounts ?? user.linkedAccounts ?? [];
+  for (const a of accounts) {
+    const type = a.type;
+    const chainRaw =
+      (a as LinkedAccount).chain_type ?? (a as LinkedAccount).chainType;
+    const chain = chainRaw?.toLowerCase();
+    if (!type || type !== "wallet" || !chain) continue;
+    // Heuristic: any non-Sui wallet with an EVM-style chain id (e.g. eip155:84532) or "ethereum".
+    const isSui = chain === "sui" || chain === "sui-mainnet";
+    const isEvmLike =
+      chain.includes("eip155:") ||
+      chain === "ethereum" ||
+      chain.startsWith("base") ||
+      chain.startsWith("optimism") ||
+      chain.startsWith("arbitrum");
+    if (!isSui && isEvmLike) {
+      const address = (a as LinkedAccount).address ?? null;
+      if (address) return { address };
     }
   }
   return null;
@@ -83,7 +110,11 @@ export default function HomeScreen() {
   const { user, logout } = usePrivy();
   const { createWallet: createSuiWallet } = useCreateWallet();
 
+  const { currentNetwork, setCurrentNetworkId } = useNetwork();
+
   // Ethereum wallet: re-add when needed — useEmbeddedEthereumWallet(), state: address, loading, createError, and a useEffect that creates/fetches wallet when wallets.length changes (see git history for full snippet).
+
+  const [networkDrawerVisible, setNetworkDrawerVisible] = useState(false);
 
   // Sui wallet state
   const [suiAddress, setSuiAddress] = useState<string | null>(null);
@@ -92,6 +123,9 @@ export default function HomeScreen() {
   >(null);
   const [suiLoading, setSuiLoading] = useState(true);
   const [suiError, setSuiError] = useState<string | null>(null);
+
+  // EVM / Base-style wallet (read-only for now; used when switching to non-Sui networks).
+  const [evmAddress, setEvmAddress] = useState<string | null>(null);
 
   // Send
   const [selectedCoinType, setSelectedCoinType] =
@@ -285,6 +319,12 @@ export default function HomeScreen() {
     };
   }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // EVM / Base-style address (no margin trading – just surfaced from Privy).
+  useEffect(() => {
+    const wallet = getEvmWalletFromUser(user);
+    setEvmAddress(wallet?.address ?? null);
+  }, [user?.id, user?.linked_accounts, user?.linkedAccounts]);
+
   const handleLogout = useCallback(() => {
     logout();
   }, [logout]);
@@ -417,259 +457,536 @@ export default function HomeScreen() {
       contentContainerStyle={styles.container}
       showsVerticalScrollIndicator={false}
     >
-      <Text style={styles.title}>Home</Text>
-      <Text style={styles.subtitle}>
-        {user?.email?.address ?? user?.google?.email ?? "Signed in"}
-      </Text>
-
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>Your Sui wallet address</Text>
-        {suiError ? (
-          <Text style={styles.error}>{suiError}</Text>
-        ) : suiAddress ? (
-          <Pressable
-            onPress={copySuiAddress}
-            style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}
-          >
-            <Text style={styles.address} selectable>
-              {suiAddress}
-            </Text>
-            <Text style={styles.addressShort}>
-              {truncateAddress(suiAddress)}
-            </Text>
-            {copiedAddress && (
-              <Text style={[styles.muted, { color: "#22c55e", marginTop: 8 }]}>
-                Copied!
-              </Text>
-            )}
-            {suiAddress && (
-              <View style={{ marginTop: 12 }}>
-                <View
-                  style={{
-                    flexDirection: "row",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    marginBottom: 4,
-                  }}
-                >
-                  <Text style={styles.cardLabel}>Balances</Text>
-                  <Pressable
-                    onPress={refetchBalances}
-                    disabled={balanceLoading}
-                    style={({ pressed }) => ({
-                      padding: 6,
-                      opacity: balanceLoading ? 0.6 : pressed ? 0.8 : 1,
-                    })}
-                    hitSlop={8}
-                  >
-                    <FontAwesome name="refresh" size={18} color={colors.tint} />
-                  </Pressable>
-                </View>
-                {balanceLoading ? (
-                  <ActivityIndicator
-                    size="small"
-                    color={colors.tint}
-                    style={{ marginTop: 4 }}
-                  />
-                ) : balanceError ? (
-                  <Text style={styles.error}>{balanceError}</Text>
-                ) : allBalances.length > 0 ? (
-                  allBalances.map((b) => (
-                    <View
-                      key={b.coinType}
-                      style={{ flexDirection: "row", marginTop: 4, gap: 8 }}
-                    >
-                      <Text style={styles.address}>
-                        {b.formatted} {b.symbol}
-                      </Text>
-                    </View>
-                  ))
-                ) : null}
-              </View>
-            )}
-          </Pressable>
-        ) : (
-          <Text style={styles.muted}>No Sui wallet yet</Text>
-        )}
-      </View>
-
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>Send</Text>
-
-        <Text style={[styles.inputLabel, { color: colors.text }]}>Token</Text>
+      <View style={styles.headerRow}>
+        <View>
+          <Text style={styles.title}>Home</Text>
+          <Text style={styles.subtitle}>
+            {user?.email?.address ?? user?.google?.email ?? "Signed in"}
+          </Text>
+        </View>
         <Pressable
-          onPress={() => setTokenPickerVisible(true)}
-          style={[
-            styles.input,
-            styles.dropdown,
+          onPress={() => setNetworkDrawerVisible(true)}
+          style={({ pressed }) => [
+            styles.networkBadge,
             {
-              color: colors.text,
-              borderColor: colors.tabIconDefault,
+              borderColor: currentNetwork.accentColor,
+              backgroundColor:
+                colorScheme === "dark"
+                  ? "rgba(15,23,42,0.9)"
+                  : "rgba(248,250,252,0.95)",
+              opacity: pressed ? 0.8 : 1,
             },
           ]}
+          hitSlop={8}
         >
-          <Text style={{ fontSize: 14 }}>
-            {selectedSymbol}
-            {selectedBalance != null
-              ? ` (${selectedBalance.formatted} available)`
-              : " — No balance"}
-          </Text>
+          <View
+            style={[
+              styles.networkDot,
+              { backgroundColor: currentNetwork.accentColor },
+            ]}
+          />
+          <Text style={styles.networkText}>{currentNetwork.shortLabel}</Text>
           <FontAwesome
             name="chevron-down"
-            size={14}
-            color={colors.tabIconDefault}
+            size={12}
+            color={colors.text}
+            style={{ marginLeft: 4 }}
           />
         </Pressable>
+      </View>
 
-        <Modal
-          visible={tokenPickerVisible}
-          transparent
-          animationType="fade"
-          onRequestClose={() => setTokenPickerVisible(false)}
+      {/* Network drawer – only on Home screen */}
+      <Modal
+        visible={networkDrawerVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setNetworkDrawerVisible(false)}
+      >
+        <Pressable
+          style={styles.drawerOverlay}
+          onPress={() => setNetworkDrawerVisible(false)}
         >
-          <Pressable
-            style={styles.modalOverlay}
-            onPress={() => setTokenPickerVisible(false)}
+          <View
+            style={[
+              styles.drawerContent,
+              {
+                backgroundColor: colors.background,
+                borderColor: colors.tabIconDefault,
+              },
+            ]}
+            onStartShouldSetResponder={() => true}
           >
+            <Text style={[styles.drawerTitle, { color: colors.text }]}>
+              Network
+            </Text>
+            <Text style={[styles.drawerSubtitle, { color: colors.text }]}>
+              Margin trading is available on Sui only. Other networks are
+              wallet-only for now.
+            </Text>
+            {NETWORKS.map((net) => {
+              const isActive = net.id === currentNetwork.id;
+              return (
+                <Pressable
+                  key={net.id}
+                  onPress={() => {
+                    setCurrentNetworkId(net.id);
+                    setNetworkDrawerVisible(false);
+                  }}
+                  style={({ pressed }) => [
+                    styles.drawerItem,
+                    {
+                      borderColor: isActive
+                        ? net.accentColor
+                        : colors.tabIconDefault,
+                      backgroundColor: isActive
+                        ? net.accentColor + "1A"
+                        : "transparent",
+                      opacity: pressed ? 0.85 : 1,
+                    },
+                  ]}
+                >
+                  <View style={styles.drawerItemHeader}>
+                    <View style={styles.drawerItemTitleRow}>
+                      <View
+                        style={[
+                          styles.networkDot,
+                          { backgroundColor: net.accentColor },
+                        ]}
+                      />
+                      <Text
+                        style={[
+                          styles.drawerItemTitle,
+                          { color: colors.text },
+                        ]}
+                      >
+                        {net.label}
+                      </Text>
+                    </View>
+                    {isActive && (
+                      <Text
+                        style={[
+                          styles.drawerActivePill,
+                          {
+                            borderColor: net.accentColor,
+                            color: net.accentColor,
+                          },
+                        ]}
+                      >
+                        Active
+                      </Text>
+                    )}
+                  </View>
+                  <Text
+                    style={[
+                      styles.drawerItemDescription,
+                      { color: colors.text },
+                    ]}
+                  >
+                    {net.description}
+                  </Text>
+                  {!net.capabilities.showMarginTab && (
+                    <Text style={styles.drawerBadge}>
+                      Margin trading not available
+                    </Text>
+                  )}
+                </Pressable>
+              );
+            })}
+          </View>
+        </Pressable>
+      </Modal>
+
+      {currentNetwork.capabilities.showEvmWallet && (
+        <>
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>
+              {currentNetwork.label} wallet (Privy)
+            </Text>
+            {evmAddress ? (
+              <>
+                <Text style={styles.address} selectable>
+                  {evmAddress}
+                </Text>
+                <Text style={styles.addressShort}>
+                  {truncateAddress(evmAddress)}
+                </Text>
+                <Text style={styles.muted}>
+                  This network is wallet-only. Margin trading and deep liquidity
+                  are available on Sui.
+                </Text>
+              </>
+            ) : (
+              <Text style={styles.muted}>
+                No {currentNetwork.label} wallet linked yet. You can add one in
+                your Privy account.
+              </Text>
+            )}
+          </View>
+
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>
+              {currentNetwork.label} balances
+            </Text>
+            <Text style={styles.muted}>
+              Balance fetching for this network will live here. For now, this is
+              a placeholder using the same layout as Sui.
+            </Text>
+          </View>
+
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>
+              Send on {currentNetwork.shortLabel}
+            </Text>
+            <Text style={[styles.inputLabel, { color: colors.text }]}>
+              Token
+            </Text>
             <View
               style={[
-                styles.modalContent,
+                styles.input,
+                styles.dropdown,
                 {
-                  backgroundColor: colors.background,
+                  borderColor: colors.tabIconDefault,
+                  opacity: 0.6,
+                },
+              ]}
+            >
+              <Text style={{ fontSize: 14, color: colors.tabIconDefault }}>
+                Coming soon
+              </Text>
+              <FontAwesome
+                name="chevron-down"
+                size={14}
+                color={colors.tabIconDefault}
+              />
+            </View>
+
+            <Text style={[styles.inputLabel, { color: colors.text }]}>
+              Amount
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                {
+                  color: colors.text,
+                  borderColor: colors.tabIconDefault,
+                  opacity: 0.6,
+                },
+              ]}
+              placeholder="0.00"
+              placeholderTextColor={colors.tabIconDefault}
+              editable={false}
+            />
+
+            <Text style={[styles.inputLabel, { color: colors.text }]}>
+              Destination address
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                {
+                  color: colors.text,
+                  borderColor: colors.tabIconDefault,
+                  opacity: 0.6,
+                },
+              ]}
+              placeholder="0x…"
+              placeholderTextColor={colors.tabIconDefault}
+              editable={false}
+            />
+            <Text style={styles.muted}>
+              Sending on {currentNetwork.shortLabel} will reuse this form, wired
+              to the Base transaction flow.
+            </Text>
+            <Pressable
+              disabled
+              style={[
+                styles.primaryButton,
+                {
+                  backgroundColor: colors.tabIconDefault,
+                  opacity: 0.4,
+                  marginTop: 8,
+                },
+              ]}
+            >
+              <Text
+                style={[styles.primaryButtonText, { color: colors.background }]}
+              >
+                Send (coming soon)
+              </Text>
+            </Pressable>
+          </View>
+        </>
+      )}
+
+      {currentNetwork.capabilities.showSuiWallet && (
+        <>
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Your Sui wallet address</Text>
+            {suiError ? (
+              <Text style={styles.error}>{suiError}</Text>
+            ) : suiAddress ? (
+              <Pressable
+                onPress={copySuiAddress}
+                style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}
+              >
+                <Text style={styles.address} selectable>
+                  {suiAddress}
+                </Text>
+                <Text style={styles.addressShort}>
+                  {truncateAddress(suiAddress)}
+                </Text>
+                {copiedAddress && (
+                  <Text
+                    style={[styles.muted, { color: "#22c55e", marginTop: 8 }]}
+                  >
+                    Copied!
+                  </Text>
+                )}
+                {suiAddress && (
+                  <View style={{ marginTop: 12 }}>
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        marginBottom: 4,
+                      }}
+                    >
+                      <Text style={styles.cardLabel}>Balances</Text>
+                      <Pressable
+                        onPress={refetchBalances}
+                        disabled={balanceLoading}
+                        style={({ pressed }) => ({
+                          padding: 6,
+                          opacity: balanceLoading ? 0.6 : pressed ? 0.8 : 1,
+                        })}
+                        hitSlop={8}
+                      >
+                        <FontAwesome
+                          name="refresh"
+                          size={18}
+                          color={colors.tint}
+                        />
+                      </Pressable>
+                    </View>
+                    {balanceLoading ? (
+                      <ActivityIndicator
+                        size="small"
+                        color={colors.tint}
+                        style={{ marginTop: 4 }}
+                      />
+                    ) : balanceError ? (
+                      <Text style={styles.error}>{balanceError}</Text>
+                    ) : allBalances.length > 0 ? (
+                      allBalances.map((b) => (
+                        <View
+                          key={b.coinType}
+                          style={{
+                            flexDirection: "row",
+                            marginTop: 4,
+                            gap: 8,
+                          }}
+                        >
+                          <Text style={styles.address}>
+                            {b.formatted} {b.symbol}
+                          </Text>
+                        </View>
+                      ))
+                    ) : null}
+                  </View>
+                )}
+              </Pressable>
+            ) : (
+              <Text style={styles.muted}>No Sui wallet yet</Text>
+            )}
+          </View>
+
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>Send</Text>
+
+            <Text style={[styles.inputLabel, { color: colors.text }]}>
+              Token
+            </Text>
+            <Pressable
+              onPress={() => setTokenPickerVisible(true)}
+              style={[
+                styles.input,
+                styles.dropdown,
+                {
+                  color: colors.text,
                   borderColor: colors.tabIconDefault,
                 },
               ]}
-              onStartShouldSetResponder={() => true}
             >
-              <Text style={[styles.inputLabel, { color: colors.text }]}>
-                Select token
+              <Text style={{ fontSize: 14 }}>
+                {selectedSymbol}
+                {selectedBalance != null
+                  ? ` (${selectedBalance.formatted} available)`
+                  : " — No balance"}
               </Text>
-              <ScrollView style={{ maxHeight: 240 }}>
-                {allBalances.length === 0 ? (
-                  <Text style={[styles.muted, { paddingVertical: 12 }]}>
-                    No tokens
+              <FontAwesome
+                name="chevron-down"
+                size={14}
+                color={colors.tabIconDefault}
+              />
+            </Pressable>
+
+            <Modal
+              visible={tokenPickerVisible}
+              transparent
+              animationType="fade"
+              onRequestClose={() => setTokenPickerVisible(false)}
+            >
+              <Pressable
+                style={styles.modalOverlay}
+                onPress={() => setTokenPickerVisible(false)}
+              >
+                <View
+                  style={[
+                    styles.modalContent,
+                    {
+                      backgroundColor: colors.background,
+                      borderColor: colors.tabIconDefault,
+                    },
+                  ]}
+                  onStartShouldSetResponder={() => true}
+                >
+                  <Text style={[styles.inputLabel, { color: colors.text }]}>
+                    Select token
                   </Text>
-                ) : (
-                  allBalances.map((b) => (
-                    <Pressable
-                      key={b.coinType}
-                      onPress={() => {
-                        setSelectedCoinType(b.coinType);
-                        setTokenPickerVisible(false);
-                        setAmountExceedsBalance(false);
-                      }}
-                      style={({ pressed }) => [
-                        styles.pickerItem,
-                        {
-                          backgroundColor:
-                            b.coinType === selectedCoinType
-                              ? colors.tabIconDefault + "30"
-                              : "transparent",
-                          opacity: pressed ? 0.8 : 1,
-                        },
-                      ]}
-                    >
-                      <Text style={{ fontSize: 14, color: colors.text }}>
-                        {b.symbol} — {b.formatted} available
+                  <ScrollView style={{ maxHeight: 240 }}>
+                    {allBalances.length === 0 ? (
+                      <Text style={[styles.muted, { paddingVertical: 12 }]}>
+                        No tokens
                       </Text>
-                    </Pressable>
-                  ))
-                )}
-              </ScrollView>
-            </View>
-          </Pressable>
-        </Modal>
+                    ) : (
+                      allBalances.map((b) => (
+                        <Pressable
+                          key={b.coinType}
+                          onPress={() => {
+                            setSelectedCoinType(b.coinType);
+                            setTokenPickerVisible(false);
+                            setAmountExceedsBalance(false);
+                          }}
+                          style={({ pressed }) => [
+                            styles.pickerItem,
+                            {
+                              backgroundColor:
+                                b.coinType === selectedCoinType
+                                  ? colors.tabIconDefault + "30"
+                                  : "transparent",
+                              opacity: pressed ? 0.8 : 1,
+                            },
+                          ]}
+                        >
+                          <Text style={{ fontSize: 14, color: colors.text }}>
+                            {b.symbol} — {b.formatted} available
+                          </Text>
+                        </Pressable>
+                      ))
+                    )}
+                  </ScrollView>
+                </View>
+              </Pressable>
+            </Modal>
 
-        <Text style={[styles.inputLabel, { color: colors.text }]}>Amount</Text>
-        <TextInput
-          style={[
-            styles.input,
-            {
-              color: colors.text,
-              borderColor: amountExceedsBalance
-                ? "#c00"
-                : colors.tabIconDefault,
-            },
-          ]}
-          placeholder={`0.00 ${selectedSymbol}`}
-          placeholderTextColor={colors.tabIconDefault}
-          value={amount}
-          onChangeText={(t) => {
-            setAmount(t);
-            setSendError(null);
-            setSendSuccess(null);
-            validateAmount(t);
-          }}
-          keyboardType="decimal-pad"
-          autoCapitalize="none"
-          autoCorrect={false}
-        />
-        {amountExceedsBalance && (
-          <Text style={styles.error}>Amount exceeds your balance</Text>
-        )}
+            <Text style={[styles.inputLabel, { color: colors.text }]}>
+              Amount
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                {
+                  color: colors.text,
+                  borderColor: amountExceedsBalance
+                    ? "#c00"
+                    : colors.tabIconDefault,
+                },
+              ]}
+              placeholder={`0.00 ${selectedSymbol}`}
+              placeholderTextColor={colors.tabIconDefault}
+              value={amount}
+              onChangeText={(t) => {
+                setAmount(t);
+                setSendError(null);
+                setSendSuccess(null);
+                validateAmount(t);
+              }}
+              keyboardType="decimal-pad"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            {amountExceedsBalance && (
+              <Text style={styles.error}>Amount exceeds your balance</Text>
+            )}
 
-        <Text style={[styles.inputLabel, { color: colors.text }]}>
-          Destination address
-        </Text>
-        <TextInput
-          style={[
-            styles.input,
-            { color: colors.text, borderColor: colors.tabIconDefault },
-          ]}
-          placeholder="0x…"
-          placeholderTextColor={colors.tabIconDefault}
-          value={destinationAddress}
-          onChangeText={(t) => {
-            setDestinationAddress(t);
-            setSendError(null);
-            setSendSuccess(null);
-          }}
-          autoCapitalize="none"
-          autoCorrect={false}
-        />
-        {sendError ? <Text style={styles.error}>{sendError}</Text> : null}
-        {sendSuccess ? (
-          <Text style={[styles.muted, { color: "#22c55e" }]}>
-            {sendSuccess}
-          </Text>
-        ) : null}
-        <Pressable
-          onPress={handleSend}
-          disabled={
-            sendLoading ||
-            !suiAddress ||
-            amountExceedsBalance ||
-            !amount.trim() ||
-            parseFloat(amount) <= 0
-          }
-          style={({ pressed }) => [
-            styles.primaryButton,
-            {
-              backgroundColor: colors.tint,
-              opacity:
+            <Text style={[styles.inputLabel, { color: colors.text }]}>
+              Destination address
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                { color: colors.text, borderColor: colors.tabIconDefault },
+              ]}
+              placeholder="0x…"
+              placeholderTextColor={colors.tabIconDefault}
+              value={destinationAddress}
+              onChangeText={(t) => {
+                setDestinationAddress(t);
+                setSendError(null);
+                setSendSuccess(null);
+              }}
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+            {sendError ? <Text style={styles.error}>{sendError}</Text> : null}
+            {sendSuccess ? (
+              <Text style={[styles.muted, { color: "#22c55e" }]}>
+                {sendSuccess}
+              </Text>
+            ) : null}
+            <Pressable
+              onPress={handleSend}
+              disabled={
                 sendLoading ||
                 !suiAddress ||
                 amountExceedsBalance ||
                 !amount.trim() ||
                 parseFloat(amount) <= 0
-                  ? 0.6
-                  : pressed
-                  ? 0.8
-                  : 1,
-            },
-          ]}
-        >
-          {sendLoading ? (
-            <ActivityIndicator size="small" color={colors.background} />
-          ) : (
-            <Text
-              style={[styles.primaryButtonText, { color: colors.background }]}
+              }
+              style={({ pressed }) => [
+                styles.primaryButton,
+                {
+                  backgroundColor: colors.tint,
+                  opacity:
+                    sendLoading ||
+                    !suiAddress ||
+                    amountExceedsBalance ||
+                    !amount.trim() ||
+                    parseFloat(amount) <= 0
+                      ? 0.6
+                      : pressed
+                      ? 0.8
+                      : 1,
+                },
+              ]}
             >
-              Send
-            </Text>
-          )}
-        </Pressable>
-      </View>
+              {sendLoading ? (
+                <ActivityIndicator size="small" color={colors.background} />
+              ) : (
+                <Text
+                  style={[
+                    styles.primaryButtonText,
+                    { color: colors.background },
+                  ]}
+                >
+                  Send
+                </Text>
+              )}
+            </Pressable>
+          </View>
+        </>
+      )}
 
       <Pressable
         onPress={handleLogout}
@@ -696,6 +1013,12 @@ const styles = StyleSheet.create({
     padding: 24,
     paddingTop: 48,
   },
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 24,
+  },
   centered: {
     flex: 1,
     alignItems: "center",
@@ -714,7 +1037,25 @@ const styles = StyleSheet.create({
   subtitle: {
     fontSize: 16,
     opacity: 0.8,
-    marginBottom: 32,
+    marginBottom: 4,
+  },
+  networkBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  networkDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 6,
+  },
+  networkText: {
+    fontSize: 12,
+    fontWeight: "600",
   },
   card: {
     padding: 20,
@@ -804,5 +1145,64 @@ const styles = StyleSheet.create({
   logoutText: {
     fontSize: 16,
     fontWeight: "600",
+  },
+  drawerOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.45)",
+    justifyContent: "flex-end",
+  },
+  drawerContent: {
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    borderWidth: 1,
+    padding: 20,
+  },
+  drawerTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 4,
+  },
+  drawerSubtitle: {
+    fontSize: 13,
+    opacity: 0.7,
+    marginBottom: 16,
+  },
+  drawerItem: {
+    borderWidth: 1,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 10,
+  },
+  drawerItemHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 4,
+  },
+  drawerItemTitleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  drawerItemTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  drawerItemDescription: {
+    fontSize: 12,
+    opacity: 0.75,
+  },
+  drawerActivePill: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    fontSize: 11,
+    fontWeight: "600",
+  },
+  drawerBadge: {
+    marginTop: 6,
+    fontSize: 11,
+    color: "#f97316",
+    fontWeight: "500",
   },
 });
