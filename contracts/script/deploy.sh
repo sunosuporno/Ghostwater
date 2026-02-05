@@ -21,8 +21,15 @@ if [ -z "${PRIVATE_KEY}" ]; then
   exit 1
 fi
 
+# Verify on Basescan after deploy if API key is set (get one at https://basescan.org/myapikey)
+VERIFY_OPTS=""
+if [ -n "${BASESCAN_API_KEY}" ]; then
+  VERIFY_OPTS="--verify"
+  echo "Verification enabled (BASESCAN_API_KEY set)."
+fi
+
 echo "Deploying GhostwaterRegistrar to Base mainnet..."
-forge script script/Deploy.s.sol --rpc-url base --broadcast --private-key "$PRIVATE_KEY"
+forge script script/Deploy.s.sol --rpc-url base --broadcast --private-key "$PRIVATE_KEY" $VERIFY_OPTS
 
 echo ""
 echo "Next step: As the L2 Registry owner, call addRegistrar(<deployed address>) on the registry (e.g. via Basescan)."
