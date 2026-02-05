@@ -94,16 +94,6 @@ contract GhostwaterRegistrar is ReentrancyGuard, IERC721Receiver {
         return addressToNode[account] != bytes32(0);
     }
 
-    /// @notice Read preferred chain and token for an address (from ENS text records on the registry).
-    /// @param account Address that has claimed a subdomain.
-    /// @return preferredChain Stored chain name (e.g. "Base") or "" if none.
-    /// @return preferredToken Stored token symbol or address, or "" if none.
-    function getPreferences(address account) external view returns (string memory preferredChain, string memory preferredToken) {
-        bytes32 node = addressToNode[account];
-        if (node == bytes32(0)) return ("", "");
-        return (registry.text(node, PREFERRED_CHAIN_KEY), registry.text(node, PREFERRED_TOKEN_KEY));
-    }
-
     /// @notice Text record keys for preferences (ENS subdomain).
     string public constant PREFERRED_CHAIN_KEY = "com.ghostwater.preferredChain";
     string public constant PREFERRED_TOKEN_KEY = "com.ghostwater.preferredToken";
