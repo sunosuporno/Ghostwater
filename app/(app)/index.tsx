@@ -10,6 +10,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   AppState,
   AppStateStatus,
   Clipboard,
@@ -24,7 +25,16 @@ import {
 
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
-import { NETWORKS, useNetwork } from "@/lib/network";
+import {
+  fetchSubdomainStatus,
+  checkLabelAvailable,
+  getRegisterWithPreferencesCalldata,
+  getSetPreferencesCalldata,
+  getRegistrarAddress,
+  getRegistrarRevertMessage,
+  type SubdomainStatus,
+} from "@/lib/ens-subdomain-base";
+import { isBaseMainnet, NETWORKS, useNetwork } from "@/lib/network";
 import {
   fetchAllBaseBalances,
   type BaseNetworkId,
@@ -36,6 +46,17 @@ import {
 } from "../../lib/sui-transfer-via-backend";
 
 const BALANCE_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+
+/** Preferred chain options for subdomain preferences (stored as chain name string). */
+const PREFERRED_CHAIN_OPTIONS = ["Base", "Arbitrum", "Sui", "Ethereum"] as const;
+
+/** Preferred token options: symbol or "OTHER" for custom address (stored as symbol or full address string). */
+const PREFERRED_TOKEN_OPTIONS = [
+  { value: "ETH", label: "ETH (native)" },
+  { value: "USDC", label: "USDC" },
+  { value: "USDT", label: "USDT" },
+  { value: "OTHER", label: "Other (paste address)" },
+] as const;
 
 type LinkedAccount = {
   type?: string;
@@ -179,6 +200,33 @@ export default function HomeScreen() {
   const [baseTxHashCopied, setBaseTxHashCopied] = useState(false);
   const { signRawHash } = useSignRawHash();
 
+  // ENS subdomain (Base mainnet only)
+  const [subdomainStatus, setSubdomainStatus] = useState<SubdomainStatus | null>(null);
+  const [subdomainLoading, setSubdomainLoading] = useState(false);
+  const [subdomainError, setSubdomainError] = useState<string | null>(null);
+  const [claimLabel, setClaimLabel] = useState("");
+  const [claimPreferredChain, setClaimPreferredChain] = useState("");
+  const [claimPreferredToken, setClaimPreferredToken] = useState<"ETH" | "USDC" | "USDT" | "OTHER" | "">("");
+  const [claimPreferredTokenCustom, setClaimPreferredTokenCustom] = useState("");
+  const [chainPickerVisible, setChainPickerVisible] = useState(false);
+  const [tokenPickerVisibleSubdomain, setTokenPickerVisibleSubdomain] = useState(false);
+  const [claimNameAvailable, setClaimNameAvailable] = useState<boolean | null>(null);
+  const [claimCheckingName, setClaimCheckingName] = useState(false);
+  const [claimLoading, setClaimLoading] = useState(false);
+  const [claimStep, setClaimStep] = useState<1 | 2 | null>(null);
+  const [claimError, setClaimError] = useState<string | null>(null);
+  const subdomainBlinkAnim = useRef(new Animated.Value(1)).current;
+
+  // Edit preferences (when user already has subdomain)
+  const [editPrefsVisible, setEditPrefsVisible] = useState(false);
+  const [editPrefsChain, setEditPrefsChain] = useState("");
+  const [editPrefsToken, setEditPrefsToken] = useState<"ETH" | "USDC" | "USDT" | "OTHER" | "">("");
+  const [editPrefsTokenCustom, setEditPrefsTokenCustom] = useState("");
+  const [editPrefsLoading, setEditPrefsLoading] = useState(false);
+  const [editPrefsError, setEditPrefsError] = useState<string | null>(null);
+  const [editChainPickerVisible, setEditChainPickerVisible] = useState(false);
+  const [editTokenPickerVisible, setEditTokenPickerVisible] = useState(false);
+
   const refetchBalances = useCallback(() => {
     if (!suiAddress) return;
     setBalanceError(null);
@@ -240,6 +288,71 @@ export default function HomeScreen() {
     }
     refetchBaseBalances();
   }, [evmAddress, currentNetwork.id, refetchBaseBalances]);
+
+  const registrarAddress = getRegistrarAddress();
+  const refetchSubdomain = useCallback(async () => {
+    if (!registrarAddress || !evmAddress || !isBaseMainnet(currentNetwork.id)) {
+      setSubdomainStatus(null);
+      setSubdomainLoading(false);
+      return;
+    }
+    setSubdomainError(null);
+    setSubdomainLoading(true);
+    try {
+      const status = await fetchSubdomainStatus(registrarAddress, evmAddress as `0x${string}`);
+      setSubdomainStatus(status);
+    } catch (err) {
+      setSubdomainError(err instanceof Error ? err.message : "Failed to load subdomain");
+      setSubdomainStatus(null);
+    } finally {
+      setSubdomainLoading(false);
+    }
+  }, [registrarAddress, evmAddress, currentNetwork.id]);
+
+  useEffect(() => {
+    if (!registrarAddress || !evmAddress || !isBaseMainnet(currentNetwork.id)) {
+      setSubdomainStatus(null);
+      setSubdomainLoading(false);
+      return;
+    }
+    refetchSubdomain();
+  }, [registrarAddress, evmAddress, currentNetwork.id, refetchSubdomain]);
+
+  // Blink animation when no subdomain (claim CTA)
+  useEffect(() => {
+    if (subdomainLoading || !subdomainStatus || subdomainStatus.hasSubdomain) return;
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(subdomainBlinkAnim, { toValue: 0.4, duration: 600, useNativeDriver: true }),
+        Animated.timing(subdomainBlinkAnim, { toValue: 1, duration: 600, useNativeDriver: true }),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, [subdomainLoading, subdomainStatus?.hasSubdomain, subdomainBlinkAnim]);
+
+  // Debounced name availability check
+  useEffect(() => {
+    const label = claimLabel.trim().toLowerCase();
+    if (label.length < 3) {
+      setClaimNameAvailable(null);
+      return;
+    }
+    if (!registrarAddress) return;
+    const t = setTimeout(async () => {
+      setClaimCheckingName(true);
+      setClaimNameAvailable(null);
+      try {
+        const available = await checkLabelAvailable(registrarAddress, label);
+        setClaimNameAvailable(available);
+      } catch {
+        setClaimNameAvailable(null);
+      } finally {
+        setClaimCheckingName(false);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [claimLabel, registrarAddress]);
 
   // Keep selected Base token in sync with balances; default to first balance
   useEffect(() => {
@@ -354,10 +467,11 @@ export default function HomeScreen() {
 
   const copyEvmAddress = useCallback(() => {
     if (!evmAddress) return;
-    Clipboard.setString(evmAddress);
+    const toCopy = subdomainStatus?.fullName ?? evmAddress;
+    Clipboard.setString(toCopy);
     setCopiedAddress(true);
     setTimeout(() => setCopiedAddress(false), 2000);
-  }, [evmAddress]);
+  }, [evmAddress, subdomainStatus?.fullName]);
 
   // Use the first embedded Ethereum wallet for Base Sepolia sends.
   const embeddedEthWallet = embeddedEthWallets?.[0] ?? null;
@@ -633,6 +747,203 @@ export default function HomeScreen() {
     selectedBaseToken,
     baseBalances,
     refetchBaseBalances,
+  ]);
+
+  const handleClaimSubdomain = useCallback(async () => {
+    const label = claimLabel.trim().toLowerCase();
+    if (label.length < 3) {
+      setClaimError("Name must be at least 3 characters");
+      return;
+    }
+    if (claimNameAvailable !== true) {
+      setClaimError("Choose an available name");
+      return;
+    }
+    if (!claimPreferredChain.trim()) {
+      setClaimError("Select preferred chain");
+      return;
+    }
+    const tokenValue =
+      claimPreferredToken === "OTHER"
+        ? claimPreferredTokenCustom.trim()
+        : claimPreferredToken;
+    if (!tokenValue) {
+      setClaimError(
+        claimPreferredToken === "OTHER"
+          ? "Paste token address for Other"
+          : "Select preferred token"
+      );
+      return;
+    }
+    if (!embeddedEthWallet || !registrarAddress) {
+      setClaimError("Wallet or registrar not ready");
+      return;
+    }
+    setClaimError(null);
+    setClaimLoading(true);
+    setClaimStep(1);
+    try {
+      const provider = await (embeddedEthWallet as any).getProvider();
+      const chainIdHex = currentNetwork.evmChainId;
+      if (!chainIdHex) throw new Error("Network not configured for EVM");
+      try {
+        const currentChainId = (await provider.request({ method: "eth_chainId" })) as string;
+        if (currentChainId !== chainIdHex) {
+          await provider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: chainIdHex }],
+          });
+        }
+      } catch (switchErr) {
+        throw new Error("Failed to switch to Base. Enable Base in your Privy app.");
+      }
+      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+      const from = accounts?.[0];
+      if (!from) throw new Error("No account in embedded wallet");
+
+      // One tx: registerWithPreferences(label, preferredChain, preferredToken)
+      const calldata = getRegisterWithPreferencesCalldata(
+        label,
+        claimPreferredChain.trim(),
+        tokenValue
+      );
+      await provider.request({
+        method: "eth_sendTransaction",
+        params: [{
+          from,
+          to: registrarAddress,
+          data: calldata,
+          chainId: chainIdHex,
+          gasLimit: "0x60000", // ~400k for registerWithPreferences
+        }],
+      });
+
+      setClaimLabel("");
+      setClaimPreferredChain("");
+      setClaimPreferredToken("");
+      setClaimPreferredTokenCustom("");
+      setClaimNameAvailable(null);
+      setClaimStep(null);
+      setTimeout(() => refetchSubdomain(), 15000);
+    } catch (err: unknown) {
+      const data = (err as { data?: unknown; error?: { data?: unknown } })?.data
+        ?? (err as { error?: { data?: unknown } })?.error?.data;
+      const friendly = getRegistrarRevertMessage(data);
+      if (friendly) {
+        setClaimError(friendly);
+      } else {
+        setClaimError(err instanceof Error ? err.message : "Claim failed. If the tx reverted, try: same wallet on Base, name still available, or edit preferences if you already have a name.");
+      }
+      setClaimStep(null);
+    } finally {
+      setClaimLoading(false);
+    }
+  }, [
+    claimLabel,
+    claimNameAvailable,
+    claimPreferredChain,
+    claimPreferredToken,
+    claimPreferredTokenCustom,
+    embeddedEthWallet,
+    currentNetwork.evmChainId,
+    registrarAddress,
+    refetchSubdomain,
+  ]);
+
+  const openEditPreferences = useCallback(() => {
+    if (!subdomainStatus) return;
+    const chain = subdomainStatus.preferredChain ?? "";
+    const token = subdomainStatus.preferredToken ?? "";
+    setEditPrefsChain(chain);
+    if (token === "ETH" || token === "USDC" || token === "USDT") {
+      setEditPrefsToken(token);
+      setEditPrefsTokenCustom("");
+    } else {
+      setEditPrefsToken("OTHER");
+      setEditPrefsTokenCustom(token);
+    }
+    setEditPrefsError(null);
+    setEditPrefsVisible(true);
+  }, [subdomainStatus]);
+
+  const handleUpdatePreferences = useCallback(async () => {
+    if (!editPrefsChain.trim()) {
+      setEditPrefsError("Select preferred chain");
+      return;
+    }
+    const tokenValue =
+      editPrefsToken === "OTHER" ? editPrefsTokenCustom.trim() : editPrefsToken;
+    if (!tokenValue) {
+      setEditPrefsError(
+        editPrefsToken === "OTHER"
+          ? "Paste token address for Other"
+          : "Select preferred token"
+      );
+      return;
+    }
+    if (!embeddedEthWallet || !registrarAddress) {
+      setEditPrefsError("Wallet or registrar not ready");
+      return;
+    }
+    setEditPrefsError(null);
+    setEditPrefsLoading(true);
+    try {
+      const provider = await (embeddedEthWallet as any).getProvider();
+      const chainIdHex = currentNetwork.evmChainId;
+      if (!chainIdHex) throw new Error("Network not configured for EVM");
+      try {
+        const currentChainId = (await provider.request({ method: "eth_chainId" })) as string;
+        if (currentChainId !== chainIdHex) {
+          await provider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: chainIdHex }],
+          });
+        }
+      } catch (switchErr) {
+        throw new Error("Failed to switch to Base. Enable Base in your Privy app.");
+      }
+      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+      const from = accounts?.[0];
+      if (!from) throw new Error("No account in embedded wallet");
+
+      const prefsData = getSetPreferencesCalldata(editPrefsChain.trim(), tokenValue);
+      await provider.request({
+        method: "eth_sendTransaction",
+        params: [{
+          from,
+          to: registrarAddress,
+          data: prefsData,
+          chainId: chainIdHex,
+          gasLimit: "0x30D40",
+        }],
+      });
+
+      setEditPrefsVisible(false);
+      setTimeout(() => refetchSubdomain(), 5000);
+    } catch (err: unknown) {
+      const data = (err as { data?: unknown; error?: { data?: unknown } })?.data
+        ?? (err as { error?: { data?: unknown } })?.error?.data;
+      const friendly = getRegistrarRevertMessage(data);
+      if (friendly) {
+        setEditPrefsError(friendly);
+      } else {
+        setEditPrefsError(
+          err instanceof Error
+            ? err.message
+            : "Update failed. Make sure you're on Base and using the same wallet that claimed your name."
+        );
+      }
+    } finally {
+      setEditPrefsLoading(false);
+    }
+  }, [
+    editPrefsChain,
+    editPrefsToken,
+    editPrefsTokenCustom,
+    embeddedEthWallet,
+    currentNetwork.evmChainId,
+    registrarAddress,
+    refetchSubdomain,
   ]);
 
   const handleSend = useCallback(async () => {
@@ -914,7 +1225,9 @@ export default function HomeScreen() {
                 style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}
               >
                 <Text style={styles.address} selectable>
-                  {evmAddress}
+                  {isBaseMainnet(currentNetwork.id) && subdomainStatus?.fullName
+                    ? subdomainStatus.fullName
+                    : evmAddress}
                 </Text>
                 <Text style={styles.addressShort}>
                   {truncateAddress(evmAddress)}
@@ -930,6 +1243,19 @@ export default function HomeScreen() {
                   This network is wallet-only. Margin trading and deep liquidity
                   are available on Sui.
                 </Text>
+                {isBaseMainnet(currentNetwork.id) && subdomainStatus?.hasSubdomain && (
+                  <>
+                    <Text style={[styles.muted, { marginTop: 10 }]}>
+                      Preferred: {subdomainStatus.preferredChain ?? "—"} · {subdomainStatus.preferredToken ?? "—"}
+                    </Text>
+                    <Pressable
+                      onPress={openEditPreferences}
+                      style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1, marginTop: 8 }]}
+                    >
+                      <Text style={[styles.muted, { color: colors.tint }]}>Edit preferences</Text>
+                    </Pressable>
+                  </>
+                )}
               </Pressable>
             ) : (
               <Text style={styles.muted}>
@@ -938,6 +1264,410 @@ export default function HomeScreen() {
               </Text>
             )}
           </View>
+
+          {isBaseMainnet(currentNetwork.id) && evmAddress && registrarAddress && (
+            <>
+              {subdomainLoading ? (
+                <View style={styles.card}>
+                  <ActivityIndicator size="small" color={colors.tint} />
+                  <Text style={styles.muted}>Checking subdomain…</Text>
+                </View>
+              ) : subdomainError ? (
+                <View style={styles.card}>
+                  <Text style={styles.error}>{subdomainError}</Text>
+                  <Pressable onPress={refetchSubdomain} style={({ pressed }) => ({ opacity: pressed ? 0.8 : 1 })}>
+                    <Text style={[styles.muted, { color: colors.tint, marginTop: 8 }]}>Tap to retry</Text>
+                  </Pressable>
+                </View>
+              ) : !subdomainStatus?.hasSubdomain ? (
+                <View style={styles.card}>
+                  <Animated.Text style={[styles.subdomainHeading, { color: colors.text, opacity: subdomainBlinkAnim }]}>
+                    Choose your Ghostwater name
+                  </Animated.Text>
+                  <Text style={[styles.inputLabel, { color: colors.text, marginTop: 8 }]}>Name (min 3 characters)</Text>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      styles.subdomainInput,
+                      { color: colors.text },
+                    ]}
+                    placeholder="e.g. alice"
+                    placeholderTextColor={colors.text + "80"}
+                    value={claimLabel}
+                    onChangeText={(t) => {
+                      setClaimLabel(t);
+                      setClaimError(null);
+                    }}
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    editable={!claimLoading}
+                  />
+                  {claimCheckingName && (
+                    <Text style={styles.muted}>Checking availability…</Text>
+                  )}
+                  {!claimCheckingName && claimNameAvailable === true && (
+                    <Text style={[styles.muted, { color: "#22c55e" }]}>Available</Text>
+                  )}
+                  {!claimCheckingName && claimNameAvailable === false && (
+                    <Text style={[styles.muted, { color: "#ef4444" }]}>Already taken</Text>
+                  )}
+                  <Text style={[styles.inputLabel, { color: colors.text, marginTop: 12 }]}>Preferred chain</Text>
+                  <Pressable
+                    onPress={() => !claimLoading && setChainPickerVisible(true)}
+                    style={[
+                      styles.input,
+                      styles.subdomainInput,
+                      styles.dropdown,
+                      {
+                        borderColor: colors.tabIconDefault,
+                        opacity: claimLoading ? 0.6 : 1,
+                      },
+                    ]}
+                  >
+                    <Text style={{ fontSize: 14, color: colors.text }}>
+                      {claimPreferredChain || "Select chain"}
+                    </Text>
+                    <FontAwesome name="chevron-down" size={14} color={colors.tabIconDefault} />
+                  </Pressable>
+                  <Modal
+                    visible={chainPickerVisible}
+                    transparent
+                    animationType="fade"
+                    onRequestClose={() => setChainPickerVisible(false)}
+                  >
+                    <Pressable style={styles.modalOverlay} onPress={() => setChainPickerVisible(false)}>
+                      <View
+                        style={[styles.modalContent, { backgroundColor: colors.background, borderColor: colors.tabIconDefault }]}
+                        onStartShouldSetResponder={() => true}
+                      >
+                        <Text style={[styles.inputLabel, { color: colors.text }]}>Select chain</Text>
+                        <ScrollView style={{ maxHeight: 240 }}>
+                          {PREFERRED_CHAIN_OPTIONS.map((chain) => (
+                            <Pressable
+                              key={chain}
+                              onPress={() => {
+                                setClaimPreferredChain(chain);
+                                setChainPickerVisible(false);
+                                setClaimError(null);
+                              }}
+                              style={({ pressed }) => [
+                                styles.pickerItem,
+                                {
+                                  backgroundColor: claimPreferredChain === chain ? colors.tabIconDefault + "30" : "transparent",
+                                  opacity: pressed ? 0.8 : 1,
+                                },
+                              ]}
+                            >
+                              <Text style={{ fontSize: 14, color: colors.text }}>{chain}</Text>
+                            </Pressable>
+                          ))}
+                        </ScrollView>
+                      </View>
+                    </Pressable>
+                  </Modal>
+
+                  <Text style={[styles.inputLabel, { color: colors.text, marginTop: 12 }]}>Preferred token</Text>
+                  <Pressable
+                    onPress={() => !claimLoading && setTokenPickerVisibleSubdomain(true)}
+                    style={[
+                      styles.input,
+                      styles.subdomainInput,
+                      styles.dropdown,
+                      {
+                        borderColor: colors.tabIconDefault,
+                        opacity: claimLoading ? 0.6 : 1,
+                      },
+                    ]}
+                  >
+                    <Text style={{ fontSize: 14, color: colors.text }}>
+                      {claimPreferredToken
+                        ? PREFERRED_TOKEN_OPTIONS.find((o) => o.value === claimPreferredToken)?.label ?? claimPreferredToken
+                        : "Select token"}
+                    </Text>
+                    <FontAwesome name="chevron-down" size={14} color={colors.tabIconDefault} />
+                  </Pressable>
+                  {claimPreferredToken === "OTHER" && (
+                    <TextInput
+                      style={[styles.input, styles.subdomainInput, { color: colors.text, marginTop: 8 }]}
+                      placeholder="Paste token contract address (0x...)"
+                      placeholderTextColor={colors.text + "80"}
+                      value={claimPreferredTokenCustom}
+                      onChangeText={(t) => {
+                        setClaimPreferredTokenCustom(t);
+                        setClaimError(null);
+                      }}
+                      editable={!claimLoading}
+                    />
+                  )}
+                  <Modal
+                    visible={tokenPickerVisibleSubdomain}
+                    transparent
+                    animationType="fade"
+                    onRequestClose={() => setTokenPickerVisibleSubdomain(false)}
+                  >
+                    <Pressable style={styles.modalOverlay} onPress={() => setTokenPickerVisibleSubdomain(false)}>
+                      <View
+                        style={[styles.modalContent, { backgroundColor: colors.background, borderColor: colors.tabIconDefault }]}
+                        onStartShouldSetResponder={() => true}
+                      >
+                        <Text style={[styles.inputLabel, { color: colors.text }]}>Select token</Text>
+                        <ScrollView style={{ maxHeight: 240 }}>
+                          {PREFERRED_TOKEN_OPTIONS.map((opt) => (
+                            <Pressable
+                              key={opt.value}
+                              onPress={() => {
+                                setClaimPreferredToken(opt.value);
+                                setTokenPickerVisibleSubdomain(false);
+                                setClaimError(null);
+                              }}
+                              style={({ pressed }) => [
+                                styles.pickerItem,
+                                {
+                                  backgroundColor: claimPreferredToken === opt.value ? colors.tabIconDefault + "30" : "transparent",
+                                  opacity: pressed ? 0.8 : 1,
+                                },
+                              ]}
+                            >
+                              <Text style={{ fontSize: 14, color: colors.text }}>{opt.label}</Text>
+                            </Pressable>
+                          ))}
+                        </ScrollView>
+                      </View>
+                    </Pressable>
+                  </Modal>
+                  {claimError && (
+                    <Text style={[styles.error, { marginTop: 8 }]}>{claimError}</Text>
+                  )}
+                  <Pressable
+                    onPress={handleClaimSubdomain}
+                    disabled={
+                      claimLoading ||
+                      claimNameAvailable !== true ||
+                      !claimPreferredChain.trim() ||
+                      !claimPreferredToken ||
+                      (claimPreferredToken === "OTHER" && !claimPreferredTokenCustom.trim())
+                    }
+                    style={({ pressed }) => [
+                      styles.primaryButton,
+                      { backgroundColor: colors.tint, opacity: claimLoading || claimNameAvailable !== true ? 0.6 : pressed ? 0.8 : 1 },
+                    ]}
+                  >
+                    <Text style={[styles.primaryButtonText, { color: colors.background }]}>
+                      {claimLoading ? "Claiming…" : "Claim name & set preferences"}
+                    </Text>
+                  </Pressable>
+                  <Text style={[styles.muted, { marginTop: 8, fontSize: 12 }]}>
+                    One tx: claim name and set preferences. We’ll refresh in ~15s after.
+                  </Text>
+                </View>
+              ) : null}
+
+              {/* Edit preferences modal (when user has subdomain) */}
+              <Modal
+                visible={editPrefsVisible}
+                transparent
+                animationType="fade"
+                onRequestClose={() => !editPrefsLoading && setEditPrefsVisible(false)}
+              >
+                <Pressable
+                  style={styles.modalOverlay}
+                  onPress={() => !editPrefsLoading && setEditPrefsVisible(false)}
+                >
+                  <View
+                    style={[
+                      styles.modalContent,
+                      {
+                        backgroundColor: colors.background,
+                        borderColor: colors.tabIconDefault,
+                      },
+                    ]}
+                    onStartShouldSetResponder={() => true}
+                  >
+                    <Text style={[styles.inputLabel, { color: colors.text }]}>
+                      Edit preferences
+                    </Text>
+                    <Text style={[styles.inputLabel, { color: colors.text, marginTop: 12 }]}>
+                      Preferred chain
+                    </Text>
+                    <Pressable
+                      onPress={() => !editPrefsLoading && setEditChainPickerVisible(true)}
+                      style={[
+                        styles.input,
+                        styles.subdomainInput,
+                        styles.dropdown,
+                        {
+                          borderColor: colors.tabIconDefault,
+                          opacity: editPrefsLoading ? 0.6 : 1,
+                        },
+                      ]}
+                    >
+                      <Text style={{ fontSize: 14, color: colors.text }}>
+                        {editPrefsChain || "Select chain"}
+                      </Text>
+                      <FontAwesome name="chevron-down" size={14} color={colors.tabIconDefault} />
+                    </Pressable>
+                    <Modal
+                      visible={editChainPickerVisible}
+                      transparent
+                      animationType="fade"
+                      onRequestClose={() => setEditChainPickerVisible(false)}
+                    >
+                      <Pressable style={styles.modalOverlay} onPress={() => setEditChainPickerVisible(false)}>
+                        <View
+                          style={[
+                            styles.modalContent,
+                            {
+                              backgroundColor: colors.background,
+                              borderColor: colors.tabIconDefault,
+                            },
+                          ]}
+                          onStartShouldSetResponder={() => true}
+                        >
+                          <Text style={[styles.inputLabel, { color: colors.text }]}>Select chain</Text>
+                          <ScrollView style={{ maxHeight: 240 }}>
+                            {PREFERRED_CHAIN_OPTIONS.map((chain) => (
+                              <Pressable
+                                key={chain}
+                                onPress={() => {
+                                  setEditPrefsChain(chain);
+                                  setEditChainPickerVisible(false);
+                                  setEditPrefsError(null);
+                                }}
+                                style={({ pressed }) => [
+                                  styles.pickerItem,
+                                  {
+                                    backgroundColor:
+                                      editPrefsChain === chain ? colors.tabIconDefault + "30" : "transparent",
+                                    opacity: pressed ? 0.8 : 1,
+                                  },
+                                ]}
+                              >
+                                <Text style={{ fontSize: 14, color: colors.text }}>{chain}</Text>
+                              </Pressable>
+                            ))}
+                          </ScrollView>
+                        </View>
+                      </Pressable>
+                    </Modal>
+
+                    <Text style={[styles.inputLabel, { color: colors.text, marginTop: 12 }]}>
+                      Preferred token
+                    </Text>
+                    <Pressable
+                      onPress={() => !editPrefsLoading && setEditTokenPickerVisible(true)}
+                      style={[
+                        styles.input,
+                        styles.subdomainInput,
+                        styles.dropdown,
+                        {
+                          borderColor: colors.tabIconDefault,
+                          opacity: editPrefsLoading ? 0.6 : 1,
+                        },
+                      ]}
+                    >
+                      <Text style={{ fontSize: 14, color: colors.text }}>
+                        {editPrefsToken
+                          ? PREFERRED_TOKEN_OPTIONS.find((o) => o.value === editPrefsToken)?.label ?? editPrefsToken
+                          : "Select token"}
+                      </Text>
+                      <FontAwesome name="chevron-down" size={14} color={colors.tabIconDefault} />
+                    </Pressable>
+                    {editPrefsToken === "OTHER" && (
+                      <TextInput
+                        style={[
+                          styles.input,
+                          styles.subdomainInput,
+                          { color: colors.text, marginTop: 8 },
+                        ]}
+                        placeholder="Paste token contract address (0x...)"
+                        placeholderTextColor={colors.text + "80"}
+                        value={editPrefsTokenCustom}
+                        onChangeText={(t) => {
+                          setEditPrefsTokenCustom(t);
+                          setEditPrefsError(null);
+                        }}
+                        editable={!editPrefsLoading}
+                      />
+                    )}
+                    <Modal
+                      visible={editTokenPickerVisible}
+                      transparent
+                      animationType="fade"
+                      onRequestClose={() => setEditTokenPickerVisible(false)}
+                    >
+                      <Pressable style={styles.modalOverlay} onPress={() => setEditTokenPickerVisible(false)}>
+                        <View
+                          style={[
+                            styles.modalContent,
+                            {
+                              backgroundColor: colors.background,
+                              borderColor: colors.tabIconDefault,
+                            },
+                          ]}
+                          onStartShouldSetResponder={() => true}
+                        >
+                          <Text style={[styles.inputLabel, { color: colors.text }]}>Select token</Text>
+                          <ScrollView style={{ maxHeight: 240 }}>
+                            {PREFERRED_TOKEN_OPTIONS.map((opt) => (
+                              <Pressable
+                                key={opt.value}
+                                onPress={() => {
+                                  setEditPrefsToken(opt.value);
+                                  setEditTokenPickerVisible(false);
+                                  setEditPrefsError(null);
+                                }}
+                                style={({ pressed }) => [
+                                  styles.pickerItem,
+                                  {
+                                    backgroundColor:
+                                      editPrefsToken === opt.value ? colors.tabIconDefault + "30" : "transparent",
+                                    opacity: pressed ? 0.8 : 1,
+                                  },
+                                ]}
+                              >
+                                <Text style={{ fontSize: 14, color: colors.text }}>{opt.label}</Text>
+                              </Pressable>
+                            ))}
+                          </ScrollView>
+                        </View>
+                      </Pressable>
+                    </Modal>
+
+                    {editPrefsError && (
+                      <Text style={[styles.error, { marginTop: 8 }]}>{editPrefsError}</Text>
+                    )}
+                    <Pressable
+                      onPress={handleUpdatePreferences}
+                      disabled={
+                        editPrefsLoading ||
+                        !editPrefsChain.trim() ||
+                        !editPrefsToken ||
+                        (editPrefsToken === "OTHER" && !editPrefsTokenCustom.trim())
+                      }
+                      style={({ pressed }) => [
+                        styles.primaryButton,
+                        {
+                          backgroundColor: colors.tint,
+                          opacity:
+                            editPrefsLoading || !editPrefsChain.trim() || !editPrefsToken ? 0.6 : pressed ? 0.8 : 1,
+                        },
+                      ]}
+                    >
+                      <Text style={[styles.primaryButtonText, { color: colors.background }]}>
+                        {editPrefsLoading ? "Updating…" : "Update preferences"}
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={() => !editPrefsLoading && setEditPrefsVisible(false)}
+                      style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1, marginTop: 8 }]}
+                    >
+                      <Text style={[styles.muted, { color: colors.text }]}>Cancel</Text>
+                    </Pressable>
+                  </View>
+                </Pressable>
+              </Modal>
+            </>
+          )}
 
           <View style={styles.card}>
             <Text style={styles.cardLabel}>
@@ -1582,6 +2312,16 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     fontSize: 14,
     marginBottom: 16,
+  },
+  subdomainHeading: {
+    fontSize: 17,
+    fontWeight: "700",
+    marginBottom: 4,
+  },
+  subdomainInput: {
+    borderWidth: 1.5,
+    borderColor: "rgba(128,128,128,0.55)",
+    backgroundColor: "rgba(128,128,128,0.12)",
   },
   dropdown: {
     flexDirection: "row",

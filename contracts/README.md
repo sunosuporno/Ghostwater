@@ -49,6 +49,28 @@ registry.addRegistrar(<GhostwaterRegistrar address>)
 
 (e.g. via Basescan “Write contract” → `addRegistrar`).
 
+## Fork tests (Base mainnet)
+
+To debug `register` / `setPreferences` against the real Base mainnet (and L2 registry), run the fork tests:
+
+1. In `contracts/.env` set:
+   - `BASE_RPC_URL` (e.g. `https://mainnet.base.org` or an Alchemy/Infura URL)
+   - `GHOSTWATER_REGISTRAR_ADDRESS` – your deployed GhostwaterRegistrar on Base
+
+2. Run (from `contracts/`):
+
+   ```bash
+   cd contracts && forge test --match-contract GhostwaterRegistrarFork -vvv
+   ```
+
+   Or pass the RPC URL in the command (no need for `BASE_RPC_URL` in .env):
+
+   ```bash
+   cd contracts && forge test --match-contract GhostwaterRegistrarFork --fork-url "https://mainnet.base.org" -vvv
+   ```
+
+   Use `-vvvv` for more trace if a test reverts. Tests cover: `NotClaimed`, `LabelTooShort`, full flow (register + setPreferences), `AlreadyClaimed`, `LabelUnavailable`, and that the registrar is allowed on the registry. If a label is already taken on mainnet, change the label constant in `test/GhostwaterRegistrarFork.t.sol` (e.g. `testfork999`) and re-run.
+
 ## Contract behaviour
 
 - **Free** – no payment; `register(label)` is callable by anyone for themselves.
