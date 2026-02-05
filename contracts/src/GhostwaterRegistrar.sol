@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {StringUtils} from "./utils/StringUtils.sol";
-import {IL2RegistryMinimal} from "./interfaces/IL2RegistryMinimal.sol";
+import {IL2Registry} from "./interfaces/IL2Registry.sol";
 
 /// @title GhostwaterRegistrar
 /// @notice Free, one-per-address, immutable ENS L2 subnames (via Durin). For Base mainnet.
@@ -13,7 +13,7 @@ contract GhostwaterRegistrar {
     /// @notice Emitted when a new subdomain is claimed
     event NameRegistered(string indexed label, address indexed owner);
 
-    IL2RegistryMinimal public immutable registry;
+    IL2Registry public immutable registry;
     uint256 public immutable chainId;
     /// @dev ENSIP-11 coinType for this chain (used for setAddr)
     uint256 public immutable coinType;
@@ -28,7 +28,7 @@ contract GhostwaterRegistrar {
     error LabelTooShort();
 
     constructor(address _registry) {
-        registry = IL2RegistryMinimal(_registry);
+        registry = IL2Registry(_registry);
         chainId = block.chainid;
         coinType = (0x80000000 | chainId) >> 0;
     }
