@@ -29,9 +29,16 @@ forge build
 
 ## Deploy (Base mainnet)
 
+From the `contracts/` directory:
+
 ```bash
-forge script script/Deploy.s.sol --rpc-url base --broadcast
-# Or with env: --private-key $PRIVATE_KEY
+./script/deploy.sh
+```
+
+Or with forge directly:
+
+```bash
+forge script script/Deploy.s.sol --rpc-url base --broadcast --private-key $PRIVATE_KEY
 ```
 
 After deployment, as the **owner of the L2 Registry**, call:

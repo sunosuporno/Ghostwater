@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {StringUtils} from "./utils/StringUtils.sol";
 import {IL2Registry} from "./interfaces/IL2Registry.sol";
 
 /// @title GhostwaterRegistrar
 /// @notice Free, one-per-address, immutable ENS L2 subnames (via Durin). For Base mainnet.
 /// @dev Subnodes are owned by this contract; resolution is set to the claimer's address and cannot be changed.
-contract GhostwaterRegistrar {
+contract GhostwaterRegistrar is ReentrancyGuard {
     using StringUtils for string;
 
     /// @notice Emitted when a new subdomain is claimed
@@ -24,10 +25,13 @@ contract GhostwaterRegistrar {
     mapping(address => string) public addressToLabel;
 
     error AlreadyClaimed();
+    error InvalidRegistry();
     error LabelUnavailable();
     error LabelTooShort();
+    error NotClaimed();
 
     constructor(address _registry) {
+        if (_registry == address(0)) revert InvalidRegistry();
         registry = IL2Registry(_registry);
         chainId = block.chainid;
         coinType = (0x80000000 | chainId) >> 0;
@@ -35,7 +39,7 @@ contract GhostwaterRegistrar {
 
     /// @notice Claim your free subdomain. Callable only by the recipient; one subdomain per address; cannot be changed.
     /// @param label The subdomain label (e.g. "alice" for alice.yourapp.eth). Min 3 chars; must be available.
-    function register(string calldata label) external {
+    function register(string calldata label) external nonReentrant {
         if (addressToNode[msg.sender] != bytes32(0)) revert AlreadyClaimed();
         if (!available(label)) revert LabelUnavailable();
         if (label.strlen() < 3) revert LabelTooShort();
@@ -59,6 +63,23 @@ contract GhostwaterRegistrar {
     /// @notice Returns true if the address has claimed a subdomain.
     function hasSubdomain(address account) external view returns (bool) {
         return addressToNode[account] != bytes32(0);
+    }
+
+    /// @notice Text record keys for preferences (ENS subdomain).
+    string public constant PREFERRED_CHAIN_KEY = "com.ghostwater.preferredChain";
+    string public constant PREFERRED_TOKEN_KEY = "com.ghostwater.preferredToken";
+
+    /// @notice Set preferred chain and token in one transaction. Caller must have claimed a subdomain.
+    function setPreferences(string calldata preferredChain, string calldata preferredToken) external nonReentrant {
+        bytes32 node = addressToNode[msg.sender];
+        if (node == bytes32(0)) revert NotClaimed();
+        _setTextRecord(node, PREFERRED_CHAIN_KEY, preferredChain);
+        _setTextRecord(node, PREFERRED_TOKEN_KEY, preferredToken);
+    }
+
+    /// @dev Internal helper to set a text record on a node.
+    function _setTextRecord(bytes32 node, string memory key, string memory value) internal {
+        registry.setText(node, key, value);
     }
 
     /// @notice Checks if a label is available for registration.
