@@ -5,6 +5,20 @@
 
 const MAINNET_RPC = "https://fullnode.mainnet.sui.io";
 
+/** Parse response body as JSON; avoid "Unexpected character" when RPC returns HTML or plain text. */
+function parseJsonResponse(text: string, context: string): unknown {
+  const trimmed = text?.trim() ?? "";
+  if (!trimmed) throw new Error(`${context}: empty response`);
+  if (trimmed.startsWith("<") || trimmed.toLowerCase().startsWith("<!doctype"))
+    throw new Error(`${context}: server returned HTML instead of JSON`);
+  try {
+    return JSON.parse(text) as unknown;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(`${context}: invalid response (${msg})`);
+  }
+}
+
 export async function fetchSuiBalance(
   owner: string,
   coinType: string = "0x2::sui::SUI"
@@ -19,11 +33,15 @@ export async function fetchSuiBalance(
       id: 1,
     }),
   });
-  const json = await res.json();
+  const text = await res.text();
+  const json = parseJsonResponse(text, "Sui balance") as {
+    error?: { message?: string };
+    result?: { totalBalance?: string; coinType?: string };
+  };
   if (json.error) {
     throw new Error(json.error.message ?? "RPC error");
   }
-  const result = json.result as { totalBalance: string; coinType: string };
+  const result = json.result;
   return {
     totalBalance: result?.totalBalance ?? "0",
     coinType: result?.coinType ?? coinType,
@@ -89,7 +107,11 @@ async function fetchCoinMetadata(
         id: 1,
       }),
     });
-    const json = await res.json();
+    const text = await res.text();
+    const json = parseJsonResponse(text, "Sui coin metadata") as {
+      error?: unknown;
+      result?: SuiCoinMetadata | null;
+    };
     if (json.error || json.result == null) return null;
     return json.result as SuiCoinMetadata;
   } catch {
@@ -132,7 +154,11 @@ export async function fetchAllSuiBalances(owner: string): Promise<
       id: 1,
     }),
   });
-  const json = await res.json();
+  const text = await res.text();
+  const json = parseJsonResponse(text, "Sui balances") as {
+    error?: { message?: string };
+    result?: SuiBalanceItem[] | null;
+  };
   if (json.error) {
     throw new Error(json.error.message ?? "RPC error");
   }
