@@ -1,0 +1,8 @@
+# Foundry
+cache/
+out/
+broadcast/
+lib/
+
+# Env (use .env.example as template)
+.env
