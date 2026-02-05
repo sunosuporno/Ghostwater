@@ -1,7 +1,9 @@
 /**
  * Build a Sui transaction to place a margin limit or market order.
- * Uses @mysten/deepbook-v3 poolProxy.placeLimitOrder / placeMarketOrder.
+ * Optionally borrows first (borrowBase/borrowQuote) so the margin account has
+ * enough balance for the order; then places the order via poolProxy.
  * @see https://docs.sui.io/standards/deepbook-margin-sdk/orders
+ * @see https://docs.sui.io/standards/deepbook-margin-sdk/margin-manager#borrowbase-borrowquote
  */
 
 import {
@@ -30,6 +32,12 @@ export type PreparePlaceOrderParams = {
   clientOrderId: number; // u64 for SDK
   payWithDeep?: boolean;
   network?: "mainnet" | "testnet";
+  /** If true, use placeReduceOnlyMarketOrder (for closing positions). */
+  reduceOnly?: boolean;
+  /** Borrow base (e.g. SUI) before placing order; used for short. Human units. */
+  borrowBaseAmount?: number;
+  /** Borrow quote (e.g. USDC) before placing order; used for long. Human units. */
+  borrowQuoteAmount?: number;
 };
 
 export type PreparePlaceOrderResult = {
@@ -51,6 +59,9 @@ export async function preparePlaceOrder(
     clientOrderId,
     payWithDeep = true,
     network = "mainnet",
+    reduceOnly = false,
+    borrowBaseAmount,
+    borrowQuoteAmount,
   } = params;
 
   if (orderType === "limit" && (price == null || Number.isNaN(price))) {
@@ -91,6 +102,10 @@ export async function preparePlaceOrder(
   const db = (
     extended as {
       deepbook: {
+        marginManager: {
+          borrowBase: (managerKey: string, amount: number) => (tx: Transaction) => void;
+          borrowQuote: (managerKey: string, amount: number) => (tx: Transaction) => void;
+        };
         poolProxy: {
           placeLimitOrder: (p: {
             poolKey: string;
@@ -109,11 +124,26 @@ export async function preparePlaceOrder(
             isBid: boolean;
             payWithDeep?: boolean;
           }) => (tx: Transaction) => void;
+          placeReduceOnlyMarketOrder: (p: {
+            poolKey: string;
+            marginManagerKey: string;
+            clientOrderId: number;
+            quantity: number;
+            isBid: boolean;
+            payWithDeep?: boolean;
+          }) => (tx: Transaction) => void;
         };
       };
     }
   ).deepbook;
-  const poolProxy = db.poolProxy;
+  const { marginManager, poolProxy } = db;
+
+  if (borrowBaseAmount != null && borrowBaseAmount > 0) {
+    marginManager.borrowBase(MANAGER_KEY, borrowBaseAmount)(tx);
+  }
+  if (borrowQuoteAmount != null && borrowQuoteAmount > 0) {
+    marginManager.borrowQuote(MANAGER_KEY, borrowQuoteAmount)(tx);
+  }
 
   if (orderType === "limit") {
     poolProxy.placeLimitOrder({
@@ -121,6 +151,15 @@ export async function preparePlaceOrder(
       marginManagerKey: MANAGER_KEY,
       clientOrderId,
       price: price!,
+      quantity,
+      isBid,
+      payWithDeep,
+    })(tx);
+  } else if (reduceOnly) {
+    poolProxy.placeReduceOnlyMarketOrder({
+      poolKey,
+      marginManagerKey: MANAGER_KEY,
+      clientOrderId,
       quantity,
       isBid,
       payWithDeep,

@@ -15,6 +15,12 @@ export type PlaceOrderViaBackendParams = {
   quantity: number;
   price?: number; // required for limit
   payWithDeep?: boolean;
+  /** Use reduce-only market order (for closing positions). */
+  reduceOnly?: boolean;
+  /** Borrow base (e.g. SUI) before order; for short. Human units. */
+  borrowBaseAmount?: number;
+  /** Borrow quote (e.g. USDC) before order; for long. Human units. */
+  borrowQuoteAmount?: number;
   signRawHash: (params: {
     address: string;
     chainType: "sui";
@@ -70,6 +76,9 @@ export async function placeOrderViaBackend(
     quantity,
     price,
     payWithDeep = true,
+    reduceOnly = false,
+    borrowBaseAmount,
+    borrowQuoteAmount,
     signRawHash,
     publicKeyHex,
     network = DEFAULT_NETWORK,
@@ -98,7 +107,16 @@ export async function placeOrderViaBackend(
       price: orderType === "limit" ? price : undefined,
       clientOrderId,
       payWithDeep,
+      reduceOnly,
       network,
+      borrowBaseAmount:
+        borrowBaseAmount != null && borrowBaseAmount > 0
+          ? borrowBaseAmount
+          : undefined,
+      borrowQuoteAmount:
+        borrowQuoteAmount != null && borrowQuoteAmount > 0
+          ? borrowQuoteAmount
+          : undefined,
     }),
   });
   const prepareJson = await prepareRes.json();

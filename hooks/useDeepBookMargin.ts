@@ -1,14 +1,19 @@
 import {
-  fetchCollateralEvents,
+  fetchAllCollateralEvents,
   fetchLiquidation,
   fetchLoanBorrowed,
   fetchLoanRepaid,
+  fetchMarginManagerCreated,
   fetchMarginManagerStates,
   fetchMarginManagersInfo,
   fetchOhlcv,
+  fetchOrders,
   fetchTicker,
+  fetchTrades,
   fromPythRaw,
   type CollateralEvent,
+  type DeepBookOrder,
+  type DeepBookTrade,
   type LiquidationEvent,
   type LoanBorrowedEvent,
   type LoanRepaidEvent,
@@ -115,6 +120,7 @@ export function useMarginManagersInfo() {
   return { pools: data ?? [], loading, error };
 }
 
+/** Price (ticker) poll interval – top-of-book price for header and order form. */
 const PRICE_POLL_MS = 5000;
 
 type TickerContextValue = {
@@ -541,12 +547,12 @@ export function useMarginManagerState(
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchState = useCallback(async () => {
+  const fetchState = useCallback(async (): Promise<MarginManagerState | null> => {
     if (!marginManagerId || !deepbookPoolId) {
       setState(null);
       setLoading(false);
       setError(null);
-      return;
+      return null;
     }
     setLoading(true);
     setError(null);
@@ -557,26 +563,13 @@ export function useMarginManagerState(
       const mine =
         list.find((s) => s.margin_manager_id === marginManagerId) ?? null;
       setState(mine);
-      if (__DEV__) {
-        console.log("[Margin] Refresh state result", {
-          deepbook_pool_id: deepbookPoolId,
-          marginManagerId,
-          listLength: list.length,
-          found: !!mine,
-          state: mine
-            ? {
-                base_asset: mine.base_asset,
-                quote_asset: mine.quote_asset,
-                risk_ratio: mine.risk_ratio,
-              }
-            : null,
-        });
-      }
+      return mine;
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load state");
       if (__DEV__) {
         console.warn("[Margin] Refresh state error", e);
       }
+      return null;
     } finally {
       setLoading(false);
     }
@@ -615,78 +608,44 @@ export function useMarginHistory(
     setError(null);
     const limit = HISTORY_LIMIT;
     try {
-      // Fetch collateral events: base (e.g. SUI), quote (e.g. USDC), and unfiltered (to include DEEP).
-      // DEEP is a third collateral type (depositDeep); indexer only documents is_base (base/quote).
-      const [
-        colBase,
-        colQuote,
-        colAll,
-        bBase,
-        bQuote,
-        rBase,
-        rQuote,
-        liqBase,
-        liqQuote,
-      ] = await Promise.all([
-        fetchCollateralEvents({
-          margin_manager_id: marginManagerId,
-          is_base: true,
-          limit,
-        }),
-        fetchCollateralEvents({
-          margin_manager_id: marginManagerId,
-          is_base: false,
-          limit,
-        }),
-        fetchCollateralEvents({
-          margin_manager_id: marginManagerId,
-          limit: limit * 2,
-        }),
-        fetchLoanBorrowed({
-          margin_manager_id: marginManagerId,
-          margin_pool_id: baseMarginPoolId,
-          limit,
-        }),
-        fetchLoanBorrowed({
-          margin_manager_id: marginManagerId,
-          margin_pool_id: quoteMarginPoolId,
-          limit,
-        }),
-        fetchLoanRepaid({
-          margin_manager_id: marginManagerId,
-          margin_pool_id: baseMarginPoolId,
-          limit,
-        }),
-        fetchLoanRepaid({
-          margin_manager_id: marginManagerId,
-          margin_pool_id: quoteMarginPoolId,
-          limit,
-        }),
-        fetchLiquidation({
-          margin_manager_id: marginManagerId,
-          margin_pool_id: baseMarginPoolId,
-          limit,
-        }),
-        fetchLiquidation({
-          margin_manager_id: marginManagerId,
-          margin_pool_id: quoteMarginPoolId,
-          limit,
-        }),
-      ]);
-      // Merge base + quote + unfiltered collateral events, dedupe by event_digest, sort newest first, cap at limit
-      const seen = new Set<string>();
-      const merged: CollateralEvent[] = [];
-      const allCol = [
-        ...(colBase ?? []),
-        ...(colQuote ?? []),
-        ...(colAll ?? []),
-      ].sort((a, b) => b.onchain_timestamp - a.onchain_timestamp);
-      for (const e of allCol) {
-        if (seen.has(e.event_digest)) continue;
-        seen.add(e.event_digest);
-        merged.push(e);
-      }
-      setCollateral(merged.slice(0, limit));
+      const [col, bBase, bQuote, rBase, rQuote, liqBase, liqQuote] =
+        await Promise.all([
+          fetchAllCollateralEvents({
+            margin_manager_id: marginManagerId,
+            limit,
+          }),
+          fetchLoanBorrowed({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: baseMarginPoolId,
+            limit,
+          }),
+          fetchLoanBorrowed({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: quoteMarginPoolId,
+            limit,
+          }),
+          fetchLoanRepaid({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: baseMarginPoolId,
+            limit,
+          }),
+          fetchLoanRepaid({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: quoteMarginPoolId,
+            limit,
+          }),
+          fetchLiquidation({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: baseMarginPoolId,
+            limit,
+          }),
+          fetchLiquidation({
+            margin_manager_id: marginManagerId,
+            margin_pool_id: quoteMarginPoolId,
+            limit,
+          }),
+        ]);
+      setCollateral(col ?? []);
       const allBorrowed = [...(bBase ?? []), ...(bQuote ?? [])].sort(
         (a, b) => b.onchain_timestamp - a.onchain_timestamp
       );
@@ -702,10 +661,7 @@ export function useMarginHistory(
       if (__DEV__) {
         console.log("[Margin] Refresh history result", {
           marginManagerId,
-          collateralCount: merged.length,
-          baseEvents: (colBase ?? []).length,
-          quoteEvents: (colQuote ?? []).length,
-          allEvents: (colAll ?? []).length,
+          collateralCount: (col ?? []).length,
           borrowedCount: (bBase ?? []).length + (bQuote ?? []).length,
           repaidCount: (rBase ?? []).length + (rQuote ?? []).length,
           liquidationsCount: (liqBase ?? []).length + (liqQuote ?? []).length,
@@ -734,6 +690,250 @@ export function useMarginHistory(
     error,
     refresh: fetchHistory,
   };
+}
+
+const OPEN_ORDERS_LIMIT = 50;
+
+/**
+ * Fetches open (Placed) orders for the selected margin account. Resolves
+ * balance_manager_id from margin_manager_created, then calls DeepBookV3
+ * /orders/:pool_name/:balance_manager_id with status=Placed.
+ */
+export function useOpenOrders(
+  marginManagerId: string | null,
+  poolName: string | null
+) {
+  const [orders, setOrders] = useState<DeepBookOrder[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!marginManagerId || !poolName || poolName.trim() === "") {
+      if (__DEV__) {
+        console.log("[OpenOrders] Skip: no marginManagerId or poolName", {
+          marginManagerId: marginManagerId ?? null,
+          poolName: poolName ?? null,
+        });
+      }
+      setOrders([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    if (__DEV__)
+      console.log("[OpenOrders] Fetching…", {
+        poolName,
+        marginManagerId: marginManagerId.slice(0, 18) + "…",
+      });
+    setLoading(true);
+    setError(null);
+    try {
+      const created = await fetchMarginManagerCreated({
+        margin_manager_id: marginManagerId,
+        limit: 10,
+      });
+      // Prefer balance_manager_id from creation event; fallback to margin manager id (same object in margin flow).
+      let balanceManagerId =
+        created.length > 0 ? created[0].balance_manager_id : null;
+      if (!balanceManagerId) {
+        balanceManagerId = marginManagerId;
+        if (__DEV__) {
+          console.log(
+            "[OpenOrders] Using margin_manager_id as balance_manager_id (no creation event)"
+          );
+        }
+      }
+      const list = await fetchOrders({
+        pool_name: poolName,
+        balance_manager_id: balanceManagerId,
+        limit: OPEN_ORDERS_LIMIT,
+        status: "Placed",
+      });
+      setOrders(list ?? []);
+      if (__DEV__) {
+        console.log("[OpenOrders] Fetched", list?.length ?? 0, "open orders", {
+          poolName,
+          balanceManagerId: balanceManagerId.slice(0, 18) + "…",
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load open orders");
+      setOrders([]);
+      if (__DEV__) {
+        console.warn("[OpenOrders] Error", e);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [marginManagerId, poolName]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  return { orders, loading, error, refresh };
+}
+
+const ORDER_HISTORY_LIMIT = 20;
+
+/**
+ * Fetches filled and canceled orders (recent order history). Market orders fill
+ * immediately, so they appear here, not in open orders.
+ */
+export function useOrderHistory(
+  marginManagerId: string | null,
+  poolName: string | null
+) {
+  const [orders, setOrders] = useState<DeepBookOrder[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!marginManagerId || !poolName || poolName.trim() === "") {
+      if (__DEV__)
+        console.log("[OrderHistory] Skip: no marginManagerId or poolName");
+      setOrders([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    if (__DEV__) console.log("[OrderHistory] Fetching…", { poolName });
+    setLoading(true);
+    setError(null);
+    try {
+      const created = await fetchMarginManagerCreated({
+        margin_manager_id: marginManagerId,
+        limit: 10,
+      });
+      let balanceManagerId =
+        created.length > 0 ? created[0].balance_manager_id : null;
+      if (!balanceManagerId) balanceManagerId = marginManagerId;
+      const list = await fetchOrders({
+        pool_name: poolName,
+        balance_manager_id: balanceManagerId,
+        limit: ORDER_HISTORY_LIMIT,
+        status: "Filled,Canceled",
+      });
+      setOrders(list ?? []);
+      if (__DEV__)
+        console.log("[OrderHistory] Fetched", list?.length ?? 0, "orders");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load order history");
+      setOrders([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [marginManagerId, poolName]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  return { orders, loading, error, refresh };
+}
+
+const TRADES_LIMIT = 30;
+
+/** Trade with "our" side: indexer type is taker's direction; we flip when we're maker. */
+export type TradeWithOurSide = DeepBookTrade & { our_side: "buy" | "sell" };
+
+/**
+ * Fetches executed trades for the margin account (GET /trades with maker and taker
+ * balance_manager_id). Use for trade history and realized PnL.
+ * Returns trades with our_side so UI and PnL use our perspective (buy/sell).
+ * @see https://docs.sui.io/standards/deepbookv3-indexer (Get trades)
+ */
+export function useTrades(
+  marginManagerId: string | null,
+  poolName: string | null
+) {
+  const [trades, setTrades] = useState<TradeWithOurSide[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    if (!marginManagerId || !poolName || poolName.trim() === "") {
+      if (__DEV__)
+        console.log("[Trade history] Skip: no marginManagerId or poolName", {
+          marginManagerId: marginManagerId ?? null,
+          poolName: poolName ?? null,
+        });
+      setTrades([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    if (__DEV__)
+      console.log("[Trade history] Fetching…", {
+        poolName,
+        marginManagerId: marginManagerId.slice(0, 18) + "…",
+      });
+    setLoading(true);
+    setError(null);
+    try {
+      const created = await fetchMarginManagerCreated({
+        margin_manager_id: marginManagerId,
+        limit: 10,
+      });
+      const balanceManagerId =
+        created.length > 0 ? created[0].balance_manager_id : null;
+      if (!balanceManagerId) {
+        console.log(
+          "[Trade history] No balance_manager_id (need it for /trades). margin_manager_created response:",
+          { marginManagerId, creationEventCount: created.length, created }
+        );
+        setTrades([]);
+        setLoading(false);
+        return;
+      }
+      if (__DEV__)
+        console.log(
+          "[Trade history] balance_manager_id",
+          balanceManagerId.slice(0, 18) + "…"
+        );
+      const oneMonthAgoSeconds = Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+      const [asMaker, asTaker] = await Promise.all([
+        fetchTrades({
+          pool_name: poolName,
+          limit: TRADES_LIMIT,
+          start_time: oneMonthAgoSeconds,
+          maker_balance_manager_id: balanceManagerId,
+        }),
+        fetchTrades({
+          pool_name: poolName,
+          limit: TRADES_LIMIT,
+          start_time: oneMonthAgoSeconds,
+          taker_balance_manager_id: balanceManagerId,
+        }),
+      ]);
+      const byId = new Map<string, TradeWithOurSide>();
+      for (const t of [...asMaker, ...asTaker]) {
+        const ourSide =
+          t.maker_balance_manager_id === balanceManagerId
+            ? t.type === "buy"
+              ? "sell"
+              : "buy"
+            : t.type;
+        byId.set(t.trade_id, { ...t, our_side: ourSide });
+      }
+      const merged = Array.from(byId.values()).sort(
+        (a, b) => b.timestamp - a.timestamp
+      );
+      console.log("[Trade history] merged trades (full):", JSON.stringify(merged, null, 2));
+      setTrades(merged.slice(0, TRADES_LIMIT));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load trades");
+      setTrades([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [marginManagerId, poolName]);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  return { trades, loading, error, refresh };
 }
 
 /** Approximate collateral USD from state (base * basePrice + quote * quotePrice with Pyth decimals). */
@@ -765,4 +965,9 @@ export function debtUsdFromState(s: MarginManagerState | null): string {
 }
 
 export { fromPythRaw };
-export type { MarginManagerInfo, MarginManagerState };
+export type {
+  DeepBookOrder,
+  DeepBookTrade,
+  MarginManagerInfo,
+  MarginManagerState,
+};

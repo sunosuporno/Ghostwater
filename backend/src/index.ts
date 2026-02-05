@@ -4,12 +4,14 @@ import "dotenv/config";
 import express from "express";
 import { executeCreateMarginManager } from "./sui/execute-create-margin-manager.js";
 import { executeTransfer } from "./sui/execute-transfer.js";
+import { fetchMarginBorrowedShares } from "./sui/fetch-margin-borrowed-shares.js";
 import { getOwnedMarginManagers } from "./sui/owned-margin-managers.js";
 import { prepareAddTpsl } from "./sui/prepare-add-tpsl.js";
 import { prepareCreateMarginManager } from "./sui/prepare-create-margin-manager.js";
 import { prepareMarginDeposit } from "./sui/prepare-margin-deposit.js";
 import { prepareMarginWithdraw } from "./sui/prepare-margin-withdraw.js";
 import { preparePlaceOrder } from "./sui/prepare-place-order.js";
+import { prepareRepay } from "./sui/prepare-repay.js";
 import { prepareTransfer } from "./sui/prepare-transfer.js";
 if (typeof globalThis.Buffer === "undefined") {
   (globalThis as unknown as { Buffer: typeof Buffer }).Buffer = Buffer;
@@ -95,13 +97,100 @@ app.get("/api/owned-margin-managers", async (req, res) => {
       res.status(400).json({ error: "Missing query: owner" });
       return;
     }
+    console.log("[api/owned-margin-managers] request", {
+      owner,
+      network,
+    });
     const result = await getOwnedMarginManagers({ owner, network });
+    console.log("[api/owned-margin-managers] response", {
+      count: result.managers.length,
+      managers: result.managers,
+    });
     res.json(result);
   } catch (err) {
+    console.error("[api/owned-margin-managers] error", err);
     const message = err instanceof Error ? err.message : "Failed to fetch";
     res.status(400).json({ error: message });
   }
 });
+
+/**
+ * GET /api/margin-borrowed-shares
+ * (Legacy name; same as /api/margin-manager-state.)
+ */
+app.get("/api/margin-borrowed-shares", marginManagerStateHandler);
+
+/**
+ * GET /api/margin-manager-state
+ *
+ * Postman: one endpoint that returns all Margin Manager SDK read-only data from chain.
+ *
+ * Method: GET
+ * URL:    http://localhost:3001/api/margin-manager-state
+ *
+ * Query params:
+ *   marginManagerId   (required)  Margin manager object ID (0x...).
+ *   poolKey           (required)  Pool key (e.g. SUI_USDC). Used by SDK for type args.
+ *   network           (optional)  "mainnet" | "testnet". Default: mainnet.
+ *   debug             (optional)  "1" or "true" to include _debug.resultCount in response.
+ *
+ * Example:
+ *   GET http://localhost:3001/api/margin-manager-state?marginManagerId=0x...&poolKey=SUI_USDC
+ *
+ * Response: single JSON object with borrowedShares, borrowedBaseShares, borrowedQuoteShares,
+ *   hasBaseDebt, balanceManager, calculateAssets, calculateDebts, source, and optionally _debug.
+ */
+app.get("/api/margin-manager-state", marginManagerStateHandler);
+
+async function marginManagerStateHandler(
+  req: express.Request,
+  res: express.Response
+): Promise<void> {
+  try {
+    const marginManagerId = (req.query.marginManagerId as string)?.trim();
+    const poolKey = (req.query.poolKey as string)?.trim();
+    const network = ((req.query.network as string) || "mainnet") as "mainnet" | "testnet";
+    const debug =
+      req.query.debug === "1" ||
+      req.query.debug === "true" ||
+      req.query.debug === "yes";
+    if (!marginManagerId) {
+      res.status(400).json({
+        error: "Missing required query param: marginManagerId",
+        params: {
+          marginManagerId: "required — margin manager object ID (0x...)",
+          poolKey: "required — e.g. SUI_USDC",
+          network: "optional — mainnet | testnet",
+          debug: "optional — 1 | true to include _debug.resultCount",
+        },
+      });
+      return;
+    }
+    if (!poolKey) {
+      res.status(400).json({
+        error: "Missing required query param: poolKey (e.g. SUI_USDC)",
+        params: {
+          marginManagerId: "required — margin manager object ID (0x...)",
+          poolKey: "required — e.g. SUI_USDC",
+          network: "optional — mainnet | testnet",
+          debug: "optional — 1 | true",
+        },
+      });
+      return;
+    }
+    const result = await fetchMarginBorrowedShares({
+      marginManagerId,
+      poolKey,
+      network,
+      debug,
+    });
+    res.json(result);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Failed to fetch margin manager state";
+    res.status(400).json({ error: message });
+  }
+}
 
 /**
  * POST /api/prepare-create-margin-manager
@@ -204,8 +293,46 @@ app.post("/api/prepare-margin-withdraw", async (req, res) => {
 });
 
 /**
+ * POST /api/prepare-repay
+ * Body: { sender, marginManagerId, poolKey, baseAmount?, quoteAmount?, network? }
+ * Returns: { intentMessageHashHex, txBytesBase64 }. Execute via POST /api/execute-transfer.
+ */
+app.post("/api/prepare-repay", async (req, res) => {
+  try {
+    const { sender, marginManagerId, poolKey, baseAmount, quoteAmount, network } =
+      req.body;
+    if (!sender || !marginManagerId || !poolKey) {
+      res.status(400).json({
+        error: "Missing required fields: sender, marginManagerId, poolKey",
+      });
+      return;
+    }
+    const base = baseAmount != null ? Number(baseAmount) : 0;
+    const quote = quoteAmount != null ? Number(quoteAmount) : 0;
+    if (base <= 0 && quote <= 0) {
+      res.status(400).json({
+        error: "At least one of baseAmount or quoteAmount must be positive",
+      });
+      return;
+    }
+    const result = await prepareRepay({
+      sender,
+      marginManagerId,
+      poolKey,
+      baseAmount: base > 0 ? base : undefined,
+      quoteAmount: quote > 0 ? quote : undefined,
+      network: network ?? "mainnet",
+    });
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Prepare repay failed";
+    res.status(400).json({ error: message });
+  }
+});
+
+/**
  * POST /api/prepare-place-order
- * Body: { sender, marginManagerId, poolKey, orderType: 'limit'|'market', isBid, quantity, price? (limit), clientOrderId, payWithDeep?, network? }
+ * Body: { sender, marginManagerId, poolKey, orderType, isBid, quantity, price?, clientOrderId, payWithDeep?, network?, borrowBaseAmount?, borrowQuoteAmount? }
  * Returns: { intentMessageHashHex, txBytesBase64 }. Execute via POST /api/execute-transfer.
  */
 app.post("/api/prepare-place-order", async (req, res) => {
@@ -221,6 +348,9 @@ app.post("/api/prepare-place-order", async (req, res) => {
       clientOrderId,
       payWithDeep,
       network,
+      reduceOnly,
+      borrowBaseAmount,
+      borrowQuoteAmount,
     } = req.body;
     if (
       !sender ||
@@ -256,6 +386,15 @@ app.post("/api/prepare-place-order", async (req, res) => {
       clientOrderId: Number(clientOrderId),
       payWithDeep: payWithDeepFlag,
       network: network ?? "mainnet",
+      reduceOnly: Boolean(reduceOnly),
+      borrowBaseAmount:
+        borrowBaseAmount != null && Number(borrowBaseAmount) > 0
+          ? Number(borrowBaseAmount)
+          : undefined,
+      borrowQuoteAmount:
+        borrowQuoteAmount != null && Number(borrowQuoteAmount) > 0
+          ? Number(borrowQuoteAmount)
+          : undefined,
     });
     res.json(result);
   } catch (err) {

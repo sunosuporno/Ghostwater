@@ -3,9 +3,26 @@
  * Same base URL for margin and V3 (OHLCV, ticker, etc.).
  * @see https://docs.sui.io/standards/deepbook-margin-indexer
  * @see https://docs.sui.io/standards/deepbookv3-indexer
+ *
+ * There is no dedicated "open position" endpoint. Position details are derived from:
+ *   - GET /margin_manager_states → size (base_asset - base_debt), current_price, risk_ratio
+ *   - GET /trades (maker/taker filter) → direction (long/short from last trade), entry (VWAP), realized PnL
+ * When trade history is missing or delayed, we still show size and side (inferred from sign of net base).
+ *
+ * DeepBookV3 endpoints we use:
+ *   GET /ticker                    → fetchTicker()        (price every 5s)
+ *   GET /ohclv/:pool_name          → fetchOhlcv()         (chart candles)
+ *   GET /orders/:pool/:balance_id  → fetchOrders()       (open + recent orders)
+ *   GET /trades/:pool_name         → fetchTrades()       (executed trades for trade history / PnL)
+ *   GET /order_updates/:pool_name  (placed/canceled in time range; alternative to /orders)
+ *   GET /orderbook/:pool_name      (bids/asks; could add live order book)
+ *   GET /get_pools                 (pool list; we use margin_managers_info instead)
+ *   GET /summary                   (pair summary; we use /ticker + margin state)
  */
 
 const INDEXER_BASE = "https://deepbook-indexer.mainnet.mystenlabs.com";
+const INDEXER_TIMEOUT_MS = 25_000;
+const INDEXER_RETRY_DELAY_MS = 2_000;
 
 type Query = Record<string, string | number | boolean | undefined>;
 
@@ -19,11 +36,55 @@ function buildUrl(path: string, params?: Query): string {
   return url.toString();
 }
 
-async function get<T>(path: string, params?: Query): Promise<T> {
+function isRetryableStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
+async function getOnce<T>(
+  path: string,
+  params?: Query,
+  signal?: AbortSignal
+): Promise<T> {
   const url = buildUrl(path, params);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Indexer ${res.status}: ${res.statusText}`);
+  const res = await fetch(url, { signal });
+  if (!res.ok) {
+    const msg =
+      res.status === 504
+        ? "Indexer timed out. Tap ⟳ to try again."
+        : `Indexer ${res.status}: ${res.statusText}`;
+    throw new Error(msg);
+  }
   return res.json() as Promise<T>;
+}
+
+async function get<T>(path: string, params?: Query): Promise<T> {
+  const attempt = (abort: AbortController): Promise<T> => {
+    const timeoutId = setTimeout(() => abort.abort(), INDEXER_TIMEOUT_MS);
+    return getOnce<T>(path, params, abort.signal).finally(() =>
+      clearTimeout(timeoutId)
+    );
+  };
+  try {
+    return await attempt(new AbortController());
+  } catch (e) {
+    const isTimeout = e instanceof Error && e.name === "AbortError";
+    const statusMatch =
+      e instanceof Error ? e.message.match(/Indexer (\d+)/)?.[1] ?? "" : "";
+    const isRetryable =
+      isTimeout ||
+      (e instanceof Error &&
+        (e.message.includes("timed out") ||
+          isRetryableStatus(Number(statusMatch))));
+    if (!isRetryable) throw e;
+    await new Promise((r) => setTimeout(r, INDEXER_RETRY_DELAY_MS));
+    try {
+      return await attempt(new AbortController());
+    } catch (retryErr) {
+      if (retryErr instanceof Error && retryErr.name === "AbortError")
+        throw new Error("Indexer timed out. Tap ⟳ to try again.");
+      throw retryErr;
+    }
+  }
 }
 
 // --- Types (from indexer docs) ---
@@ -120,6 +181,35 @@ export interface LiquidationEvent {
   checkpoint_timestamp_ms: number;
 }
 
+/** Margin manager creation event; includes balance_manager_id used by DeepBookV3 /orders. */
+export interface MarginManagerCreatedEvent {
+  event_digest: string;
+  digest: string;
+  sender: string;
+  checkpoint: number;
+  checkpoint_timestamp_ms: number;
+  package: string;
+  margin_manager_id: string;
+  balance_manager_id: string;
+  deepbook_pool_id: string;
+  owner: string;
+  onchain_timestamp: number;
+}
+
+/** Order from DeepBookV3 indexer GET /orders/:pool_name/:balance_manager_id. */
+export interface DeepBookOrder {
+  order_id: string;
+  balance_manager_id: string;
+  type: string;
+  current_status: string;
+  price: number;
+  placed_at: number;
+  last_updated_at: number;
+  original_quantity: number;
+  filled_quantity: number;
+  remaining_quantity: number;
+}
+
 // --- API calls ---
 
 /**
@@ -167,6 +257,44 @@ export async function fetchCollateralEvents(params: {
   return Array.isArray(raw) ? raw : [];
 }
 
+/**
+ * Fetch all collateral events (base, quote, and DEEP) by calling the indexer
+ * with is_base=true, is_base=false, and no is_base, then merging and deduping.
+ * The indexer filters by is_base (base vs quote); for pools like DEEP_USDC,
+ * base = DEEP and quote = USDC. Some indexer versions may only return DEEP
+ * when is_base is omitted, so we fetch all three and merge.
+ */
+export async function fetchAllCollateralEvents(params: {
+  margin_manager_id: string;
+  limit?: number;
+  start_time?: number;
+  end_time?: number;
+}): Promise<CollateralEvent[]> {
+  const limit = params.limit ?? 20;
+  const common = {
+    margin_manager_id: params.margin_manager_id,
+    limit: limit * 2,
+    start_time: params.start_time,
+    end_time: params.end_time,
+  };
+  const [baseEvents, quoteEvents, noFilterEvents] = await Promise.all([
+    fetchCollateralEvents({ ...common, is_base: true }),
+    fetchCollateralEvents({ ...common, is_base: false }),
+    fetchCollateralEvents(common),
+  ]);
+  const byDigest = new Map<string, CollateralEvent>();
+  for (const e of [...baseEvents, ...quoteEvents, ...noFilterEvents]) {
+    if (e.event_digest && !byDigest.has(e.event_digest)) {
+      byDigest.set(e.event_digest, e);
+    }
+  }
+  const merged = Array.from(byDigest.values()).sort(
+    (a, b) =>
+      (b.checkpoint_timestamp_ms ?? 0) - (a.checkpoint_timestamp_ms ?? 0)
+  );
+  return merged.slice(0, limit);
+}
+
 export async function fetchLoanBorrowed(params: {
   margin_manager_id: string;
   margin_pool_id: string;
@@ -200,6 +328,121 @@ export async function fetchLiquidation(params: {
   end_time?: number;
 }): Promise<LiquidationEvent[]> {
   const raw = await get<LiquidationEvent[] | unknown>("/liquidation", params);
+  return Array.isArray(raw) ? raw : [];
+}
+
+/** Unix seconds for ~1 month ago (used so margin_manager_created returns events beyond 24h default). */
+const ONE_MONTH_AGO_UNIX =
+  Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+
+/**
+ * Get margin manager creation event(s) for a margin manager. Used to resolve
+ * balance_manager_id for the DeepBookV3 /orders endpoint.
+ * Uses start_time ~1 month ago so managers created more than 24h ago are found.
+ * @see https://docs.sui.io/standards/deepbook-margin-indexer (Get margin manager creation events)
+ */
+export async function fetchMarginManagerCreated(params: {
+  margin_manager_id: string;
+  limit?: number;
+  start_time?: number;
+  end_time?: number;
+}): Promise<MarginManagerCreatedEvent[]> {
+  const q: Query = {
+    margin_manager_id: params.margin_manager_id,
+    limit: params.limit ?? 10,
+    start_time: params.start_time ?? ONE_MONTH_AGO_UNIX,
+  };
+  if (params.end_time != null) q.end_time = params.end_time;
+  const raw = await get<MarginManagerCreatedEvent[] | unknown>(
+    "/margin_manager_created",
+    q
+  );
+  const list = Array.isArray(raw) ? raw : [];
+  if (__DEV__ && list.length === 0) {
+    console.log("[fetchMarginManagerCreated] no events for margin_manager_id", {
+      margin_manager_id: params.margin_manager_id.slice(0, 18) + "…",
+      start_time: q.start_time,
+      url: buildUrl("/margin_manager_created", q),
+    });
+  } else if (__DEV__ && list.length > 0) {
+    console.log("[fetchMarginManagerCreated] found", list.length, "event(s), balance_manager_id", list[0].balance_manager_id?.slice(0, 18) + "…");
+  }
+  return list;
+}
+
+/**
+ * Get orders for a balance manager in a pool (DeepBookV3 indexer). Use
+ * fetchMarginManagerCreated first to get balance_manager_id from margin_manager_id.
+ * @see https://docs.sui.io/standards/deepbookv3-indexer (Get orders by balance manager)
+ */
+export async function fetchOrders(params: {
+  pool_name: string;
+  balance_manager_id: string;
+  limit?: number;
+  status?: string; // e.g. "Placed" or "Placed,Canceled,Filled"
+}): Promise<DeepBookOrder[]> {
+  const path = `/orders/${encodeURIComponent(
+    params.pool_name
+  )}/${encodeURIComponent(params.balance_manager_id)}`;
+  const q: Query = {};
+  if (params.limit != null) q.limit = params.limit;
+  if (params.status != null && params.status !== "") q.status = params.status;
+  const raw = await get<DeepBookOrder[] | unknown>(path, q);
+  return Array.isArray(raw) ? raw : [];
+}
+
+/** Executed trade from DeepBookV3 GET /trades/:pool_name. Timestamp in ms. */
+export interface DeepBookTrade {
+  event_digest: string;
+  digest: string;
+  trade_id: string;
+  maker_order_id: string;
+  taker_order_id: string;
+  maker_balance_manager_id: string;
+  taker_balance_manager_id: string;
+  price: number;
+  base_volume: number;
+  quote_volume: number;
+  timestamp: number;
+  type: "buy" | "sell";
+  taker_is_bid: boolean;
+  taker_fee: number;
+  maker_fee: number;
+  taker_fee_is_deep: boolean;
+  maker_fee_is_deep: boolean;
+}
+
+/**
+ * Get recent trades in a pool. Optional maker_balance_manager_id or
+ * taker_balance_manager_id to filter by user (pass both to get all trades for that user).
+ * @see https://docs.sui.io/standards/deepbookv3-indexer (Get trades)
+ */
+export async function fetchTrades(params: {
+  pool_name: string;
+  limit?: number;
+  start_time?: number;
+  end_time?: number;
+  maker_balance_manager_id?: string;
+  taker_balance_manager_id?: string;
+}): Promise<DeepBookTrade[]> {
+  const path = `/trades/${encodeURIComponent(params.pool_name)}`;
+  const q: Query = {};
+  if (params.limit != null) q.limit = params.limit;
+  if (params.start_time != null) q.start_time = params.start_time;
+  if (params.end_time != null) q.end_time = params.end_time;
+  if (
+    params.maker_balance_manager_id != null &&
+    params.maker_balance_manager_id !== ""
+  )
+    q.maker_balance_manager_id = params.maker_balance_manager_id;
+  if (
+    params.taker_balance_manager_id != null &&
+    params.taker_balance_manager_id !== ""
+  )
+    q.taker_balance_manager_id = params.taker_balance_manager_id;
+  const fullUrl = buildUrl(path, q);
+  if (__DEV__) console.log("[fetchTrades] API call:", fullUrl);
+  const raw = await get<DeepBookTrade[] | unknown>(path, q);
   return Array.isArray(raw) ? raw : [];
 }
 
@@ -271,7 +514,19 @@ export async function debugFetchOhlcv(
   const url = buildUrl(path, { interval, limit });
   console.log("[OHLCV debug] GET", url);
   const res = await fetch(url);
-  const raw = await res.json();
+  const text = await res.text();
+  let raw: unknown;
+  try {
+    raw = text ? JSON.parse(text) : {};
+  } catch (parseErr) {
+    console.warn(
+      "[OHLCV debug] response is not JSON (status",
+      res.status,
+      "). First 200 chars:",
+      text.slice(0, 200)
+    );
+    throw parseErr;
+  }
   console.log(
     "[OHLCV debug] status",
     res.status,

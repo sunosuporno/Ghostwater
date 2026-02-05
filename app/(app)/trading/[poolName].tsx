@@ -1,5 +1,11 @@
 import { Text } from "@/components/Themed";
-import { router, useLocalSearchParams, useNavigation } from "expo-router";
+import FontAwesome from "@expo/vector-icons/FontAwesome";
+import {
+  router,
+  useFocusEffect,
+  useLocalSearchParams,
+  useNavigation,
+} from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -27,8 +33,11 @@ import {
   useMarginManagersInfo,
   useMarginManagerState,
   useOhlcv,
+  useOpenOrders,
+  useOrderHistory,
   useOwnedMarginManagers,
   useTicker,
+  useTrades,
 } from "@/hooks/useDeepBookMargin";
 import { addTpslViaBackend } from "@/lib/add-tpsl-via-backend";
 import { createMarginManagerViaBackend } from "@/lib/create-margin-manager-via-backend";
@@ -39,9 +48,11 @@ import {
   type MarginManagerInfo,
   type OhlcvInterval,
 } from "@/lib/deepbook-indexer";
+import { fetchMarginBorrowedSharesViaBackend } from "@/lib/fetch-margin-borrowed-shares-via-backend";
 import {
   depositMarginViaBackend,
   withdrawMarginViaBackend,
+  repayViaBackend,
 } from "@/lib/margin-deposit-withdraw-via-backend";
 import {
   getSelectedMarginManagerId,
@@ -83,6 +94,20 @@ function formatTs(ms: number): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+/** e.g. "1h 9m" or "5m" for order history age. */
+function formatAge(ms: number): string {
+  const sec = Math.floor((Date.now() - ms) / 1000);
+  if (sec < 60) return "just now";
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (h < 24) return m ? `${h}h ${m}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  const hh = h % 24;
+  return hh ? `${d}d ${hh}h` : `${d}d`;
 }
 
 function formatPairLabel(poolName: string): string {
@@ -162,6 +187,7 @@ export default function PairDetailScreen() {
     interval: chartInterval,
     displayLimit: CHART_DISPLAY_LIMIT,
     fetchLimit: CHART_FETCH_LIMIT,
+    refreshIntervalMs: 10_000, // OHLC every 10s; price (ticker) stays 5s via TickerProvider
   });
 
   useEffect(() => {
@@ -294,6 +320,24 @@ export default function PairDetailScreen() {
     poolInfoForPair?.base_margin_pool_id ?? null,
     poolInfoForPair?.quote_margin_pool_id ?? null
   );
+  const {
+    orders: openOrders,
+    loading: openOrdersLoading,
+    error: openOrdersError,
+    refresh: refreshOpenOrders,
+  } = useOpenOrders(marginManagerId, decodedPoolName);
+  const {
+    orders: orderHistory,
+    loading: orderHistoryLoading,
+    error: orderHistoryError,
+    refresh: refreshOrderHistory,
+  } = useOrderHistory(marginManagerId, decodedPoolName);
+  const {
+    trades: tradeHistory,
+    loading: tradeHistoryLoading,
+    error: tradeHistoryError,
+    refresh: refreshTradeHistory,
+  } = useTrades(marginManagerId, decodedPoolName);
 
   useEffect(() => {
     if (marginManagerId && state) {
@@ -301,8 +345,74 @@ export default function PairDetailScreen() {
         marginManagerId,
         state,
       });
+      fetchMarginBorrowedSharesViaBackend({
+        apiUrl,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        network: "mainnet",
+      })
+        .then((chain) => {
+          console.log(
+            "======= Margin Manager SDK — borrowedShares, borrowedBaseShares, borrowedQuoteShares, hasBaseDebt ======="
+          );
+          console.log(
+            JSON.stringify(
+              {
+                borrowedShares: chain.borrowedShares,
+                borrowedBaseShares: chain.borrowedBaseShares,
+                borrowedQuoteShares: chain.borrowedQuoteShares,
+                hasBaseDebt: chain.hasBaseDebt,
+              },
+              null,
+              2
+            )
+          );
+          console.log(
+            "+++++++ Margin Manager SDK — balanceManager, calculateAssets, calculateDebts +++++++"
+          );
+          console.log(
+            JSON.stringify(
+              {
+                balanceManager: chain.balanceManager,
+                calculateAssets: chain.calculateAssets,
+                calculateDebts: chain.calculateDebts,
+              },
+              null,
+              2
+            )
+          );
+          console.log(
+            "[Margin] Indexer vs chain — indexer base_debt/quote_debt:",
+            state.base_debt,
+            state.quote_debt,
+            "| chain borrowedBaseShares/borrowedQuoteShares:",
+            chain.borrowedBaseShares,
+            chain.borrowedQuoteShares
+          );
+        })
+        .catch((e) => {
+          if (__DEV__) {
+            console.warn("[Margin] Chain margin state fetch failed:", e);
+          }
+        });
     }
-  }, [marginManagerId, state]);
+  }, [marginManagerId, state, apiUrl, decodedPoolName]);
+
+  // (Removed verbose state→live-position debug logging to keep console clean.)
+
+  const lastFocusRefreshRef = useRef<number>(0);
+  const FOCUS_REFRESH_DEBOUNCE_MS = 5000;
+  // Refresh Activity when screen gains focus so DEEP/indexer-delayed events show up.
+  // Debounce so we don’t refetch every 2–3s if focus fires repeatedly.
+  useFocusEffect(
+    useCallback(() => {
+      if (!marginManagerId) return;
+      const now = Date.now();
+      if (now - lastFocusRefreshRef.current < FOCUS_REFRESH_DEBOUNCE_MS) return;
+      lastFocusRefreshRef.current = now;
+      refreshMarginHistory();
+    }, [marginManagerId, refreshMarginHistory])
+  );
 
   const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy");
   const [orderType, setOrderType] = useState<"limit" | "market">("limit");
@@ -337,6 +447,7 @@ export default function PairDetailScreen() {
   const [withdrawAmountExceedsBalance, setWithdrawAmountExceedsBalance] =
     useState(false);
   const [orderLoading, setOrderLoading] = useState(false);
+  const [closePositionLoading, setClosePositionLoading] = useState(false);
   const [tpPrice, setTpPrice] = useState("");
   const [slPrice, setSlPrice] = useState("");
   const [tpslLoading, setTpslLoading] = useState(false);
@@ -454,9 +565,14 @@ export default function PairDetailScreen() {
     return { base, quote, deep };
   }, [collateral, poolInfoForPair]);
 
-  // Available balance for withdraw: use summed activity first, else state.
+  // Available balance for withdraw. Prefer state when available so open positions are reflected.
   const withdrawAvailableHuman = useMemo(() => {
     if (withdrawAsset === "deep") return null;
+    if (state != null) {
+      if (withdrawAsset === "base") return Number(state.base_asset);
+      if (withdrawAsset === "quote") return Number(state.quote_asset);
+      return null;
+    }
     const fromSum =
       availableFromEventSum &&
       (withdrawAsset === "base"
@@ -469,9 +585,6 @@ export default function PairDetailScreen() {
       fromSum >= 0
     )
       return fromSum;
-    if (!state) return null;
-    if (withdrawAsset === "base") return Number(state.base_asset);
-    if (withdrawAsset === "quote") return Number(state.quote_asset);
     return null;
   }, [withdrawAsset, availableFromEventSum, state]);
 
@@ -489,36 +602,60 @@ export default function PairDetailScreen() {
     );
   }, [maxLeverageForPool]);
 
+  // Max margin (your capital in base): equity / price. Position = margin × leverage; protocol borrows the rest.
+  const maxMarginBase = useMemo(() => {
+    const price =
+      typeof livePrice === "number" && livePrice > 0 ? livePrice : null;
+    if (price == null) return null;
+    const debtStr = state ? debtUsdFromState(state).replace(/,/g, "") : "0";
+    const equity = Math.max(
+      0,
+      collateralUsdTotal - parseFloat(debtStr) || 0
+    );
+    return equity / price;
+  }, [collateralUsdTotal, state, livePrice]);
+
+  const setMarginToMax = useCallback(() => {
+    if (maxMarginBase != null && maxMarginBase > 0) {
+      setQuantity(
+        maxMarginBase.toLocaleString(undefined, {
+          maximumFractionDigits: 6,
+          minimumFractionDigits: 0,
+        })
+      );
+    }
+  }, [maxMarginBase]);
+
   const [paymentAsset, setPaymentAsset] = useState<"base" | "quote" | "deep">(
     "quote"
   );
 
   const paymentAssetBalance = useMemo(() => {
-    if (!availableFromEventSum) {
-      if (state && paymentAsset === "base") return Number(state.base_asset);
-      if (state && paymentAsset === "quote") return Number(state.quote_asset);
-      return null;
+    if (state != null && paymentAsset !== "deep") {
+      if (paymentAsset === "base") return Number(state.base_asset);
+      if (paymentAsset === "quote") return Number(state.quote_asset);
     }
-    if (paymentAsset === "base") return availableFromEventSum.base;
-    if (paymentAsset === "quote") return availableFromEventSum.quote;
-    if (paymentAsset === "deep") return availableFromEventSum.deep;
+    if (availableFromEventSum) {
+      if (paymentAsset === "base") return availableFromEventSum.base;
+      if (paymentAsset === "quote") return availableFromEventSum.quote;
+      if (paymentAsset === "deep") return availableFromEventSum.deep;
+    }
     return null;
   }, [paymentAsset, availableFromEventSum, state]);
 
   // Margin account token balances for display (like home screen balances).
-  // Source A: Event sum from GET /collateral_events?margin_manager_id=...
-  //   (https://deepbook-indexer.mainnet.mystenlabs.com/collateral_events)
-  //   Sum of (+Deposit -Withdraw) per asset from activity. Used when collateral.length > 0.
-  // Source B: State from GET /margin_manager_states?deepbook_pool_id=...
-  //   (https://deepbook-indexer.mainnet.mystenlabs.com/margin_manager_states)
-  //   Uses state.base_asset, state.quote_asset. Used when no collateral events yet.
+  // Prefer state when available so open positions are reflected (state includes trading;
+  // event sum is only deposits - withdrawals). State = GET /margin_manager_states.
+  // Event sum = GET /collateral_events (+Deposit -Withdraw). DEEP only from events.
   const marginBalances = useMemo(() => {
     const base =
-      availableFromEventSum?.base ??
-      (state ? Number(state.base_asset) : undefined);
+      state != null
+        ? Number(state.base_asset)
+        : availableFromEventSum?.base ?? undefined;
     const quote =
-      availableFromEventSum?.quote ??
-      (state ? Number(state.quote_asset) : undefined);
+      state != null
+        ? Number(state.quote_asset)
+        : availableFromEventSum?.quote ?? undefined;
     const deep = availableFromEventSum?.deep ?? 0;
     return { base, quote, deep };
   }, [availableFromEventSum, state]);
@@ -545,55 +682,133 @@ export default function PairDetailScreen() {
     ticker,
   ]);
 
-  // Debug: log event_sum (and raw collateral events that produced it)
-  useEffect(() => {
-    if (!__DEV__) return;
-    console.log("[Margin] event_sum", {
-      event_sum: availableFromEventSum ?? null,
-      collateralEventCount: collateral.length,
-      rawCollateralEvents: collateral.map((e) => ({
-        event_type: e.event_type,
-        asset_type: e.asset_type,
-        amount: e.amount,
-      })),
-    });
-  }, [availableFromEventSum, collateral]);
+  const equityUsd = useMemo(() => {
+    const debtStr = state ? debtUsdFromState(state).replace(/,/g, "") : "0";
+    return Math.max(0, collateralUsdTotal - parseFloat(debtStr) || 0);
+  }, [collateralUsdTotal, state]);
 
-  // Debug: log which source is used and raw values (for tracing wrong balance e.g. -3.1)
-  useEffect(() => {
-    if (!__DEV__ || (!state && !availableFromEventSum)) return;
-    const source =
-      availableFromEventSum != null
-        ? "collateral_events"
-        : "margin_manager_states";
-    console.log("[Margin] Balances source and raw values", {
-      source,
-      collateralEventCount: collateral.length,
-      fromEventSum:
-        availableFromEventSum != null
-          ? {
-              base: availableFromEventSum.base,
-              quote: availableFromEventSum.quote,
-              deep: availableFromEventSum.deep,
-            }
-          : null,
-      fromState:
-        state != null
-          ? {
-              base_asset: state.base_asset,
-              quote_asset: state.quote_asset,
-            }
-          : null,
-      displayed: marginBalances,
-    });
+  // State = only live position? + size (no direction, no price). Direction + entry = from trades.
+  // - Our side: taker => our_side = type, maker => our_side = opposite(type).
+  // - Long vs short: latest trade's our_side. Sell => short, buy => long.
+  // - Entry: VWAP of trade "price" for that side (buys for long, sells for short).
+  const livePnl = useMemo(() => {
+    const quoteSymbol = poolInfoForPair?.quote_asset_symbol ?? "USDC";
+    const chronological = [...tradeHistory].sort(
+      (a, b) => (a.timestamp || 0) - (b.timestamp || 0)
+    );
+    let runningBase = 0;
+    let runningCostBasisQuote = 0;
+    let runningShortBase = 0;
+    let runningShortProceedsQuote = 0;
+    let realizedPnlQuote = 0;
+    const ourSide = (t: { our_side?: "buy" | "sell"; type: "buy" | "sell" }) =>
+      t.our_side ?? t.type;
+    for (const t of chronological) {
+      const b = Number(t.base_volume) || 0;
+      const price = Number(t.price) ?? 0;
+      if (ourSide(t) === "buy") {
+        if (runningShortBase > 0) {
+          const closeQty = Math.min(b, runningShortBase);
+          const shortProceedsForClose =
+            (closeQty / runningShortBase) * runningShortProceedsQuote;
+          realizedPnlQuote += shortProceedsForClose - price * closeQty;
+          runningShortBase -= closeQty;
+          runningShortProceedsQuote -= shortProceedsForClose;
+          const remainderB = b - closeQty;
+          if (remainderB > 0) {
+            runningBase += remainderB;
+            runningCostBasisQuote += price * remainderB;
+          }
+        } else {
+          runningBase += b;
+          runningCostBasisQuote += price * b;
+        }
+      } else {
+        if (runningBase > 0) {
+          const closeQty = Math.min(b, runningBase);
+          const costOfSold = (closeQty / runningBase) * runningCostBasisQuote;
+          realizedPnlQuote += price * closeQty - costOfSold;
+          runningCostBasisQuote -= costOfSold;
+          runningBase -= closeQty;
+          const remainderB = b - closeQty;
+          if (remainderB > 0) {
+            runningShortBase += remainderB;
+            runningShortProceedsQuote += price * remainderB;
+          }
+        } else {
+          runningShortBase += b;
+          runningShortProceedsQuote += price * b;
+        }
+      }
+    }
+    const avgEntryLong =
+      runningBase > 0 ? runningCostBasisQuote / runningBase : 0;
+    const avgEntryShort =
+      runningShortBase > 0 ? runningShortProceedsQuote / runningShortBase : 0;
+    const currentPrice = Number(
+      (decodedPoolName && ticker[decodedPoolName]?.last_price) ?? 0
+    );
+    // State: size and sign. Direction from latest trade when we have trades; else infer from state (net base > 0 => long, < 0 => short).
+    let positionSize = 0;
+    let netBaseSigned = 0;
+    if (state) {
+      netBaseSigned =
+        Number(state.base_asset) - Number(state.base_debt);
+      positionSize = Math.abs(netBaseSigned);
+    }
+    const hasPosition = positionSize > 0;
+    const hasDebt =
+      state != null &&
+      (Number(state.base_debt) > 0 || Number(state.quote_debt) > 0);
+    const latestTrade = chronological[chronological.length - 1];
+    const positionSide: "long" | "short" | "none" = !hasPosition
+      ? "none"
+      : latestTrade != null
+        ? ourSide(latestTrade) === "sell"
+          ? "short"
+          : "long"
+        : netBaseSigned > 0
+          ? "long"
+          : "short";
+    const entryForPosition =
+      positionSide === "long"
+        ? avgEntryLong
+        : positionSide === "short"
+        ? avgEntryShort
+        : 0;
+    const hasKnownEntry = entryForPosition > 0;
+    const unrealizedPnlQuote =
+      hasKnownEntry && currentPrice > 0 && positionSize > 0
+        ? positionSide === "long"
+          ? positionSize * (currentPrice - entryForPosition)
+          : positionSize * (entryForPosition - currentPrice)
+        : 0;
+    const totalPnlQuote = realizedPnlQuote + unrealizedPnlQuote;
+    const baseSymbol = poolInfoForPair?.base_asset_symbol ?? "BASE";
+    return {
+      realizedPnlQuote,
+      unrealizedPnlQuote,
+      totalPnlQuote,
+      quoteSymbol,
+      baseSymbol,
+      hasPosition,
+      hasDebt,
+      hasKnownEntry,
+      netBasePosition: positionSize,
+      avgEntryQuote: entryForPosition,
+      currentPrice,
+      positionSide,
+    };
   }, [
+    tradeHistory,
     state,
-    availableFromEventSum,
-    collateral.length,
-    marginBalances.base,
-    marginBalances.quote,
-    marginBalances.deep,
+    ticker,
+    decodedPoolName,
+    poolInfoForPair?.base_asset_id,
+    poolInfoForPair?.quote_asset_symbol,
   ]);
+
+  // (Removed verbose balance/source debug logging to keep console clean.)
 
   useEffect(() => {
     if (withdrawAsset === "deep" || withdrawAvailableHuman === null) {
@@ -664,6 +879,9 @@ export default function PairDetailScreen() {
       await refreshOwned();
       refreshMarginState();
       refreshMarginHistory();
+      refreshOpenOrders();
+      refreshOrderHistory();
+      refreshTradeHistory();
       if (marginRefreshPollRef.current != null) {
         clearInterval(marginRefreshPollRef.current);
         marginRefreshPollRef.current = null;
@@ -674,6 +892,9 @@ export default function PairDetailScreen() {
       marginRefreshPollRef.current = setInterval(() => {
         refreshMarginState();
         refreshMarginHistory();
+        refreshOpenOrders();
+        refreshOrderHistory();
+        refreshTradeHistory();
         pollCountdown -= 1;
         if (pollCountdown <= 0 && marginRefreshPollRef.current != null) {
           clearInterval(marginRefreshPollRef.current);
@@ -706,6 +927,9 @@ export default function PairDetailScreen() {
     refreshOwned,
     refreshMarginState,
     refreshMarginHistory,
+    refreshOpenOrders,
+    refreshOrderHistory,
+    refreshTradeHistory,
   ]);
 
   const onWithdrawSubmit = useCallback(async () => {
@@ -754,6 +978,9 @@ export default function PairDetailScreen() {
       await refreshOwned();
       refreshMarginState();
       refreshMarginHistory();
+      refreshOpenOrders();
+      refreshOrderHistory();
+      refreshTradeHistory();
       if (marginRefreshPollRef.current != null) {
         clearInterval(marginRefreshPollRef.current);
         marginRefreshPollRef.current = null;
@@ -764,6 +991,9 @@ export default function PairDetailScreen() {
       marginRefreshPollRef.current = setInterval(() => {
         refreshMarginState();
         refreshMarginHistory();
+        refreshOpenOrders();
+        refreshOrderHistory();
+        refreshTradeHistory();
         pollCountdown -= 1;
         if (pollCountdown <= 0 && marginRefreshPollRef.current != null) {
           clearInterval(marginRefreshPollRef.current);
@@ -796,6 +1026,9 @@ export default function PairDetailScreen() {
     refreshOwned,
     refreshMarginState,
     refreshMarginHistory,
+    refreshOpenOrders,
+    refreshOrderHistory,
+    refreshTradeHistory,
   ]);
 
   const assetLabel = (asset: "base" | "quote" | "deep") => {
@@ -805,6 +1038,29 @@ export default function PairDetailScreen() {
       ? poolInfoForPair.base_asset_symbol
       : poolInfoForPair.quote_asset_symbol;
   };
+
+  /** Format borrow/repay amount (raw from indexer) to human + symbol, e.g. "1 SUI". */
+  const formatLoanAmount = useCallback(
+    (amountRaw: number, marginPoolId: string): string => {
+      if (!poolInfoForPair) return String(amountRaw);
+      const isBase =
+        marginPoolId === poolInfoForPair.base_margin_pool_id;
+      const decimals = getDecimalsForCoinType(
+        isBase
+          ? poolInfoForPair.base_asset_id
+          : poolInfoForPair.quote_asset_id
+      );
+      const symbol = isBase
+        ? poolInfoForPair.base_asset_symbol
+        : poolInfoForPair.quote_asset_symbol;
+      const value = Number(amountRaw) / Math.pow(10, decimals);
+      return `${value.toLocaleString(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 6,
+      })} ${symbol}`;
+    },
+    [poolInfoForPair]
+  );
 
   const onCreateManager = useCallback(async () => {
     if (!suiAddress || !decodedPoolName) {
@@ -868,13 +1124,16 @@ export default function PairDetailScreen() {
   ]);
 
   const onPlaceOrder = useCallback(async () => {
-    if (orderType === "limit" && (!price.trim() || !quantity.trim())) {
-      Alert.alert("Place order", "Enter price and quantity.");
-      return;
-    }
-    if (orderType === "market" && !quantity.trim()) {
-      Alert.alert("Place order", "Enter quantity.");
-      return;
+    if (orderType === "limit") {
+      if (!price.trim() || !quantity.trim()) {
+        Alert.alert("Place order", "Enter price and margin for limit order.");
+        return;
+      }
+    } else {
+      if (!quantity.trim()) {
+        Alert.alert("Place order", "Enter margin for market order.");
+        return;
+      }
     }
     if (!marginManagerId || !decodedPoolName || !suiAddress) {
       Alert.alert("Place order", "Select a margin account first.");
@@ -884,15 +1143,17 @@ export default function PairDetailScreen() {
       Alert.alert("Place order", "Wallet signing not available.");
       return;
     }
-    const qty = parseFloat(quantity.trim());
-    if (!Number.isFinite(qty) || qty <= 0) {
-      Alert.alert("Place order", "Enter a valid quantity.");
+    const marginQty = parseFloat(quantity.trim());
+    if (!Number.isFinite(marginQty) || marginQty <= 0) {
+      Alert.alert("Place order", "Enter a valid margin (your capital).");
       return;
     }
-    if (qty < MIN_ORDER_QUANTITY) {
+    // Order size sent to protocol = your margin × leverage (protocol borrows the rest).
+    const orderQty = marginQty * leverage;
+    if (orderQty < MIN_ORDER_QUANTITY) {
       Alert.alert(
         "Place order",
-        `Minimum order size is ${MIN_ORDER_QUANTITY} (protocol min borrow).`
+        `Position (margin × ${leverage}×) must be at least ${MIN_ORDER_QUANTITY}. Use margin ≥ ${(MIN_ORDER_QUANTITY / leverage).toFixed(2)}.`
       );
       return;
     }
@@ -904,42 +1165,41 @@ export default function PairDetailScreen() {
       Alert.alert("Place order", "Enter a valid price.");
       return;
     }
-    // Light client-side check; chain does the real balance check.
-    if (paymentAssetBalance != null) {
-      const priceForMargin =
-        orderType === "limit" && pr != null ? pr : livePrice;
-      if (paymentAsset === "base" && paymentAssetBalance < qty) {
-        Alert.alert(
-          "Place order",
-          `Insufficient ${assetLabel(
-            paymentAsset
-          )}. Max ${paymentAssetBalance.toLocaleString(undefined, {
-            maximumFractionDigits: 6,
-          })} available.`
-        );
-        return;
-      }
-      if (
-        paymentAsset === "quote" &&
-        priceForMargin != null &&
-        priceForMargin > 0
-      ) {
-        const quoteNeeded = qty * priceForMargin;
-        if (paymentAssetBalance < quoteNeeded) {
-          Alert.alert(
-            "Place order",
-            `Insufficient ${assetLabel(
-              paymentAsset
-            )}. Need ~${quoteNeeded.toLocaleString(undefined, {
-              maximumFractionDigits: 2,
-            })}. Max ${paymentAssetBalance.toLocaleString(undefined, {
-              maximumFractionDigits: 6,
-            })} available.`
-          );
-          return;
-        }
-      }
+    // Margin check: your margin × price (margin in USD) can't exceed equity; position notional = margin × leverage × price ≤ equity × leverage.
+    const priceForMargin =
+      orderType === "limit" && pr != null ? pr : livePrice;
+    const notionalUsd =
+      typeof priceForMargin === "number" && priceForMargin > 0
+        ? orderQty * priceForMargin
+        : null;
+    const maxNotionalUsd = equityUsd * leverage;
+    if (
+      notionalUsd != null &&
+      notionalUsd > 0 &&
+      maxNotionalUsd < notionalUsd
+    ) {
+      Alert.alert(
+        "Place order",
+        `Not enough margin for this size at ${leverage}×.\n\n` +
+          `Your equity ≈ $${equityUsd.toFixed(2)}. At ${leverage}×, max position notional ≈ $${maxNotionalUsd.toFixed(2)}.\n` +
+          `This order: ${marginQty.toFixed(2)} × ${leverage}× × $${priceForMargin.toFixed(2)} ≈ $${notionalUsd.toFixed(2)} notional.\n\n` +
+          `Use a smaller margin or add collateral.`
+      );
+      return;
     }
+    // Borrow (n-1)× margin so account has enough for the order. Long = borrow quote; short = borrow base.
+    const borrowBaseAmount =
+      orderSide === "sell" && leverage > 1
+        ? Math.round(marginQty * (leverage - 1) * 1e6) / 1e6
+        : undefined;
+    const borrowQuoteAmount =
+      orderSide === "buy" &&
+      leverage > 1 &&
+      typeof livePrice === "number" &&
+      livePrice > 0
+        ? Math.round(marginQty * livePrice * (leverage - 1) * 1e6) / 1e6
+        : undefined;
+
     setOrderLoading(true);
     try {
       const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
@@ -950,19 +1210,34 @@ export default function PairDetailScreen() {
         poolKey: decodedPoolName,
         orderType,
         isBid: orderSide === "buy",
-        quantity: qty,
+        quantity: orderQty,
         price: orderType === "limit" ? pr : undefined,
         payWithDeep: paymentAsset === "deep",
+        borrowBaseAmount,
+        borrowQuoteAmount,
         signRawHash,
         publicKeyHex,
         network: "mainnet",
       });
       refreshMarginHistory?.();
+      refreshOpenOrders?.();
+      refreshOrderHistory?.();
+      refreshTradeHistory?.();
+      refreshMarginState?.();
+      setTimeout(() => {
+        refreshOpenOrders?.();
+        refreshOrderHistory?.();
+        refreshTradeHistory?.();
+        refreshMarginState?.();
+      }, 2500);
+      setTimeout(() => {
+        refreshMarginState?.();
+      }, 6000);
       setPrice("");
-      setQuantity("");
       Alert.alert("Place order", "Order submitted.");
     } catch (err) {
       const raw = err instanceof Error ? err.message : "Place order failed";
+      console.log("[Place order] Protocol/backend error:", raw);
       const isInsufficientMargin =
         raw.includes("withdraw_with_proof") ||
         raw.includes("abort code: 3") ||
@@ -983,6 +1258,8 @@ export default function PairDetailScreen() {
     paymentAssetBalance,
     livePrice,
     assetLabel,
+    equityUsd,
+    leverage,
     marginManagerId,
     decodedPoolName,
     suiAddress,
@@ -990,6 +1267,238 @@ export default function PairDetailScreen() {
     suiWallet?.publicKey,
     apiUrl,
     refreshMarginHistory,
+    refreshOpenOrders,
+    refreshOrderHistory,
+    refreshTradeHistory,
+    refreshMarginState,
+  ]);
+
+  const onClosePosition = useCallback(async () => {
+    if (
+      !livePnl.hasPosition ||
+      !livePnl.hasDebt ||
+      livePnl.positionSide === "none"
+    )
+      return;
+    const baseDebt = state ? Number(state.base_debt) : 0;
+    const quoteDebt = state ? Number(state.quote_debt) : 0;
+    const hasDebt = baseDebt > 0 || quoteDebt > 0;
+    // One position per margin manager. Convert quote → base first when short (use USDC to buy SUI); then repay.
+    const latestTrade = tradeHistory[0];
+    const mark = livePnl.currentPrice;
+    const quoteAsset = state ? Number(state.quote_asset) : 0;
+    const baseAsset = state ? Number(state.base_asset) : 0;
+    const onChainPositionSize = Math.abs(livePnl.netBasePosition);
+
+    let closeQuantity: number;
+    if (
+      livePnl.positionSide === "short" &&
+      latestTrade?.quote_volume != null &&
+      latestTrade?.price != null &&
+      mark > 0
+    ) {
+      // Short: only swap the position (size + unrealized) in USDC — the amount that went into the trade. Convert that to base.
+      const sizeInQuote = Number(latestTrade.quote_volume);
+      const entry = Number(latestTrade.price);
+      const unrealizedInQuote = sizeInQuote * (entry - mark) / entry;
+      const totalQuoteToConvert = sizeInQuote + unrealizedInQuote;
+      closeQuantity = totalQuoteToConvert / mark;
+      if (quoteAsset > 0) {
+        closeQuantity = Math.min(closeQuantity, quoteAsset / mark);
+      }
+    } else if (livePnl.positionSide === "short" && quoteAsset > 0 && mark > 0) {
+      closeQuantity = quoteAsset / mark;
+    } else if (livePnl.positionSide === "long" && baseAsset > 0) {
+      // Long: close only the SUI involved in the trade (size + unrealized PnL),
+      // not extra SUI collateral sitting in the account.
+      if (
+        latestTrade?.quote_volume != null &&
+        latestTrade?.price != null &&
+        mark > 0
+      ) {
+        const sizeInQuote = Number(latestTrade.quote_volume); // trade notional in USDC
+        const entry = Number(latestTrade.price);
+        const unrealizedInQuote = sizeInQuote * (mark - entry) / entry;
+        const totalQuoteToConvert = sizeInQuote + unrealizedInQuote;
+        const qtyFromTrade = totalQuoteToConvert / mark; // SUI = (size + PnL)/mark
+        closeQuantity = Math.min(
+          qtyFromTrade,
+          baseAsset,
+          onChainPositionSize || qtyFromTrade
+        );
+      } else if (latestTrade?.base_volume != null) {
+        const tradeBaseSize = Number(latestTrade.base_volume);
+        closeQuantity = Math.min(tradeBaseSize, baseAsset);
+      } else {
+        closeQuantity = Math.min(baseAsset, onChainPositionSize || baseAsset);
+      }
+    } else if (
+      latestTrade?.quote_volume != null &&
+      latestTrade?.price != null &&
+      mark > 0
+    ) {
+      const sizeInSameDenom = Number(latestTrade.quote_volume);
+      const entry = Number(latestTrade.price);
+      const unrealizedInSameDenom =
+        livePnl.positionSide === "long"
+          ? sizeInSameDenom * (mark - entry) / entry
+          : sizeInSameDenom * (entry - mark) / entry;
+      closeQuantity = (sizeInSameDenom + unrealizedInSameDenom) / mark;
+      closeQuantity = Math.min(closeQuantity, onChainPositionSize || closeQuantity);
+    } else if (latestTrade?.base_volume != null) {
+      closeQuantity = Math.min(Number(latestTrade.base_volume), onChainPositionSize || Number(latestTrade.base_volume));
+    } else {
+      closeQuantity = onChainPositionSize;
+    }
+    if (__DEV__) {
+      console.log("[ClosePosition] computed raw close quantity", {
+        positionSide: livePnl.positionSide,
+        baseAsset,
+        quoteAsset,
+        baseDebt,
+        quoteDebt,
+        onChainPositionSize,
+        latestTrade,
+        mark,
+        closeQuantity,
+      });
+    }
+    closeQuantity = Math.round(closeQuantity * 1e6) / 1e6;
+    const canPlaceCloseOrder = closeQuantity >= MIN_ORDER_QUANTITY;
+    if (__DEV__) {
+      console.log("[ClosePosition] normalized close quantity", {
+        closeQuantity,
+        canPlaceCloseOrder,
+        minOrderQuantity: MIN_ORDER_QUANTITY,
+      });
+    }
+
+    if (!canPlaceCloseOrder && !hasDebt) {
+      Alert.alert(
+        "Close position",
+        `Position size (${closeQuantity.toFixed(6)}) is below minimum order ${MIN_ORDER_QUANTITY}. Nothing to repay.`
+      );
+      return;
+    }
+    if (!marginManagerId || !decodedPoolName || !suiAddress) {
+      Alert.alert("Close position", "Select a margin account first.");
+      return;
+    }
+    if (!signRawHash || !suiWallet?.publicKey) {
+      Alert.alert("Close position", "Wallet signing not available.");
+      return;
+    }
+    setClosePositionLoading(true);
+    try {
+      const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
+      if (canPlaceCloseOrder) {
+        if (__DEV__) {
+          console.log("[ClosePosition] placing close order via backend", {
+            apiUrl,
+            sender: suiAddress,
+            marginManagerId,
+            poolKey: decodedPoolName,
+            orderType: "market",
+            isBid: livePnl.positionSide === "short",
+            quantity: closeQuantity,
+            payWithDeep: false,
+            reduceOnly: false,
+          });
+        }
+        await placeOrderViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          orderType: "market",
+          isBid: livePnl.positionSide === "short",
+          quantity: closeQuantity,
+          // Pay fees in quote asset for close; DEEP balance is optional.
+          payWithDeep: false,
+          // Use a regular market order for closing; repay step handles debt.
+          reduceOnly: false,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+      }
+      if (hasDebt) {
+        // Use fresh state after order so we repay with the SUI we just got (and current quote).
+        const stateForRepay = (await refreshMarginState?.()) ?? state;
+        if (stateForRepay) {
+          const baseAsset = Number(stateForRepay.base_asset);
+          const quoteAsset = Number(stateForRepay.quote_asset);
+          // After closing the position, margin manager should have enough assets
+          // to cover its debts; otherwise it would be liquidated. Repay full debt
+          // amounts (capped by protocol), rather than clamping by asset here.
+          const baseRepay = baseDebt > 0 ? baseDebt : 0;
+          const quoteRepay = quoteDebt > 0 ? quoteDebt : 0;
+          if (__DEV__) {
+            console.log("[ClosePosition] repay inputs", {
+              stateForRepay,
+              baseDebt,
+              quoteDebt,
+              baseAsset,
+              quoteAsset,
+              baseRepay,
+              quoteRepay,
+            });
+          }
+          if (baseRepay > 0 || quoteRepay > 0) {
+            await repayViaBackend({
+              apiUrl,
+              sender: suiAddress,
+              marginManagerId,
+              poolKey: decodedPoolName,
+              baseAmount: baseRepay > 0 ? baseRepay : undefined,
+              quoteAmount: quoteRepay > 0 ? quoteRepay : undefined,
+              signRawHash,
+              publicKeyHex,
+              network: "mainnet",
+            });
+          }
+        }
+      }
+      refreshMarginState?.();
+      refreshOpenOrders?.();
+      refreshOrderHistory?.();
+      refreshTradeHistory?.();
+      if (canPlaceCloseOrder && hasDebt) {
+        Alert.alert("Close position", "Position closed and debt repaid.");
+      } else if (canPlaceCloseOrder) {
+        Alert.alert("Close position", "Position closed.");
+      } else {
+        Alert.alert(
+          "Close position",
+          "Debt repaid. Position size was below minimum order, so no close order was placed; a small position may remain."
+        );
+      }
+    } catch (err) {
+      if (__DEV__) {
+        console.log("[ClosePosition] error", err);
+      }
+      const msg = err instanceof Error ? err.message : "Close position failed";
+      Alert.alert("Close position", msg);
+    } finally {
+      setClosePositionLoading(false);
+    }
+  }, [
+    livePnl.hasPosition,
+    livePnl.hasDebt,
+    livePnl.positionSide,
+    livePnl.netBasePosition,
+    marginManagerId,
+    decodedPoolName,
+    suiAddress,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    state,
+    tradeHistory,
+    refreshMarginState,
+    refreshOpenOrders,
+    refreshOrderHistory,
+    refreshTradeHistory,
   ]);
 
   const onSetTpsl = useCallback(async () => {
@@ -1234,6 +1743,56 @@ export default function PairDetailScreen() {
                   onPress={() => {
                     refreshMarginState();
                     refreshMarginHistory();
+                    refreshOpenOrders();
+                    refreshOrderHistory();
+                    refreshTradeHistory();
+                    if (marginManagerId) {
+                      fetchMarginBorrowedSharesViaBackend({
+                        apiUrl,
+                        marginManagerId,
+                        poolKey: decodedPoolName,
+                        network: "mainnet",
+                      })
+                        .then((chain) => {
+                          console.log(
+                            "======= Margin Manager SDK — borrowedShares, borrowedBaseShares, borrowedQuoteShares, hasBaseDebt ======="
+                          );
+                          console.log(
+                            JSON.stringify(
+                              {
+                                borrowedShares: chain.borrowedShares,
+                                borrowedBaseShares: chain.borrowedBaseShares,
+                                borrowedQuoteShares: chain.borrowedQuoteShares,
+                                hasBaseDebt: chain.hasBaseDebt,
+                              },
+                              null,
+                              2
+                            )
+                          );
+                          console.log(
+                            "+++++++ Margin Manager SDK — balanceManager, calculateAssets, calculateDebts +++++++"
+                          );
+                          console.log(
+                            JSON.stringify(
+                              {
+                                balanceManager: chain.balanceManager,
+                                calculateAssets: chain.calculateAssets,
+                                calculateDebts: chain.calculateDebts,
+                              },
+                              null,
+                              2
+                            )
+                          );
+                        })
+                        .catch((e) => {
+                          if (__DEV__) {
+                            console.warn(
+                              "[Margin] Chain margin state fetch failed:",
+                              e
+                            );
+                          }
+                        });
+                    }
                   }}
                   style={({ pressed }) => [
                     styles.marginRefreshButton,
@@ -1512,7 +2071,27 @@ export default function PairDetailScreen() {
                   </Pressable>
                 </View>
 
-                <Text style={styles.sectionTitle}>Activity</Text>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    marginBottom: 4,
+                  }}
+                >
+                  <Text style={styles.sectionTitle}>Activity</Text>
+                  <Pressable
+                    onPress={refreshMarginHistory}
+                    disabled={historyLoading}
+                    style={({ pressed }) => ({
+                      padding: 6,
+                      opacity: historyLoading ? 0.6 : pressed ? 0.8 : 1,
+                    })}
+                    hitSlop={8}
+                  >
+                    <FontAwesome name="refresh" size={18} color={colors.tint} />
+                  </Pressable>
+                </View>
                 <View style={styles.card}>
                   {historyLoading &&
                     !collateral.length &&
@@ -1533,7 +2112,7 @@ export default function PairDetailScreen() {
                         <Text style={styles.sell}>Liquidated</Text>
                         <Text style={styles.orderDetail}>
                           {formatTs(e.checkpoint_timestamp_ms)} ·{" "}
-                          {e.liquidation_amount}
+                          {formatLoanAmount(e.liquidation_amount, e.margin_pool_id)}
                         </Text>
                       </View>
                     ))}
@@ -1564,7 +2143,8 @@ export default function PairDetailScreen() {
                     >
                       <Text style={styles.buy}>Borrow</Text>
                       <Text style={styles.orderDetail}>
-                        {formatTs(e.checkpoint_timestamp_ms)} · {e.loan_amount}
+                        {formatTs(e.checkpoint_timestamp_ms)} ·{" "}
+                        {formatLoanAmount(e.loan_amount, e.margin_pool_id)}
                       </Text>
                     </View>
                   ))}
@@ -1575,7 +2155,8 @@ export default function PairDetailScreen() {
                     >
                       <Text style={styles.sell}>Repay</Text>
                       <Text style={styles.orderDetail}>
-                        {formatTs(e.checkpoint_timestamp_ms)} · {e.repay_amount}
+                        {formatTs(e.checkpoint_timestamp_ms)} ·{" "}
+                        {formatLoanAmount(e.repay_amount, e.margin_pool_id)}
                       </Text>
                     </View>
                   ))}
@@ -1701,20 +2282,57 @@ export default function PairDetailScreen() {
                   />
                 </>
               )}
-              <Text style={styles.inputLabel}>Quantity</Text>
-              <TextInput
-                style={[
-                  styles.input,
-                  { color: colors.text, borderColor: colors.tabIconDefault },
-                ]}
-                placeholder="0"
-                placeholderTextColor={colors.tabIconDefault}
-                value={quantity}
-                onChangeText={setQuantity}
-                keyboardType="decimal-pad"
-              />
+              <Text style={styles.inputLabel}>
+                Your margin ({poolInfoForPair?.base_asset_symbol ?? "base"})
+              </Text>
+              <View style={styles.quantityRow}>
+                <TextInput
+                  style={[
+                    styles.input,
+                    styles.quantityInput,
+                    { color: colors.text, borderColor: colors.tabIconDefault },
+                  ]}
+                  placeholder="0"
+                  placeholderTextColor={colors.tabIconDefault}
+                  value={quantity}
+                  onChangeText={setQuantity}
+                  keyboardType="decimal-pad"
+                />
+                <Pressable
+                  onPress={setMarginToMax}
+                  disabled={maxMarginBase == null || maxMarginBase <= 0}
+                  style={[
+                    styles.optionChip,
+                    {
+                      borderColor: colors.tabIconDefault,
+                      backgroundColor:
+                        maxMarginBase != null && maxMarginBase > 0
+                          ? colors.tint
+                          : "transparent",
+                      opacity:
+                        maxMarginBase != null && maxMarginBase > 0 ? 1 : 0.5,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.optionChipText,
+                      {
+                        color:
+                          maxMarginBase != null && maxMarginBase > 0
+                            ? colors.background
+                            : colors.text,
+                      },
+                    ]}
+                  >
+                    Max
+                  </Text>
+                </Pressable>
+              </View>
               <Text style={styles.optionsHint}>
-                Min order: {MIN_ORDER_QUANTITY} (protocol min borrow)
+                Position = margin × {leverage}× (you put in margin, protocol
+                borrows the rest). Min position: {MIN_ORDER_QUANTITY}. Max =
+                use full equity.
               </Text>
               <Text style={styles.inputLabel}>Leverage</Text>
               <View style={styles.leverageRow}>
@@ -1746,6 +2364,10 @@ export default function PairDetailScreen() {
                   </Pressable>
                 ))}
               </View>
+              <Text style={[styles.optionsHint, { marginTop: 2 }]}>
+                Leverage sets max quantity (equity × leverage ÷ price). Protocol
+                borrows as needed when you place the order.
+              </Text>
               <Text style={styles.inputLabel}>Pay with</Text>
               <View style={styles.payWithRow}>
                 {(["base", "quote", "deep"] as const).map((a) => {
@@ -1879,12 +2501,213 @@ export default function PairDetailScreen() {
               </Pressable>
             </View>
 
-            <Text style={styles.sectionTitle}>Open orders</Text>
-            <View style={styles.card}>
-              <Text style={styles.muted}>
-                Open orders come from DeepBook order book indexer.
-              </Text>
-            </View>
+            {livePnl.hasPosition &&
+              livePnl.hasDebt &&
+              livePnl.positionSide !== "none" && (
+              <>
+                <Text style={styles.sectionTitle}>Position</Text>
+                <View style={styles.card}>
+                  <Text style={[styles.muted, { marginBottom: 12 }]}>
+                    Size and side from margin state; entry and unrealized PnL
+                    from trade history (indexer). If entry shows —, the indexer
+                    may not have your trades yet. Close flattens with a market
+                    order.
+                  </Text>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={true}
+                    style={styles.positionTableScroll}
+                    contentContainerStyle={styles.positionTableContent}
+                  >
+                    <View style={styles.positionTable}>
+                      <View style={styles.positionTableRow}>
+                        <View style={[styles.positionTableCell, styles.positionTableHeader]}>
+                          <Text style={[styles.positionTableHeaderText, { color: colors.text }]}>Side</Text>
+                        </View>
+                        <View style={[styles.positionTableCell, styles.positionTableHeader]}>
+                          <Text style={[styles.positionTableHeaderText, { color: colors.text }]}>Size</Text>
+                        </View>
+                        <View style={[styles.positionTableCell, styles.positionTableHeader]}>
+                          <Text style={[styles.positionTableHeaderText, { color: colors.text }]}>Entry</Text>
+                        </View>
+                        <View style={[styles.positionTableCell, styles.positionTableHeader]}>
+                          <Text style={[styles.positionTableHeaderText, { color: colors.text }]}>Mark</Text>
+                        </View>
+                        <View style={[styles.positionTableCell, styles.positionTableHeader]}>
+                          <Text style={[styles.positionTableHeaderText, { color: colors.text }]}>Δ%</Text>
+                        </View>
+                        <View style={[styles.positionTableCell, styles.positionTableHeader]}>
+                          <Text style={[styles.positionTableHeaderText, { color: colors.text }]}>Unrealized</Text>
+                        </View>
+                      </View>
+                      <ScrollView
+                        nestedScrollEnabled
+                        style={styles.positionTableBodyScroll}
+                        showsVerticalScrollIndicator={true}
+                      >
+                        <View style={styles.positionTableRow}>
+                        <View style={[styles.positionTableCell, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.tabIconDefault }]}>
+                          <Text
+                            style={[
+                              styles.positionTableCellText,
+                              {
+                                color:
+                                  livePnl.positionSide === "long"
+                                    ? (colors as { positive?: string }).positive ?? "#22c55e"
+                                    : (colors as { negative?: string }).negative ?? "#ef4444",
+                                fontWeight: "600",
+                              },
+                            ]}
+                          >
+                            {livePnl.positionSide === "long" ? "Long" : "Short"}
+                          </Text>
+                        </View>
+                        <View style={[styles.positionTableCell, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.tabIconDefault }]}>
+                          <Text style={[styles.positionTableCellText, { color: colors.text }]}>
+                            {(() => {
+                              const latestTrade = tradeHistory[0];
+                              if (latestTrade && latestTrade.quote_volume != null) {
+                                return `${Number(latestTrade.quote_volume).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })} ${livePnl.quoteSymbol}`;
+                              }
+                              const entryOrMark = livePnl.avgEntryQuote > 0 ? livePnl.avgEntryQuote : livePnl.currentPrice;
+                              const sizeUsdc = entryOrMark > 0 ? Math.abs(livePnl.netBasePosition) * entryOrMark : 0;
+                              return sizeUsdc > 0
+                                ? `${sizeUsdc.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${livePnl.quoteSymbol}`
+                                : `${Math.abs(livePnl.netBasePosition).toLocaleString(undefined, { maximumFractionDigits: 6 })} ${livePnl.baseSymbol}`;
+                            })()}
+                          </Text>
+                        </View>
+                        <View style={[styles.positionTableCell, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.tabIconDefault }]}>
+                          <Text style={[styles.positionTableCellText, { color: colors.text }]}>
+                            {(() => {
+                              const latestTrade = tradeHistory[0];
+                              if (latestTrade && latestTrade.price != null) {
+                                return `${Number(latestTrade.price).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })} ${livePnl.quoteSymbol}`;
+                              }
+                              return livePnl.avgEntryQuote > 0
+                                ? `${livePnl.avgEntryQuote.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })} ${livePnl.quoteSymbol}`
+                                : "—";
+                            })()}
+                          </Text>
+                        </View>
+                        <View style={[styles.positionTableCell, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.tabIconDefault }]}>
+                          <Text style={[styles.positionTableCellText, { color: colors.text }]}>
+                            {livePnl.currentPrice > 0
+                              ? `${livePnl.currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 })} ${livePnl.quoteSymbol}`
+                              : "—"}
+                          </Text>
+                        </View>
+                        <View style={[styles.positionTableCell, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.tabIconDefault }]}>
+                          {(() => {
+                            const latestTrade = tradeHistory[0];
+                            const entryPrice = latestTrade?.price ?? livePnl.avgEntryQuote;
+                            if (entryPrice > 0 && livePnl.currentPrice > 0) {
+                              const pctChange =
+                                livePnl.positionSide === "long"
+                                  ? ((livePnl.currentPrice - entryPrice) / entryPrice) * 100
+                                  : ((entryPrice - livePnl.currentPrice) / entryPrice) * 100;
+                              const positive = pctChange >= 0;
+                              return (
+                                <Text
+                                  style={[
+                                    styles.positionTableCellText,
+                                    {
+                                      fontWeight: "600",
+                                      color: positive
+                                        ? (colors as { positive?: string }).positive ?? "#22c55e"
+                                        : (colors as { negative?: string }).negative ?? "#ef4444",
+                                    },
+                                  ]}
+                                >
+                                  {positive ? "+" : ""}
+                                  {pctChange.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%
+                                </Text>
+                              );
+                            }
+                            return <Text style={[styles.positionTableCellText, styles.muted]}>—</Text>;
+                          })()}
+                        </View>
+                        <View style={[styles.positionTableCell, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: colors.tabIconDefault }]}>
+                          {(() => {
+                            const latestTrade = tradeHistory[0];
+                            const entryPrice = latestTrade?.price ?? livePnl.avgEntryQuote;
+                            const quoteVol = latestTrade?.quote_volume != null ? Number(latestTrade.quote_volume) : 0;
+                            const mark = livePnl.currentPrice;
+                            const unrealized =
+                              entryPrice > 0 && mark > 0 && quoteVol > 0
+                                ? livePnl.positionSide === "long"
+                                  ? quoteVol * (mark - entryPrice) / entryPrice
+                                  : quoteVol * (entryPrice - mark) / entryPrice
+                                : livePnl.hasKnownEntry
+                                  ? livePnl.unrealizedPnlQuote
+                                  : null;
+                            if (unrealized === null) {
+                              return (
+                                <Text style={[styles.positionTableCellText, styles.muted]}>
+                                  — (entry unknown)
+                                </Text>
+                              );
+                            }
+                            const positive = unrealized >= 0;
+                            return (
+                              <Text
+                                style={[
+                                  styles.positionTableCellText,
+                                  {
+                                    fontWeight: "600",
+                                    color: positive
+                                      ? (colors as { positive?: string }).positive ?? "#22c55e"
+                                      : (colors as { negative?: string }).negative ?? "#ef4444",
+                                  },
+                                ]}
+                              >
+                                {positive ? "+" : ""}
+                                {unrealized.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 4 })} {livePnl.quoteSymbol}
+                              </Text>
+                            );
+                          })()}
+                        </View>
+                        </View>
+                      </ScrollView>
+                    </View>
+                  </ScrollView>
+                  <Pressable
+                    onPress={onClosePosition}
+                    disabled={closePositionLoading}
+                    style={({ pressed }) => [
+                      styles.primaryButton,
+                      {
+                        marginTop: 12,
+                        backgroundColor:
+                          livePnl.positionSide === "long"
+                            ? "#ef4444"
+                            : "#22c55e",
+                        opacity: closePositionLoading ? 0.6 : pressed ? 0.8 : 1,
+                      },
+                    ]}
+                    accessibilityRole="button"
+                    accessibilityLabel="Close position"
+                  >
+                    {closePositionLoading ? (
+                      <ActivityIndicator
+                        size="small"
+                        color={colors.background}
+                      />
+                    ) : (
+                      <Text
+                        style={[
+                          styles.primaryButtonText,
+                          { color: colors.background },
+                        ]}
+                      >
+                        Close position
+                      </Text>
+                    )}
+                  </Pressable>
+                </View>
+              </>
+            )}
+
           </>
         )}
       </ScrollView>
@@ -2353,6 +3176,51 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(128,128,128,0.3)",
   },
+  positionTableScroll: {
+    maxHeight: 220,
+    marginBottom: 4,
+  },
+  positionTableContent: {
+    flexGrow: 1,
+  },
+  positionTableBodyScroll: {
+    maxHeight: 160,
+  },
+  positionTable: {
+    flexDirection: "column",
+    minWidth: "100%",
+  },
+  positionTableRow: {
+    flexDirection: "row",
+    width: 600,
+    minWidth: 600,
+  },
+  positionTableCell: {
+    width: 100,
+    minWidth: 100,
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    paddingRight: 12,
+    borderRightWidth: StyleSheet.hairlineWidth,
+    borderRightColor: "rgba(128,128,128,0.35)",
+    justifyContent: "flex-start",
+    alignItems: "flex-start",
+  },
+  positionTableHeader: {
+    paddingBottom: 8,
+  },
+  positionTableHeaderText: {
+    fontSize: 12,
+    fontWeight: "600",
+    opacity: 0.85,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+    textAlign: "left",
+  },
+  positionTableCellText: {
+    fontSize: 14,
+    textAlign: "left",
+  },
   cardLabel: {
     fontSize: 11,
     fontWeight: "700",
@@ -2449,6 +3317,13 @@ const styles = StyleSheet.create({
     fontSize: 16,
     marginBottom: 16,
   },
+  quantityRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 16,
+  },
+  quantityInput: { flex: 1, marginBottom: 0 },
   primaryButton: { paddingVertical: 14, borderRadius: 8, alignItems: "center" },
   primaryButtonText: { fontSize: 16, fontWeight: "600" },
   checkRow: {

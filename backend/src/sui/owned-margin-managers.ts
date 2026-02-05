@@ -49,16 +49,37 @@ async function getManagersFromCreationEvents(
   const managers: OwnedMarginManagerEntry[] = [];
   const seen = new Set<string>();
 
-  const tryQuery = async (
-    query: Parameters<SuiJsonRpcClient["queryEvents"]>[0]["query"]
+  // Paginate queryEvents (RPC page limit is 50) so we can scan more than the
+  // most recent 50 events. Stop after a reasonable cap to avoid unbounded work.
+  const queryEventsPaginated = async (
+    query: Parameters<SuiJsonRpcClient["queryEvents"]>[0]["query"],
+    maxEvents = 500
   ) => {
-    const result = await client.queryEvents({ query, limit: 100 });
-    return result.data ?? [];
+    const all: Awaited<
+      ReturnType<SuiJsonRpcClient["queryEvents"]>
+    >["data"] = [];
+    let cursor: string | null | undefined = null;
+    const pageLimit = 50;
+    let pages = 0;
+    const maxPages = 20;
+    do {
+      const { data, nextCursor, hasNextPage } = await client.queryEvents({
+        query,
+        limit: pageLimit,
+        cursor: cursor ?? undefined,
+      });
+      if (data && data.length) {
+        all.push(...data);
+      }
+      cursor = hasNextPage ? nextCursor : null;
+      pages += 1;
+    } while (cursor && all.length < maxEvents && pages < maxPages);
+    return all;
   };
 
   let events: Awaited<ReturnType<typeof tryQuery>> = [];
   try {
-    events = await tryQuery({ Sender: owner });
+    events = await queryEventsPaginated({ Sender: owner });
   } catch (err) {
     console.log(
       "[owned-margin-managers] fallback queryEvents(Sender) error:",
@@ -67,7 +88,7 @@ async function getManagersFromCreationEvents(
   }
   if (events.length === 0) {
     try {
-      events = await tryQuery({
+      events = await queryEventsPaginated({
         MoveEventModule: { package: packageId, module: MARGIN_MANAGER_MODULE },
       });
     } catch (err) {
@@ -138,27 +159,44 @@ export async function getOwnedMarginManagers(
   const url = getJsonRpcFullnodeUrl(network);
   const client = new SuiJsonRpcClient({ url, network });
 
-  // Try MoveModule first; if 0 results, try Package (broader) in case filter differs by node
+  // Helper: paginate getOwnedObjects up to a reasonable cap so wallets with many
+  // margin managers are fully captured.
+  async function getOwnedObjectsPaginated(
+    filter:
+      | { MoveModule: { package: string; module: string } }
+      | { Package: string }
+  ) {
+    const all: Awaited<ReturnType<typeof client.getOwnedObjects>>["data"] = [];
+    let cursor: string | null | undefined = null;
+    const pageLimit = 50; // RPC max
+    const maxObjects = 500; // safety cap
+    do {
+      const { data, nextCursor, hasNextPage } = await client.getOwnedObjects({
+        owner,
+        filter,
+        options: { showContent: true, showType: true },
+        limit: pageLimit,
+        cursor: cursor ?? undefined,
+      });
+      if (data && data.length) {
+        all.push(...data);
+      }
+      cursor = hasNextPage ? nextCursor : null;
+    } while (cursor && all.length < maxObjects);
+    return all;
+  }
+
+  // Try MoveModule first; if 0 results, try Package (broader) in case filter differs by node.
   let objects: Awaited<ReturnType<typeof client.getOwnedObjects>>["data"] = [];
-  const { data: byModule } = await client.getOwnedObjects({
-    owner,
-    filter: {
-      MoveModule: {
-        package: packageId,
-        module: MARGIN_MANAGER_MODULE,
-      },
+  const byModule = await getOwnedObjectsPaginated({
+    MoveModule: {
+      package: packageId,
+      module: MARGIN_MANAGER_MODULE,
     },
-    options: { showContent: true, showType: true },
-    limit: 50,
   });
   objects = byModule ?? [];
   if (objects.length === 0) {
-    const { data: byPackage } = await client.getOwnedObjects({
-      owner,
-      filter: { Package: packageId },
-      options: { showContent: true, showType: true },
-      limit: 50,
-    });
+    const byPackage = await getOwnedObjectsPaginated({ Package: packageId });
     objects = byPackage ?? [];
   }
 
