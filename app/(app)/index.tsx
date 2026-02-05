@@ -25,6 +25,7 @@ import {
 
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
   fetchSubdomainStatus,
   checkLabelAvailable,
@@ -70,6 +71,14 @@ type LinkedAccount = {
 function truncateAddress(address: string) {
   if (!address || address.length < 12) return address;
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+/** Time-based greeting (local time). Morning / afternoon / evening only; no "good night". */
+function getTimeGreeting(): string {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
 }
 
 /** Find existing Sui wallet address and public key from user's linked accounts (API may use snake_case or camelCase). */
@@ -1069,6 +1078,7 @@ export default function HomeScreen() {
     signRawHash,
   ]);
 
+  const insets = useSafeAreaInsets();
   const showSuiLoading = suiLoading && !suiAddress && !suiError;
 
   if (showSuiLoading) {
@@ -1083,15 +1093,13 @@ export default function HomeScreen() {
   return (
     <ScrollView
       style={styles.scroll}
-      contentContainerStyle={styles.container}
+      contentContainerStyle={[styles.container, { paddingTop: insets.top + 24 }]}
       showsVerticalScrollIndicator={false}
     >
       <View style={styles.headerRow}>
         <View>
           <Text style={styles.title}>Home</Text>
-          <Text style={styles.subtitle}>
-            {user?.email?.address ?? user?.google?.email ?? "Signed in"}
-          </Text>
+          <Text style={styles.subtitle}>{getTimeGreeting()}</Text>
         </View>
         <Pressable
           onPress={() => setNetworkDrawerVisible(true)}
@@ -1145,13 +1153,22 @@ export default function HomeScreen() {
             ]}
             onStartShouldSetResponder={() => true}
           >
-            <Text style={[styles.drawerTitle, { color: colors.text }]}>
-              Network
-            </Text>
-            <Text style={[styles.drawerSubtitle, { color: colors.text }]}>
-              Margin trading is available on Sui only. Other networks are
-              wallet-only for now.
-            </Text>
+            <View style={styles.drawerHeaderRow}>
+              <Text style={[styles.drawerTitle, { color: colors.text }]}>
+                Network
+              </Text>
+              <Pressable
+                onPress={() => {
+                  setNetworkDrawerVisible(false);
+                  handleLogout();
+                }}
+                style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}
+              >
+                <Text style={[styles.drawerSignOut, { color: colors.tint }]}>
+                  Sign out
+                </Text>
+              </Pressable>
+            </View>
             {NETWORKS.map((net) => {
               const isActive = net.id === currentNetwork.id;
               return (
@@ -1205,19 +1222,6 @@ export default function HomeScreen() {
                       </Text>
                     )}
                   </View>
-                  <Text
-                    style={[
-                      styles.drawerItemDescription,
-                      { color: colors.text },
-                    ]}
-                  >
-                    {net.description}
-                  </Text>
-                  {!net.capabilities.showMarginTab && (
-                    <Text style={styles.drawerBadge}>
-                      Margin trading not available
-                    </Text>
-                  )}
                 </Pressable>
               );
             })}
@@ -1227,54 +1231,50 @@ export default function HomeScreen() {
 
       {currentNetwork.capabilities.showEvmWallet && (
         <>
-          <View style={styles.card}>
-            <Text style={styles.cardLabel}>
-              {currentNetwork.label} wallet (Privy)
+          <View style={[styles.card, styles.walletCard]}>
+            <Text style={[styles.cardLabel, styles.walletCardLabel]}>
+              {currentNetwork.label} wallet
             </Text>
             {evmAddress ? (
               <Pressable
                 onPress={copyEvmAddress}
-                style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}
+                style={({ pressed }) => [{ opacity: pressed ? 0.9 : 1 }]}
               >
-                <Text style={styles.address} selectable>
+                <Text style={[styles.walletHero, { color: colors.text }]} selectable numberOfLines={1}>
                   {isBaseMainnet(currentNetwork.id) && subdomainStatus?.fullName
                     ? subdomainStatus.fullName
                     : evmAddress}
                 </Text>
-                <Text style={styles.addressShort}>
+                <Text style={[styles.walletShort, { color: colors.text }]}>
                   {truncateAddress(evmAddress)}
                 </Text>
                 {copiedAddress && (
-                  <Text
-                    style={[styles.muted, { color: "#22c55e", marginTop: 8 }]}
-                  >
-                    Copied!
+                  <Text style={[styles.walletCopied, { color: "#22c55e" }]}>
+                    Copied
                   </Text>
                 )}
-                <Text style={styles.muted}>
-                  This network is wallet-only. Margin trading and deep liquidity
-                  are available on Sui.
-                </Text>
                 {isBaseMainnet(currentNetwork.id) && subdomainStatus?.hasSubdomain && (
-                  <>
-                    <Text style={[styles.muted, { marginTop: 10 }]}>
-                      Preferred: {subdomainStatus.preferredChain ?? "—"} · {subdomainStatus.preferredToken ?? "—"}
-                    </Text>
-                    <View style={{ flexDirection: "row", alignItems: "center", marginTop: 8, gap: 16 }}>
-                      <Pressable onPress={openEditPreferences} style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}>
-                        <Text style={[styles.muted, { color: colors.tint }]}>Edit preferences</Text>
+                  <View style={styles.walletPrefsRow}>
+                    <View style={[styles.preferredPill, { backgroundColor: colors.tabIconDefault + "25", borderColor: colors.tabIconDefault + "50" }]}>
+                      <Text style={[styles.preferredPillText, { color: colors.text }]}>
+                        ★ {subdomainStatus.preferredChain ?? "—"} · {subdomainStatus.preferredToken ?? "—"}
+                      </Text>
+                    </View>
+                    <View style={styles.walletActionsRow}>
+                      <Pressable onPress={openEditPreferences} style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}>
+                        <Text style={[styles.walletActionLink, { color: colors.tint }]}>Edit</Text>
                       </Pressable>
-                      <Pressable onPress={refetchSubdomain} style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}>
-                        <Text style={[styles.muted, { color: colors.tint }]}>Refresh</Text>
+                      <Text style={[styles.walletActionDot, { color: colors.tabIconDefault }]}>·</Text>
+                      <Pressable onPress={refetchSubdomain} style={({ pressed }) => ({ opacity: pressed ? 0.7 : 1 })}>
+                        <Text style={[styles.walletActionLink, { color: colors.tint }]}>Refresh</Text>
                       </Pressable>
                     </View>
-                  </>
+                  </View>
                 )}
               </Pressable>
             ) : (
-              <Text style={styles.muted}>
-                No {currentNetwork.label} wallet linked yet. You can add one in
-                your Privy account.
+              <Text style={[styles.muted, { color: colors.text }]}>
+                No {currentNetwork.label} wallet linked. Add one in your Privy account.
               </Text>
             )}
           </View>
@@ -2213,18 +2213,6 @@ export default function HomeScreen() {
         </>
       )}
 
-      <Pressable
-        onPress={handleLogout}
-        style={({ pressed }) => [
-          styles.logoutButton,
-          {
-            backgroundColor: colors.tabIconDefault,
-            opacity: pressed ? 0.8 : 1,
-          },
-        ]}
-      >
-        <Text style={styles.logoutText}>Log out</Text>
-      </Pressable>
     </ScrollView>
   );
 }
@@ -2236,7 +2224,6 @@ const styles = StyleSheet.create({
   container: {
     flexGrow: 1,
     padding: 24,
-    paddingTop: 48,
   },
   headerRow: {
     flexDirection: "row",
@@ -2305,6 +2292,63 @@ const styles = StyleSheet.create({
     fontSize: 12,
     opacity: 0.7,
   },
+  walletCard: {
+    paddingVertical: 20,
+    paddingHorizontal: 20,
+  },
+  walletCardLabel: {
+    fontSize: 11,
+    letterSpacing: 0.8,
+    opacity: 0.55,
+    marginBottom: 12,
+  },
+  walletHero: {
+    fontSize: 20,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+    marginBottom: 4,
+  },
+  walletShort: {
+    fontSize: 13,
+    opacity: 0.5,
+    marginBottom: 12,
+  },
+  walletCopied: {
+    fontSize: 13,
+    fontWeight: "600",
+    marginBottom: 8,
+  },
+  walletPrefsRow: {
+    marginTop: 4,
+    gap: 10,
+  },
+  preferredPill: {
+    alignSelf: "flex-start",
+    paddingLeft: 0,
+    paddingRight: 12,
+    paddingVertical: 6,
+    borderRadius: 20,
+    borderWidth: 1,
+  },
+  preferredPillText: {
+    fontSize: 13,
+    fontWeight: "500",
+    opacity: 0.9,
+  },
+  walletActionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 4,
+  },
+  walletActionLink: {
+    fontSize: 13,
+    fontWeight: "500",
+  },
+  walletActionDot: {
+    fontSize: 13,
+    opacity: 0.5,
+  },
   muted: {
     fontSize: 14,
     opacity: 0.6,
@@ -2370,17 +2414,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
   },
-  logoutButton: {
-    paddingVertical: 14,
-    paddingHorizontal: 24,
-    borderRadius: 8,
-    alignItems: "center",
-    alignSelf: "center",
-  },
-  logoutText: {
-    fontSize: 16,
-    fontWeight: "600",
-  },
   drawerOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.45)",
@@ -2392,15 +2425,20 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     padding: 20,
   },
+  drawerHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 16,
+  },
   drawerTitle: {
     fontSize: 18,
     fontWeight: "700",
     marginBottom: 4,
   },
-  drawerSubtitle: {
-    fontSize: 13,
-    opacity: 0.7,
-    marginBottom: 16,
+  drawerSignOut: {
+    fontSize: 14,
+    fontWeight: "600",
   },
   drawerItem: {
     borderWidth: 1,
@@ -2412,7 +2450,6 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    marginBottom: 4,
   },
   drawerItemTitleRow: {
     flexDirection: "row",
@@ -2422,10 +2459,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
   },
-  drawerItemDescription: {
-    fontSize: 12,
-    opacity: 0.75,
-  },
   drawerActivePill: {
     borderWidth: 1,
     borderRadius: 999,
@@ -2433,11 +2466,5 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     fontSize: 11,
     fontWeight: "600",
-  },
-  drawerBadge: {
-    marginTop: 6,
-    fontSize: 11,
-    color: "#f97316",
-    fontWeight: "500",
   },
 });

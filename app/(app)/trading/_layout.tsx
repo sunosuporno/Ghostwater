@@ -4,7 +4,7 @@ export default function TradingLayout() {
   return (
     <Stack
       screenOptions={{
-        headerShown: true,
+        headerShown: false,
         headerBackTitle: 'Pairs',
       }}
     >

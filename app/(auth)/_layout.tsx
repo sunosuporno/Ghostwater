@@ -13,11 +13,12 @@ function TabBarIcon(props: {
 
 export default function AuthLayout() {
   const colorScheme = useColorScheme();
+  const tint = Colors[colorScheme ?? 'light'].tint;
 
   return (
     <Tabs
       screenOptions={{
-        tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
+        tabBarActiveTintColor: tint,
         headerShown: true,
       }}
     >
@@ -25,7 +26,9 @@ export default function AuthLayout() {
         name="index"
         options={{
           title: 'Login',
-          tabBarIcon: ({ color }) => <TabBarIcon name="sign-in" color={color} />,
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="sign-in" color={color ?? tint} />
+          ),
         }}
       />
     </Tabs>

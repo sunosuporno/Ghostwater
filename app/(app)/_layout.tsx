@@ -23,7 +23,7 @@ function AppTabs() {
       key={currentNetwork.id}
       screenOptions={{
         tabBarActiveTintColor: Colors[colorScheme ?? "light"].tint,
-        headerShown: true,
+        headerShown: false,
       }}
     >
       <Tabs.Screen
