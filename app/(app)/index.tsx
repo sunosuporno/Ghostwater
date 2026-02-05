@@ -302,8 +302,10 @@ export default function HomeScreen() {
       const status = await fetchSubdomainStatus(registrarAddress, evmAddress as `0x${string}`);
       setSubdomainStatus(status);
     } catch (err) {
-      setSubdomainError(err instanceof Error ? err.message : "Failed to load subdomain");
-      setSubdomainStatus(null);
+      const raw = err instanceof Error ? err.message : String(err);
+      const message = /429|rate limit|over rate limit/i.test(raw) ? "Rate limited – tap to retry" : raw;
+      setSubdomainError(message);
+      setSubdomainStatus((prev) => (prev?.hasSubdomain ? prev : null));
     } finally {
       setSubdomainLoading(false);
     }
@@ -390,7 +392,8 @@ export default function HomeScreen() {
   useFocusEffect(
     useCallback(() => {
       if (suiAddress) refetchBalances();
-    }, [suiAddress, refetchBalances])
+      if (isBaseMainnet(currentNetwork.id) && evmAddress && registrarAddress) refetchSubdomain();
+    }, [suiAddress, refetchBalances, currentNetwork.id, evmAddress, registrarAddress, refetchSubdomain])
   );
 
   // Refresh when app comes to foreground
@@ -801,12 +804,14 @@ export default function HomeScreen() {
       const from = accounts?.[0];
       if (!from) throw new Error("No account in embedded wallet");
 
-      // One tx: registerWithPreferences(label, preferredChain, preferredToken)
-      const calldata = getRegisterWithPreferencesCalldata(
-        label,
-        claimPreferredChain.trim(),
-        tokenValue
-      );
+      // Use form values explicitly (no empty strings)
+      const preferredChain = claimPreferredChain.trim();
+      const preferredToken = tokenValue;
+      if (!label || label.length < 3) throw new Error("Invalid label");
+      if (!preferredChain) throw new Error("Preferred chain is required");
+      if (!preferredToken) throw new Error("Preferred token is required");
+
+      const calldata = getRegisterWithPreferencesCalldata(label, preferredChain, preferredToken);
       await provider.request({
         method: "eth_sendTransaction",
         params: [{
@@ -824,7 +829,9 @@ export default function HomeScreen() {
       setClaimPreferredTokenCustom("");
       setClaimNameAvailable(null);
       setClaimStep(null);
-      setTimeout(() => refetchSubdomain(), 15000);
+      refetchSubdomain();
+      setTimeout(() => refetchSubdomain(), 3000);
+      setTimeout(() => refetchSubdomain(), 12000);
     } catch (err: unknown) {
       const data = (err as { data?: unknown; error?: { data?: unknown } })?.data
         ?? (err as { error?: { data?: unknown } })?.error?.data;
@@ -906,7 +913,12 @@ export default function HomeScreen() {
       const from = accounts?.[0];
       if (!from) throw new Error("No account in embedded wallet");
 
-      const prefsData = getSetPreferencesCalldata(editPrefsChain.trim(), tokenValue);
+      const preferredChain = editPrefsChain.trim();
+      const preferredToken = tokenValue;
+      if (!preferredChain) throw new Error("Preferred chain is required");
+      if (!preferredToken) throw new Error("Preferred token is required");
+
+      const prefsData = getSetPreferencesCalldata(preferredChain, preferredToken);
       await provider.request({
         method: "eth_sendTransaction",
         params: [{
@@ -1248,12 +1260,14 @@ export default function HomeScreen() {
                     <Text style={[styles.muted, { marginTop: 10 }]}>
                       Preferred: {subdomainStatus.preferredChain ?? "—"} · {subdomainStatus.preferredToken ?? "—"}
                     </Text>
-                    <Pressable
-                      onPress={openEditPreferences}
-                      style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1, marginTop: 8 }]}
-                    >
-                      <Text style={[styles.muted, { color: colors.tint }]}>Edit preferences</Text>
-                    </Pressable>
+                    <View style={{ flexDirection: "row", alignItems: "center", marginTop: 8, gap: 16 }}>
+                      <Pressable onPress={openEditPreferences} style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}>
+                        <Text style={[styles.muted, { color: colors.tint }]}>Edit preferences</Text>
+                      </Pressable>
+                      <Pressable onPress={refetchSubdomain} style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}>
+                        <Text style={[styles.muted, { color: colors.tint }]}>Refresh</Text>
+                      </Pressable>
+                    </View>
                   </>
                 )}
               </Pressable>

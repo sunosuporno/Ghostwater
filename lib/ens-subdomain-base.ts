@@ -59,6 +59,13 @@ const REGISTRAR_ABI = [
     outputs: [{ type: "string" }],
   },
   {
+    name: "addressToNode",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "account", type: "address" }],
+    outputs: [{ type: "bytes32" }],
+  },
+  {
     name: "available",
     type: "function",
     stateMutability: "view",
@@ -150,13 +157,17 @@ const REGISTRY_ABI = [
 export const PREFERRED_CHAIN_KEY = "com.ghostwater.preferredChain";
 export const PREFERRED_TOKEN_KEY = "com.ghostwater.preferredToken";
 
-const BASE_RPC =
-  process.env.EXPO_PUBLIC_BASE_RPC_URL ?? "https://mainnet.base.org";
+function getBaseRpcUrl(): string {
+  if (process.env.EXPO_PUBLIC_BASE_RPC_URL) return process.env.EXPO_PUBLIC_BASE_RPC_URL;
+  const alchemyKey = process.env.EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_MAINNET ?? process.env.EXPO_PUBLIC_ALCHEMY_API_KEY;
+  if (alchemyKey) return `https://base-mainnet.g.alchemy.com/v2/${alchemyKey}`;
+  return "https://mainnet.base.org";
+}
 
 function getPublicClient() {
   return createPublicClient({
     chain: base,
-    transport: http(BASE_RPC),
+    transport: http(getBaseRpcUrl()),
   });
 }
 
@@ -185,51 +196,57 @@ export async function fetchSubdomainStatus(
     client,
   });
 
-  const [hasSubdomain, label] = await Promise.all([
+  const [hasSubdomain, label, node] = await Promise.all([
     registrar.read.hasSubdomain([userAddress]),
     registrar.read.addressToLabel([userAddress]),
+    registrar.read.addressToNode([userAddress]),
   ]);
+
+  const registrarRegistryAddress = (await registrar.read.registry()) as Address;
+  const registryForBase = getContract({
+    address: registrarRegistryAddress,
+    abi: REGISTRY_ABI,
+    client,
+  });
 
   let baseName: string | null = null;
   try {
-    const registryAddress = await registrar.read.registry();
-    const registry = getContract({
-      address: registryAddress as Address,
-      abi: REGISTRY_ABI,
-      client,
-    });
-    const baseNode = await registry.read.baseNode();
-    const nameBytes = await registry.read.names([baseNode]);
-    baseName = await registry.read.decodeName([nameBytes]);
+    const baseNode = await registryForBase.read.baseNode();
+    const nameBytes = await registryForBase.read.names([baseNode]);
+    baseName = await registryForBase.read.decodeName([nameBytes]);
   } catch {
     // ignore
   }
 
+  const zeroNodeHex = "0x0000000000000000000000000000000000000000000000000000000000000000" as const;
+  const hasNode =
+    node != null &&
+    (typeof node === "string" ? node !== zeroNodeHex : (node as bigint) !== 0n);
   const fullName =
-    hasSubdomain && label && baseName && label.length > 0
-      ? `${label}.${baseName}`
+    hasSubdomain && label && label.length > 0
+      ? baseName
+        ? `${label}.${baseName}`
+        : label
       : null;
 
   let preferredChain: string | null = null;
   let preferredToken: string | null = null;
-  if (hasSubdomain && label && label.length > 0) {
+  const registryForTextAddress = getL2RegistryAddress() ?? registrarRegistryAddress;
+  const registryForText = getContract({
+    address: registryForTextAddress,
+    abi: REGISTRY_ABI,
+    client,
+  });
+  if (hasSubdomain && hasNode) {
     try {
-      const registryAddress = await registrar.read.registry();
-      const registry = getContract({
-        address: registryAddress as Address,
-        abi: REGISTRY_ABI,
-        client,
-      });
-      const baseNode = await registry.read.baseNode();
-      const node = await registry.read.makeNode([baseNode, label]);
       const [chainVal, tokenVal] = await Promise.all([
-        registry.read.text([node, PREFERRED_CHAIN_KEY]),
-        registry.read.text([node, PREFERRED_TOKEN_KEY]),
+        registryForText.read.text([node, PREFERRED_CHAIN_KEY]),
+        registryForText.read.text([node, PREFERRED_TOKEN_KEY]),
       ]);
       preferredChain = chainVal && chainVal.length > 0 ? chainVal : null;
       preferredToken = tokenVal && tokenVal.length > 0 ? tokenVal : null;
     } catch {
-      // text records may not exist yet or registry may not support text()
+      // text records may not exist or registry may not support text()
     }
   }
 
@@ -301,6 +318,13 @@ export function getRegisterWithPreferencesCalldata(
 
 export function getRegistrarAddress(): Address | null {
   const addr = process.env.EXPO_PUBLIC_GHOSTWATER_REGISTRAR_ADDRESS;
+  if (!addr || !addr.startsWith("0x")) return null;
+  return addr as Address;
+}
+
+/** L2 Registry address (for reading text records). Prefer env so we read from the same registry the registrar uses. */
+export function getL2RegistryAddress(): Address | null {
+  const addr = process.env.EXPO_PUBLIC_L2_REGISTRY_ADDRESS;
   if (!addr || !addr.startsWith("0x")) return null;
   return addr as Address;
 }
