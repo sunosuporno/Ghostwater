@@ -175,6 +175,8 @@ export default function HomeScreen() {
   const [baseSendLoading, setBaseSendLoading] = useState(false);
   const [baseSendError, setBaseSendError] = useState<string | null>(null);
   const [baseSendSuccess, setBaseSendSuccess] = useState<string | null>(null);
+  const [baseSendTxHash, setBaseSendTxHash] = useState<string | null>(null);
+  const [baseTxHashCopied, setBaseTxHashCopied] = useState(false);
   const { signRawHash } = useSignRawHash();
 
   const refetchBalances = useCallback(() => {
@@ -532,6 +534,7 @@ export default function HomeScreen() {
 
     setBaseSendError(null);
     setBaseSendSuccess(null);
+    setBaseSendTxHash(null);
     setBaseSendLoading(true);
     try {
       const provider = await (embeddedEthWallet as any).getProvider();
@@ -606,9 +609,11 @@ export default function HomeScreen() {
         });
       }
 
+      const hashStr = String(txHash);
       setBaseSendSuccess(
-        `Transaction sent on ${currentNetwork.shortLabel}. Tx hash: ${String(txHash)}`
+        `Transaction sent on ${currentNetwork.shortLabel}. Tx hash: ${hashStr}`
       );
+      setBaseSendTxHash(hashStr);
       setBaseAmount("");
       setBaseDestination("");
       setBaseAmountExceedsBalance(false);
@@ -1071,6 +1076,7 @@ export default function HomeScreen() {
                 setBaseAmount(t);
                 setBaseSendError(null);
                 setBaseSendSuccess(null);
+                setBaseSendTxHash(null);
                 validateBaseAmount(t);
               }}
               keyboardType="decimal-pad"
@@ -1099,6 +1105,7 @@ export default function HomeScreen() {
                 setBaseDestination(t);
                 setBaseSendError(null);
                 setBaseSendSuccess(null);
+                setBaseSendTxHash(null);
               }}
               autoCapitalize="none"
               autoCorrect={false}
@@ -1107,9 +1114,42 @@ export default function HomeScreen() {
               <Text style={styles.error}>{baseSendError}</Text>
             ) : null}
             {baseSendSuccess ? (
-              <Text style={[styles.muted, { color: "#22c55e" }]}>
-                {baseSendSuccess}
-              </Text>
+              <View style={{ marginBottom: 8 }}>
+                <Text style={[styles.muted, { color: "#22c55e" }]}>
+                  Transaction sent on {currentNetwork.shortLabel}. Tx hash:{" "}
+                </Text>
+                {baseSendTxHash ? (
+                  <Pressable
+                    onPress={() => {
+                      Clipboard.setString(baseSendTxHash);
+                      setBaseTxHashCopied(true);
+                      setTimeout(() => setBaseTxHashCopied(false), 2000);
+                    }}
+                    style={({ pressed }) => ({ opacity: pressed ? 0.8 : 1 })}
+                  >
+                    <Text
+                      style={[
+                        styles.muted,
+                        {
+                          color: "#22c55e",
+                          textDecorationLine: "underline",
+                        },
+                      ]}
+                      selectable
+                    >
+                      {baseSendTxHash}
+                      {baseTxHashCopied ? " — Copied!" : " (tap to copy)"}
+                    </Text>
+                  </Pressable>
+                ) : (
+                  <Text
+                    style={[styles.muted, { color: "#22c55e" }]}
+                    selectable
+                  >
+                    {baseSendSuccess.replace(/^.*Tx hash: /, "")}
+                  </Text>
+                )}
+              </View>
             ) : null}
             <Pressable
               onPress={handleSendBase}

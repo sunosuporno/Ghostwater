@@ -16,6 +16,8 @@ export type NetworkCapabilities = {
   showSuiWallet: boolean;
   /** Whether EVM-style wallet UI (e.g. Base) should be rendered. */
   showEvmWallet: boolean;
+  /** Whether features exclusive to Base mainnet (L2) should be shown. */
+  showBaseMainnetExclusiveFeature: boolean;
 };
 
 export type NetworkConfig = {
@@ -42,6 +44,7 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: true,
       showSuiWallet: true,
       showEvmWallet: false,
+      showBaseMainnetExclusiveFeature: false,
     },
   },
   {
@@ -56,6 +59,7 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: false,
       showSuiWallet: false,
       showEvmWallet: true,
+      showBaseMainnetExclusiveFeature: false,
     },
   },
   {
@@ -70,9 +74,15 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: false,
       showSuiWallet: false,
       showEvmWallet: true,
+      showBaseMainnetExclusiveFeature: true,
     },
   },
 ];
+
+/** True when the current or given network is Base mainnet (L2). Use for features exclusive to Base mainnet. */
+export function isBaseMainnet(networkId: NetworkId): networkId is "base-mainnet" {
+  return networkId === "base-mainnet";
+}
 
 type NetworkContextValue = {
   currentNetworkId: NetworkId;
