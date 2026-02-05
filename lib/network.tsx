@@ -7,7 +7,7 @@ import React, {
   type ReactNode,
 } from "react";
 
-export type NetworkId = "sui-mainnet" | "base-sepolia";
+export type NetworkId = "sui-mainnet" | "base-sepolia" | "base-mainnet";
 
 export type NetworkCapabilities = {
   /** Whether the Margin tab and trading screens should be visible. */
@@ -25,6 +25,8 @@ export type NetworkConfig = {
   description: string;
   kind: "sui" | "evm";
   accentColor: string;
+  /** EVM chainId (hex) when kind === "evm". Used for wallet_switchEthereumChain and tx params. */
+  evmChainId?: string;
   capabilities: NetworkCapabilities;
 };
 
@@ -49,6 +51,21 @@ export const NETWORKS: NetworkConfig[] = [
     description: "Experimental L2 test network. No margin trading here yet.",
     kind: "evm",
     accentColor: "#4C6FFF",
+    evmChainId: "0x14a34", // 84532
+    capabilities: {
+      showMarginTab: false,
+      showSuiWallet: false,
+      showEvmWallet: true,
+    },
+  },
+  {
+    id: "base-mainnet",
+    label: "Base",
+    shortLabel: "Base",
+    description: "Base L2 mainnet. No margin trading here yet.",
+    kind: "evm",
+    accentColor: "#0052FF",
+    evmChainId: "0x2105", // 8453
     capabilities: {
       showMarginTab: false,
       showSuiWallet: false,

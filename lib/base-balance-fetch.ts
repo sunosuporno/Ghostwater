@@ -1,10 +1,18 @@
 /**
- * Fetch Base Sepolia token balances using Alchemy Portfolio "Tokens By Wallet" API.
+ * Fetch Base (mainnet or Sepolia) token balances using Alchemy Portfolio "Tokens By Wallet" API.
  *
  * This is safe to use in React Native – it uses plain fetch against the
- * Alchemy data API endpoint. You MUST configure an Alchemy API key in
- * EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA.
+ * Alchemy data API endpoint. Configure EXPO_PUBLIC_ALCHEMY_API_KEY (or
+ * EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA for testnet).
  */
+
+export type BaseNetworkId = "base-sepolia" | "base-mainnet";
+
+/** Alchemy Portfolio API network identifiers (see dashboard.alchemy.com/chains). */
+const ALCHEMY_NETWORK: Record<BaseNetworkId, string> = {
+  "base-sepolia": "base-sepolia",
+  "base-mainnet": "base-mainnet",
+};
 
 const ALCHEMY_PORTFOLIO_BASE_URL =
   "https://api.g.alchemy.com/data/v1" as const;
@@ -52,22 +60,31 @@ function formatTokenBalance(raw: string, decimals: number): string {
 }
 
 /**
- * Fetch fungible token balances on Base Sepolia for a given EVM address.
+ * Fetch fungible token balances on Base (Sepolia or mainnet) for a given EVM address.
  * Returns native token and ERC-20s with formatted values.
  */
-export async function fetchAllBaseSepoliaBalances(
-  address: string
+export async function fetchAllBaseBalances(
+  address: string,
+  networkId: BaseNetworkId = "base-sepolia"
 ): Promise<BaseBalanceItem[]> {
   const apiKey =
-    process.env.EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA ??
-    process.env.EXPO_PUBLIC_ALCHEMY_API_KEY ??
-    "";
+    networkId === "base-mainnet"
+      ? (process.env.EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_MAINNET ??
+        process.env.EXPO_PUBLIC_ALCHEMY_API_KEY ??
+        "")
+      : (process.env.EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA ??
+        process.env.EXPO_PUBLIC_ALCHEMY_API_KEY ??
+        "");
 
   if (!apiKey) {
     throw new Error(
-      "Missing EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA (or EXPO_PUBLIC_ALCHEMY_API_KEY)."
+      networkId === "base-mainnet"
+        ? "Missing EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_MAINNET (or EXPO_PUBLIC_ALCHEMY_API_KEY)."
+        : "Missing EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA (or EXPO_PUBLIC_ALCHEMY_API_KEY)."
     );
   }
+
+  const alchemyNetwork = ALCHEMY_NETWORK[networkId];
 
   const url = `${ALCHEMY_PORTFOLIO_BASE_URL}/${encodeURIComponent(
     apiKey
@@ -80,7 +97,7 @@ export async function fetchAllBaseSepoliaBalances(
       addresses: [
         {
           address,
-          networks: ["base-sepolia"],
+          networks: [alchemyNetwork],
         },
       ],
       withMetadata: true,
@@ -130,8 +147,28 @@ export async function fetchAllBaseSepoliaBalances(
         formatted,
       };
     })
-    // Filter out true zero balances to keep the list small
-    .filter((b) => b.rawBalance !== "0");
+    // Filter out zero balances (use BigInt so we catch "0", "0.0", etc.)
+    .filter((b) => {
+      try {
+        return BigInt(b.rawBalance) !== BigInt(0);
+      } catch {
+        return false;
+      }
+    });
+
+  // If everything was zero, return a single "0 ETH" row so the UI shows one line only
+  if (balances.length === 0) {
+    return [
+      {
+        tokenAddress: null,
+        rawBalance: "0",
+        symbol: "ETH",
+        name: "Ether",
+        decimals: 18,
+        formatted: "0",
+      },
+    ];
+  }
 
   // Native ETH-like token first, then others alphabetically
   return balances.sort((a, b) => {
@@ -141,5 +178,12 @@ export async function fetchAllBaseSepoliaBalances(
     if (!isNativeA && isNativeB) return 1;
     return a.symbol.localeCompare(b.symbol);
   });
+}
+
+/** @deprecated Use fetchAllBaseBalances(address, "base-sepolia") instead. */
+export async function fetchAllBaseSepoliaBalances(
+  address: string
+): Promise<BaseBalanceItem[]> {
+  return fetchAllBaseBalances(address, "base-sepolia");
 }
 

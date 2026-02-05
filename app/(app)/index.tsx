@@ -25,7 +25,10 @@ import {
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
 import { NETWORKS, useNetwork } from "@/lib/network";
-import { fetchAllBaseSepoliaBalances } from "@/lib/base-balance-fetch";
+import {
+  fetchAllBaseBalances,
+  type BaseNetworkId,
+} from "@/lib/base-balance-fetch";
 import { fetchAllSuiBalances } from "../../lib/sui-balance-fetch";
 import {
   publicKeyToHex,
@@ -190,7 +193,10 @@ export default function HomeScreen() {
   }, [suiAddress]);
 
   const refetchBaseBalances = useCallback(() => {
-    if (!evmAddress || currentNetwork.id !== "base-sepolia") {
+    const isBase =
+      currentNetwork.id === "base-sepolia" ||
+      currentNetwork.id === "base-mainnet";
+    if (!evmAddress || !isBase) {
       setBaseBalances([]);
       setBaseBalanceError(null);
       setBaseBalanceLoading(false);
@@ -198,7 +204,7 @@ export default function HomeScreen() {
     }
     setBaseBalanceError(null);
     setBaseBalanceLoading(true);
-    fetchAllBaseSepoliaBalances(evmAddress)
+    fetchAllBaseBalances(evmAddress, currentNetwork.id as BaseNetworkId)
       .then(setBaseBalances)
       .catch((err) => {
         setBaseBalanceError(
@@ -219,9 +225,12 @@ export default function HomeScreen() {
     refetchBalances();
   }, [suiAddress]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Initial fetch when EVM/Base address is set and network is Base Sepolia
+  // Initial fetch when EVM/Base address is set and network is Base (Sepolia or mainnet)
   useEffect(() => {
-    if (!evmAddress || currentNetwork.id !== "base-sepolia") {
+    const isBase =
+      currentNetwork.id === "base-sepolia" ||
+      currentNetwork.id === "base-mainnet";
+    if (!evmAddress || !isBase) {
       setBaseBalances([]);
       setBaseBalanceError(null);
       setSelectedBaseToken(null);
@@ -252,9 +261,12 @@ export default function HomeScreen() {
     return () => clearInterval(id);
   }, [suiAddress, refetchBalances]);
 
-  // Auto-refresh Base balances every 5 min when on Base Sepolia
+  // Auto-refresh Base balances every 5 min when on Base (Sepolia or mainnet)
   useEffect(() => {
-    if (!evmAddress || currentNetwork.id !== "base-sepolia") return;
+    const isBase =
+      currentNetwork.id === "base-sepolia" ||
+      currentNetwork.id === "base-mainnet";
+    if (!evmAddress || !isBase) return;
     const id = setInterval(refetchBaseBalances, BALANCE_REFRESH_INTERVAL_MS);
     return () => clearInterval(id);
   }, [evmAddress, currentNetwork.id, refetchBaseBalances]);
@@ -524,22 +536,26 @@ export default function HomeScreen() {
     try {
       const provider = await (embeddedEthWallet as any).getProvider();
 
-      // Ensure embedded wallet is on Base Sepolia before sending.
+      const chainIdHex = currentNetwork.evmChainId;
+      if (!chainIdHex) {
+        throw new Error("Current network is not configured for EVM sends.");
+      }
+
+      // Ensure embedded wallet is on the correct chain (Base Sepolia or Base mainnet) before sending.
       try {
         const currentChainId = (await provider.request({
           method: "eth_chainId",
         })) as string;
 
-        // Base Sepolia: chainId 84532 (0x14a34)
-        if (currentChainId !== "0x14a34") {
+        if (currentChainId !== chainIdHex) {
           await provider.request({
             method: "wallet_switchEthereumChain",
-            params: [{ chainId: "0x14a34" }],
+            params: [{ chainId: chainIdHex }],
           });
         }
       } catch (switchErr) {
         throw new Error(
-          "Failed to switch embedded wallet to Base Sepolia. Make sure Base Sepolia is enabled for your Privy app."
+          `Failed to switch embedded wallet to ${currentNetwork.shortLabel}. Make sure this network is enabled for your Privy app.`
         );
       }
 
@@ -550,10 +566,6 @@ export default function HomeScreen() {
       if (!from) {
         throw new Error("No account found in embedded Ethereum wallet");
       }
-
-      // Base Sepolia chainId (84532). Other platforms (Swift, Android, Flutter) pass chainId for
-      // non-mainnet so the wallet knows which chain to use when populating gas. RN doc omits it.
-      const chainIdHex = "0x14a34";
 
       let txHash: unknown;
 
@@ -595,7 +607,7 @@ export default function HomeScreen() {
       }
 
       setBaseSendSuccess(
-        `Transaction sent on Base Sepolia. Tx hash: ${String(txHash)}`
+        `Transaction sent on ${currentNetwork.shortLabel}. Tx hash: ${String(txHash)}`
       );
       setBaseAmount("");
       setBaseDestination("");
@@ -610,6 +622,7 @@ export default function HomeScreen() {
   }, [
     evmAddress,
     embeddedEthWallet,
+    currentNetwork,
     baseDestination,
     baseAmount,
     selectedBaseToken,
