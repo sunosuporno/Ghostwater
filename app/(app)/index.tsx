@@ -1,6 +1,6 @@
 import { Text } from "@/components/Themed";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
-import { usePrivy } from "@privy-io/expo";
+import { usePrivy, useEmbeddedEthereumWallet } from "@privy-io/expo";
 import {
   useCreateWallet,
   useSignRawHash,
@@ -25,6 +25,7 @@ import {
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
 import { NETWORKS, useNetwork } from "@/lib/network";
+import { fetchAllBaseSepoliaBalances } from "@/lib/base-balance-fetch";
 import { fetchAllSuiBalances } from "../../lib/sui-balance-fetch";
 import {
   publicKeyToHex,
@@ -108,6 +109,7 @@ export default function HomeScreen() {
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
   const { user, logout } = usePrivy();
+  const { wallets: embeddedEthWallets } = useEmbeddedEthereumWallet();
   const { createWallet: createSuiWallet } = useCreateWallet();
 
   const { currentNetwork, setCurrentNetworkId } = useNetwork();
@@ -149,6 +151,27 @@ export default function HomeScreen() {
   >([]);
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [balanceError, setBalanceError] = useState<string | null>(null);
+  const [baseBalances, setBaseBalances] = useState<
+    Array<{
+      tokenAddress: string | null;
+      rawBalance: string;
+      symbol: string;
+      formatted: string;
+      decimals: number;
+    }>
+  >([]);
+  const [baseBalanceLoading, setBaseBalanceLoading] = useState(false);
+  const [baseBalanceError, setBaseBalanceError] = useState<string | null>(null);
+  const [selectedBaseToken, setSelectedBaseToken] = useState<string | null>(
+    null
+  );
+  const [baseAmount, setBaseAmount] = useState("");
+  const [baseDestination, setBaseDestination] = useState("");
+  const [baseAmountExceedsBalance, setBaseAmountExceedsBalance] =
+    useState(false);
+  const [baseSendLoading, setBaseSendLoading] = useState(false);
+  const [baseSendError, setBaseSendError] = useState<string | null>(null);
+  const [baseSendSuccess, setBaseSendSuccess] = useState<string | null>(null);
   const { signRawHash } = useSignRawHash();
 
   const refetchBalances = useCallback(() => {
@@ -166,6 +189,26 @@ export default function HomeScreen() {
       .finally(() => setBalanceLoading(false));
   }, [suiAddress]);
 
+  const refetchBaseBalances = useCallback(() => {
+    if (!evmAddress || currentNetwork.id !== "base-sepolia") {
+      setBaseBalances([]);
+      setBaseBalanceError(null);
+      setBaseBalanceLoading(false);
+      return;
+    }
+    setBaseBalanceError(null);
+    setBaseBalanceLoading(true);
+    fetchAllBaseSepoliaBalances(evmAddress)
+      .then(setBaseBalances)
+      .catch((err) => {
+        setBaseBalanceError(
+          err instanceof Error ? err.message : "Failed to load balances"
+        );
+        setBaseBalances([]);
+      })
+      .finally(() => setBaseBalanceLoading(false));
+  }, [evmAddress, currentNetwork.id]);
+
   // Initial fetch when Sui address is set
   useEffect(() => {
     if (!suiAddress) {
@@ -176,12 +219,45 @@ export default function HomeScreen() {
     refetchBalances();
   }, [suiAddress]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Initial fetch when EVM/Base address is set and network is Base Sepolia
+  useEffect(() => {
+    if (!evmAddress || currentNetwork.id !== "base-sepolia") {
+      setBaseBalances([]);
+      setBaseBalanceError(null);
+      setSelectedBaseToken(null);
+      return;
+    }
+    refetchBaseBalances();
+  }, [evmAddress, currentNetwork.id, refetchBaseBalances]);
+
+  // Keep selected Base token in sync with balances; default to first balance
+  useEffect(() => {
+    if (baseBalances.length === 0) {
+      if (selectedBaseToken !== null) setSelectedBaseToken(null);
+      return;
+    }
+    const exists = baseBalances.some(
+      (b) => (b.tokenAddress ?? "native") === selectedBaseToken
+    );
+    if (!exists) {
+      const first = baseBalances[0];
+      setSelectedBaseToken(first.tokenAddress ?? "native");
+    }
+  }, [baseBalances, selectedBaseToken]);
+
   // Auto-refresh every 5 min
   useEffect(() => {
     if (!suiAddress) return;
     const id = setInterval(refetchBalances, BALANCE_REFRESH_INTERVAL_MS);
     return () => clearInterval(id);
   }, [suiAddress, refetchBalances]);
+
+  // Auto-refresh Base balances every 5 min when on Base Sepolia
+  useEffect(() => {
+    if (!evmAddress || currentNetwork.id !== "base-sepolia") return;
+    const id = setInterval(refetchBaseBalances, BALANCE_REFRESH_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [evmAddress, currentNetwork.id, refetchBaseBalances]);
 
   // Refresh when screen gains focus (e.g. tab switch back to Home)
   useFocusEffect(
@@ -262,6 +338,53 @@ export default function HomeScreen() {
     setTimeout(() => setCopiedAddress(false), 2000);
   }, [suiAddress]);
 
+  const copyEvmAddress = useCallback(() => {
+    if (!evmAddress) return;
+    Clipboard.setString(evmAddress);
+    setCopiedAddress(true);
+    setTimeout(() => setCopiedAddress(false), 2000);
+  }, [evmAddress]);
+
+  // Use the first embedded Ethereum wallet for Base Sepolia sends.
+  const embeddedEthWallet = embeddedEthWallets?.[0] ?? null;
+
+  const validateBaseAmount = useCallback(
+    (amountStr: string) => {
+      const num = parseFloat(amountStr);
+      if (
+        amountStr.trim() === "" ||
+        isNaN(num) ||
+        num <= 0 ||
+        !selectedBaseToken
+      ) {
+        setBaseAmountExceedsBalance(false);
+        return;
+      }
+      const token = baseBalances.find(
+        (b) => (b.tokenAddress ?? "native") === selectedBaseToken
+      );
+      if (!token) {
+        setBaseAmountExceedsBalance(false);
+        return;
+      }
+      const decimals = token.decimals;
+      const rawBalance = token.rawBalance;
+      const amountRaw = BigInt(
+        Math.round(num * Math.pow(10, decimals ?? 18))
+      );
+      if (amountRaw > BigInt(rawBalance)) {
+        setBaseAmountExceedsBalance(true);
+        Alert.alert(
+          "Amount exceeds balance",
+          `You don't have enough ${token.symbol}. Max: ${token.formatted} ${token.symbol}.`
+        );
+      } else {
+        setBaseAmountExceedsBalance(false);
+      }
+    },
+    [baseBalances, selectedBaseToken]
+  );
+
   // Sui: get existing or create, then show address and public key (needed for sending)
   useEffect(() => {
     let cancelled = false;
@@ -319,15 +442,180 @@ export default function HomeScreen() {
     };
   }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // EVM / Base-style address (no margin trading – just surfaced from Privy).
+  // EVM / Base-style address – mirror Sui flow by using the embedded Ethereum wallet
+  // as the single source of truth for the Base account.
   useEffect(() => {
-    const wallet = getEvmWalletFromUser(user);
-    setEvmAddress(wallet?.address ?? null);
-  }, [user?.id, user?.linked_accounts, user?.linkedAccounts]);
+    let cancelled = false;
+
+    const run = async () => {
+      if (!embeddedEthWallet) {
+        if (!cancelled) setEvmAddress(null);
+        return;
+      }
+      try {
+        const provider = await (embeddedEthWallet as any).getProvider();
+        const accounts = (await provider.request({
+          method: "eth_requestAccounts",
+        })) as string[];
+        if (!cancelled) {
+          setEvmAddress(accounts?.[0] ?? null);
+        }
+      } catch {
+        if (!cancelled) setEvmAddress(null);
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [embeddedEthWallet]);
 
   const handleLogout = useCallback(() => {
     logout();
   }, [logout]);
+
+  const handleSendBase = useCallback(async () => {
+    if (!evmAddress?.trim()) {
+      setBaseSendError("No Base wallet address");
+      return;
+    }
+    if (!embeddedEthWallet) {
+      setBaseSendError("No Privy EVM wallet available for sending.");
+      return;
+    }
+    let recipient = baseDestination.trim();
+    if (!recipient) {
+      setBaseSendError("Enter destination address");
+      return;
+    }
+    if (!recipient.startsWith("0x")) {
+      recipient = "0x" + recipient;
+    }
+    const amountNum = parseFloat(baseAmount);
+    if (isNaN(amountNum) || amountNum <= 0) {
+      setBaseSendError("Enter a valid amount");
+      return;
+    }
+    if (!selectedBaseToken) {
+      setBaseSendError("Select a token");
+      return;
+    }
+    const token = baseBalances.find(
+      (b) => (b.tokenAddress ?? "native") === selectedBaseToken
+    );
+    if (!token) {
+      setBaseSendError("Selected token not found");
+      return;
+    }
+    const decimals = token.decimals;
+    const rawBalance = token.rawBalance;
+    const amountRaw = BigInt(
+      Math.round(amountNum * Math.pow(10, decimals ?? 18))
+    );
+    if (amountRaw > BigInt(rawBalance)) {
+      setBaseSendError("Amount exceeds your balance");
+      return;
+    }
+
+    setBaseSendError(null);
+    setBaseSendSuccess(null);
+    setBaseSendLoading(true);
+    try {
+      const provider = await (embeddedEthWallet as any).getProvider();
+
+      // Ensure embedded wallet is on Base Sepolia before sending.
+      try {
+        const currentChainId = (await provider.request({
+          method: "eth_chainId",
+        })) as string;
+
+        // Base Sepolia: chainId 84532 (0x14a34)
+        if (currentChainId !== "0x14a34") {
+          await provider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: "0x14a34" }],
+          });
+        }
+      } catch (switchErr) {
+        throw new Error(
+          "Failed to switch embedded wallet to Base Sepolia. Make sure Base Sepolia is enabled for your Privy app."
+        );
+      }
+
+      const accounts = (await provider.request({
+        method: "eth_requestAccounts",
+      })) as string[];
+      const from = accounts?.[0];
+      if (!from) {
+        throw new Error("No account found in embedded Ethereum wallet");
+      }
+
+      // Base Sepolia chainId (84532). Other platforms (Swift, Android, Flutter) pass chainId for
+      // non-mainnet so the wallet knows which chain to use when populating gas. RN doc omits it.
+      const chainIdHex = "0x14a34";
+
+      let txHash: unknown;
+
+      if (token.tokenAddress === null) {
+        const valueHex = "0x" + amountRaw.toString(16);
+        const tx = {
+          from,
+          to: recipient,
+          value: valueHex,
+          chainId: chainIdHex,
+          gasLimit: "0x5208", // 21000
+        };
+        console.log("[Base send] Native ETH tx params", tx);
+        txHash = await provider.request({
+          method: "eth_sendTransaction",
+          params: [tx],
+        });
+      } else {
+        const selector = "0xa9059cbb";
+        const addr = recipient.toLowerCase().replace(/^0x/, "");
+        const paddedAddress = addr.padStart(64, "0");
+        const valueHex = amountRaw.toString(16);
+        const paddedValue = valueHex.padStart(64, "0");
+        const data = selector + paddedAddress + paddedValue;
+
+        const tx = {
+          from,
+          to: token.tokenAddress,
+          value: "0x0",
+          data,
+          chainId: chainIdHex,
+          gasLimit: "0x186A0", // 100000
+        };
+        console.log("[Base send] ERC20 tx params", tx);
+        txHash = await provider.request({
+          method: "eth_sendTransaction",
+          params: [tx],
+        });
+      }
+
+      setBaseSendSuccess(
+        `Transaction sent on Base Sepolia. Tx hash: ${String(txHash)}`
+      );
+      setBaseAmount("");
+      setBaseDestination("");
+      setBaseAmountExceedsBalance(false);
+      refetchBaseBalances();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Send failed";
+      setBaseSendError(msg);
+    } finally {
+      setBaseSendLoading(false);
+    }
+  }, [
+    evmAddress,
+    embeddedEthWallet,
+    baseDestination,
+    baseAmount,
+    selectedBaseToken,
+    baseBalances,
+    refetchBaseBalances,
+  ]);
 
   const handleSend = useCallback(async () => {
     if (!suiAddress?.trim()) {
@@ -603,18 +891,28 @@ export default function HomeScreen() {
               {currentNetwork.label} wallet (Privy)
             </Text>
             {evmAddress ? (
-              <>
+              <Pressable
+                onPress={copyEvmAddress}
+                style={({ pressed }) => [{ opacity: pressed ? 0.8 : 1 }]}
+              >
                 <Text style={styles.address} selectable>
                   {evmAddress}
                 </Text>
                 <Text style={styles.addressShort}>
                   {truncateAddress(evmAddress)}
                 </Text>
+                {copiedAddress && (
+                  <Text
+                    style={[styles.muted, { color: "#22c55e", marginTop: 8 }]}
+                  >
+                    Copied!
+                  </Text>
+                )}
                 <Text style={styles.muted}>
                   This network is wallet-only. Margin trading and deep liquidity
                   are available on Sui.
                 </Text>
-              </>
+              </Pressable>
             ) : (
               <Text style={styles.muted}>
                 No {currentNetwork.label} wallet linked yet. You can add one in
@@ -627,10 +925,66 @@ export default function HomeScreen() {
             <Text style={styles.cardLabel}>
               {currentNetwork.label} balances
             </Text>
-            <Text style={styles.muted}>
-              Balance fetching for this network will live here. For now, this is
-              a placeholder using the same layout as Sui.
-            </Text>
+            {evmAddress ? (
+              <>
+                <View
+                  style={{
+                    flexDirection: "row",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    marginBottom: 4,
+                  }}
+                >
+                  <Text style={styles.cardLabel}>Balances</Text>
+                  <Pressable
+                    onPress={refetchBaseBalances}
+                    disabled={baseBalanceLoading}
+                    style={({ pressed }) => ({
+                      padding: 6,
+                      opacity: baseBalanceLoading ? 0.6 : pressed ? 0.8 : 1,
+                    })}
+                    hitSlop={8}
+                  >
+                    <FontAwesome
+                      name="refresh"
+                      size={18}
+                      color={colors.tint}
+                    />
+                  </Pressable>
+                </View>
+                {baseBalanceLoading ? (
+                  <ActivityIndicator
+                    size="small"
+                    color={colors.tint}
+                    style={{ marginTop: 4 }}
+                  />
+                ) : baseBalanceError ? (
+                  <Text style={styles.error}>{baseBalanceError}</Text>
+                ) : baseBalances.length > 0 ? (
+                  baseBalances.map((b) => (
+                    <View
+                      key={b.tokenAddress ?? "native"}
+                      style={{
+                        flexDirection: "row",
+                        marginTop: 4,
+                        gap: 8,
+                      }}
+                    >
+                      <Text style={styles.address}>
+                        {b.formatted} {b.symbol}
+                      </Text>
+                    </View>
+                  ))
+                ) : (
+                  <Text style={styles.muted}>No tokens</Text>
+                )}
+              </>
+            ) : (
+              <Text style={styles.muted}>
+                No {currentNetwork.label} wallet linked yet. You can add one in
+                your Privy account.
+              </Text>
+            )}
           </View>
 
           <View style={styles.card}>
@@ -640,25 +994,49 @@ export default function HomeScreen() {
             <Text style={[styles.inputLabel, { color: colors.text }]}>
               Token
             </Text>
-            <View
+            <Pressable
+              onPress={() => {
+                // Simple picker: cycle through tokens; could be replaced by a modal list later.
+                if (baseBalances.length === 0) return;
+                if (!selectedBaseToken) {
+                  setSelectedBaseToken(
+                    baseBalances[0].tokenAddress ?? "native"
+                  );
+                  return;
+                }
+                const idx = baseBalances.findIndex(
+                  (b) => (b.tokenAddress ?? "native") === selectedBaseToken
+                );
+                const next =
+                  baseBalances[(idx + 1) % baseBalances.length] ??
+                  baseBalances[0];
+                setSelectedBaseToken(next.tokenAddress ?? "native");
+                setBaseAmountExceedsBalance(false);
+              }}
               style={[
                 styles.input,
                 styles.dropdown,
                 {
                   borderColor: colors.tabIconDefault,
-                  opacity: 0.6,
                 },
               ]}
             >
-              <Text style={{ fontSize: 14, color: colors.tabIconDefault }}>
-                Coming soon
+              <Text style={{ fontSize: 14, color: colors.text }}>
+                {(() => {
+                  if (baseBalances.length === 0) return "No tokens";
+                  const token = baseBalances.find(
+                    (b) => (b.tokenAddress ?? "native") === selectedBaseToken
+                  );
+                  const active = token ?? baseBalances[0];
+                  return `${active.symbol} (${active.formatted} available)`;
+                })()}
               </Text>
               <FontAwesome
                 name="chevron-down"
                 size={14}
                 color={colors.tabIconDefault}
               />
-            </View>
+            </Pressable>
 
             <Text style={[styles.inputLabel, { color: colors.text }]}>
               Amount
@@ -668,14 +1046,27 @@ export default function HomeScreen() {
                 styles.input,
                 {
                   color: colors.text,
-                  borderColor: colors.tabIconDefault,
-                  opacity: 0.6,
+                  borderColor: baseAmountExceedsBalance
+                    ? "#c00"
+                    : colors.tabIconDefault,
                 },
               ]}
               placeholder="0.00"
               placeholderTextColor={colors.tabIconDefault}
-              editable={false}
+              value={baseAmount}
+              onChangeText={(t) => {
+                setBaseAmount(t);
+                setBaseSendError(null);
+                setBaseSendSuccess(null);
+                validateBaseAmount(t);
+              }}
+              keyboardType="decimal-pad"
+              autoCapitalize="none"
+              autoCorrect={false}
             />
+            {baseAmountExceedsBalance && (
+              <Text style={styles.error}>Amount exceeds your balance</Text>
+            )}
 
             <Text style={[styles.inputLabel, { color: colors.text }]}>
               Destination address
@@ -686,33 +1077,70 @@ export default function HomeScreen() {
                 {
                   color: colors.text,
                   borderColor: colors.tabIconDefault,
-                  opacity: 0.6,
                 },
               ]}
               placeholder="0x…"
               placeholderTextColor={colors.tabIconDefault}
-              editable={false}
+              value={baseDestination}
+              onChangeText={(t) => {
+                setBaseDestination(t);
+                setBaseSendError(null);
+                setBaseSendSuccess(null);
+              }}
+              autoCapitalize="none"
+              autoCorrect={false}
             />
-            <Text style={styles.muted}>
-              Sending on {currentNetwork.shortLabel} will reuse this form, wired
-              to the Base transaction flow.
-            </Text>
+            {baseSendError ? (
+              <Text style={styles.error}>{baseSendError}</Text>
+            ) : null}
+            {baseSendSuccess ? (
+              <Text style={[styles.muted, { color: "#22c55e" }]}>
+                {baseSendSuccess}
+              </Text>
+            ) : null}
             <Pressable
-              disabled
+              onPress={handleSendBase}
+              disabled={
+                baseSendLoading ||
+                !evmAddress ||
+                !embeddedEthWallet ||
+                baseAmountExceedsBalance ||
+                !baseAmount.trim() ||
+                parseFloat(baseAmount) <= 0 ||
+                !baseDestination.trim() ||
+                !selectedBaseToken
+              }
               style={[
                 styles.primaryButton,
                 {
-                  backgroundColor: colors.tabIconDefault,
-                  opacity: 0.4,
+                  backgroundColor: colors.tint,
+                  opacity:
+                    baseSendLoading ||
+                    !evmAddress ||
+                    !embeddedEthWallet ||
+                    baseAmountExceedsBalance ||
+                    !baseAmount.trim() ||
+                    parseFloat(baseAmount) <= 0 ||
+                    !baseDestination.trim() ||
+                    !selectedBaseToken
+                      ? 0.6
+                      : 1,
                   marginTop: 8,
                 },
               ]}
             >
-              <Text
-                style={[styles.primaryButtonText, { color: colors.background }]}
-              >
-                Send (coming soon)
-              </Text>
+              {baseSendLoading ? (
+                <ActivityIndicator size="small" color={colors.background} />
+              ) : (
+                <Text
+                  style={[
+                    styles.primaryButtonText,
+                    { color: colors.background },
+                  ]}
+                >
+                  Send
+                </Text>
+              )}
             </Pressable>
           </View>
         </>
