@@ -29,6 +29,7 @@ import {
   type StoredMarginManager,
 } from "@/lib/margin-manager-storage";
 import { fetchOwnedMarginManagers } from "@/lib/owned-margin-managers-api";
+import { useNetwork } from "@/lib/network";
 import React, {
   createContext,
   useCallback,
@@ -143,17 +144,33 @@ export function TickerProvider({
   const [ticker, setTicker] = useState<Record<string, TickerEntry>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const { currentNetwork } = useNetwork();
+  const isSuiNetwork = currentNetwork.kind === "sui";
 
   const refetch = useCallback(() => {
+    if (!isSuiNetwork) {
+      // When not on Sui, ticker is a no-op: clear any existing data and stop loading.
+      setTicker({});
+      setLoading(false);
+      setError(null);
+      return;
+    }
     fetchTicker()
       .then(setTicker)
       .catch((e) =>
         setError(e instanceof Error ? e.message : "Failed to load prices")
       )
       .finally(() => setLoading(false));
-  }, []);
+  }, [isSuiNetwork]);
 
   useEffect(() => {
+    if (!isSuiNetwork) {
+      // Disable ticker polling entirely when we're on a non-Sui network.
+      setTicker({});
+      setLoading(false);
+      setError(null);
+      return;
+    }
     setLoading(true);
     setError(null);
     refetch();
@@ -162,7 +179,7 @@ export function TickerProvider({
     }
     const id = setInterval(refetch, refreshIntervalMs);
     return () => clearInterval(id);
-  }, [refetch, refreshIntervalMs]);
+  }, [refetch, refreshIntervalMs, isSuiNetwork]);
 
   const value = useMemo(
     () => ({ ticker, loading, error, refetch }),

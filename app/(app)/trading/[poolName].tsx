@@ -16,6 +16,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { PriceChart } from "@/components/PriceChart";
 import { useColorScheme } from "@/components/useColorScheme";
@@ -142,6 +143,7 @@ export default function PairDetailScreen() {
 
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
+  const insets = useSafeAreaInsets();
   const { user } = usePrivy();
   const suiAddress = getSuiAddressFromUser(user);
 
@@ -1620,13 +1622,32 @@ export default function PairDetailScreen() {
     <View style={styles.screen}>
       <ScrollView
         style={styles.scroll}
-        contentContainerStyle={styles.container}
+        contentContainerStyle={[
+          styles.container,
+          { paddingTop: insets.top + 24 },
+        ]}
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.pairHeader}>
-          <Text style={[styles.pairName, { color: colors.text }]}>
-            {displayPoolLabel}
-          </Text>
+          <View style={styles.pairHeaderTopRow}>
+            <Pressable
+              onPress={() => navigation.goBack()}
+              hitSlop={8}
+              style={({ pressed }) => ({
+                marginRight: 12,
+                opacity: pressed ? 0.7 : 1,
+              })}
+            >
+              <FontAwesome
+                name="chevron-left"
+                size={20}
+                color={colors.text}
+              />
+            </Pressable>
+            <Text style={[styles.pairName, { color: colors.text }]}>
+              {displayPoolLabel}
+            </Text>
+          </View>
           <View style={styles.priceRow}>
             <Text style={[styles.muted, { color: colors.text }]}>Price</Text>
             <View style={styles.priceWithArrow}>
@@ -3163,7 +3184,12 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   pairHeader: { marginBottom: 20 },
-  pairName: { fontSize: 28, fontWeight: "700", marginBottom: 8 },
+  pairHeaderTopRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  pairName: { fontSize: 28, fontWeight: "700" },
   priceRow: {
     flexDirection: "row",
     justifyContent: "space-between",
