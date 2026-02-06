@@ -142,6 +142,13 @@ const REGISTRY_ABI = [
     outputs: [{ type: "bytes32" }],
   },
   {
+    name: "addr",
+    type: "function",
+    stateMutability: "view",
+    inputs: [{ name: "node", type: "bytes32" }],
+    outputs: [{ type: "address" }],
+  },
+  {
     name: "text",
     type: "function",
     stateMutability: "view",
@@ -327,4 +334,46 @@ export function getL2RegistryAddress(): Address | null {
   const addr = process.env.EXPO_PUBLIC_L2_REGISTRY_ADDRESS;
   if (!addr || !addr.startsWith("0x")) return null;
   return addr as Address;
+}
+
+/** Resolve a Ghostwater subdomain (label or full name) to an EVM address via the L2 registry. */
+export async function resolveSubdomainAddress(
+  fullNameOrLabel: string
+): Promise<Address | null> {
+  const registrarAddress = getRegistrarAddress();
+  if (!registrarAddress) return null;
+
+  const raw = fullNameOrLabel.trim().toLowerCase();
+  if (!raw) return null;
+
+  // Derive label: accept "label" or "label.something"
+  const label = raw.includes(".") ? raw.split(".")[0] : raw;
+  if (!label || label.length < 3) return null;
+
+  const client = getPublicClient();
+  const registrar = getContract({
+    address: registrarAddress,
+    abi: REGISTRAR_ABI,
+    client,
+  });
+
+  // Get registry and base node
+  const registryAddress = (await registrar.read.registry()) as Address;
+  const registry = getContract({
+    address: registryAddress,
+    abi: REGISTRY_ABI,
+    client,
+  });
+
+  try {
+    const baseNode = await registry.read.baseNode();
+    const node = await registry.read.makeNode([baseNode, label]);
+    const addr = (await registry.read.addr([node])) as Address;
+    const zero =
+      "0x0000000000000000000000000000000000000000" as Address;
+    if (!addr || addr.toLowerCase() === zero.toLowerCase()) return null;
+    return addr;
+  } catch {
+    return null;
+  }
 }

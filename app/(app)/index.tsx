@@ -5,7 +5,7 @@ import {
   useCreateWallet,
   useSignRawHash,
 } from "@privy-io/expo/extended-chains";
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -34,6 +34,7 @@ import {
   getSetPreferencesCalldata,
   getRegistrarAddress,
   getRegistrarRevertMessage,
+  resolveSubdomainAddress,
   type SubdomainStatus,
 } from "@/lib/ens-subdomain-base";
 import { isBaseMainnet, NETWORKS, useNetwork } from "@/lib/network";
@@ -72,6 +73,15 @@ type LinkedAccount = {
 function truncateAddress(address: string) {
   if (!address || address.length < 12) return address;
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
+}
+
+function isHexAddress(value: string): boolean {
+  const v = value.trim();
+  return /^0x[0-9a-fA-F]{40}$/.test(v);
+}
+
+function isGhostwaterSubdomain(value: string): boolean {
+  return value.trim().toLowerCase().endsWith(".ghostwater.eth");
 }
 
 /** Time-based greeting (local time). Morning / afternoon / evening only; no "good night". */
@@ -200,7 +210,8 @@ export default function HomeScreen() {
     null
   );
   const [baseAmount, setBaseAmount] = useState("");
-  const [baseDestination, setBaseDestination] = useState("");
+  const [baseDestinationInput, setBaseDestinationInput] = useState("");
+  const [baseDestinationAddress, setBaseDestinationAddress] = useState<string | null>(null);
   const [baseAmountExceedsBalance, setBaseAmountExceedsBalance] =
     useState(false);
   const [baseSendLoading, setBaseSendLoading] = useState(false);
@@ -209,6 +220,12 @@ export default function HomeScreen() {
   const [baseSendTxHash, setBaseSendTxHash] = useState<string | null>(null);
   const [baseTxHashCopied, setBaseTxHashCopied] = useState(false);
   const [baseQrVisible, setBaseQrVisible] = useState(false);
+  const [scannedRecipient, setScannedRecipient] = useState<{
+    handle: string | null;
+    address: string;
+    preferredChain: string | null;
+    preferredToken: string | null;
+  } | null>(null);
   const { signRawHash } = useSignRawHash();
 
   // ENS subdomain (Base mainnet only)
@@ -237,6 +254,15 @@ export default function HomeScreen() {
   const [editPrefsError, setEditPrefsError] = useState<string | null>(null);
   const [editChainPickerVisible, setEditChainPickerVisible] = useState(false);
   const [editTokenPickerVisible, setEditTokenPickerVisible] = useState(false);
+
+  const urlParams = useLocalSearchParams<{
+    type?: string;
+    handle?: string;
+    address?: string;
+    token?: string;
+    chain?: string;
+  }>();
+  const [deepLinkHandled, setDeepLinkHandled] = useState(false);
 
   const refetchBalances = useCallback(() => {
     if (!suiAddress) return;
@@ -599,6 +625,55 @@ export default function HomeScreen() {
     ensureEvmWallet();
   }, [user?.id, embeddedEthWallets?.length, createPrivyWallet]);
 
+  // Handle deep links like ghostwater://?type=pay&address=...&token=USDC&handle=...
+  useEffect(() => {
+    if (deepLinkHandled) return;
+    if (!urlParams || urlParams.type !== "pay") return;
+
+    const addressParam = Array.isArray(urlParams.address)
+      ? urlParams.address[0]
+      : urlParams.address;
+    const tokenParam = Array.isArray(urlParams.token)
+      ? urlParams.token[0]
+      : urlParams.token;
+    const handleParam = Array.isArray(urlParams.handle)
+      ? urlParams.handle[0]
+      : urlParams.handle;
+    const chainParam = Array.isArray(urlParams.chain)
+      ? urlParams.chain[0]
+      : urlParams.chain;
+
+    if (!addressParam || typeof addressParam !== "string") return;
+
+    // If deep link says Base mainnet, switch network to Base mainnet so the send form is visible.
+    if (chainParam === "base-mainnet") {
+      setCurrentNetworkId("base-mainnet");
+    }
+
+    setBaseDestinationInput(handleParam ?? addressParam);
+    setBaseDestinationAddress(addressParam);
+    if (tokenParam && baseBalances.length > 0) {
+      const match = baseBalances.find(
+        (b) => b.symbol.toUpperCase() === tokenParam.toUpperCase()
+      );
+      if (match) {
+        setSelectedBaseToken(match.tokenAddress ?? "native");
+      }
+    }
+    setScannedRecipient({
+      handle: handleParam ?? null,
+      address: addressParam,
+      preferredChain: chainParam ?? null,
+      preferredToken: tokenParam ?? null,
+    });
+    setDeepLinkHandled(true);
+  }, [
+    urlParams,
+    deepLinkHandled,
+    baseBalances,
+    setCurrentNetworkId,
+  ]);
+
   // EVM / Base-style address – mirror Sui flow by using the embedded Ethereum wallet
   // as the single source of truth for the Base account.
   useEffect(() => {
@@ -641,13 +716,28 @@ export default function HomeScreen() {
       setBaseSendError("No Privy EVM wallet available for sending.");
       return;
     }
-    let recipient = baseDestination.trim();
-    if (!recipient) {
+    const rawInput = baseDestinationInput.trim();
+    if (!rawInput && !baseDestinationAddress) {
       setBaseSendError("Enter destination address");
       return;
     }
-    if (!recipient.startsWith("0x")) {
-      recipient = "0x" + recipient;
+
+    let recipient = baseDestinationAddress ?? null;
+
+    if (!recipient) {
+      if (isHexAddress(rawInput)) {
+        recipient = rawInput;
+      } else if (isGhostwaterSubdomain(rawInput)) {
+        const resolved = await resolveSubdomainAddress(rawInput);
+        if (!resolved) {
+          setBaseSendError("Ghostwater name not found");
+          return;
+        }
+        recipient = resolved;
+      } else {
+        setBaseSendError("Enter a valid 0x address or Ghostwater name");
+        return;
+      }
     }
     const amountNum = parseFloat(baseAmount);
     if (isNaN(amountNum) || amountNum <= 0) {
@@ -771,7 +861,7 @@ export default function HomeScreen() {
     evmAddress,
     embeddedEthWallet,
     currentNetwork,
-    baseDestination,
+    baseDestinationInput,
     baseAmount,
     selectedBaseToken,
     baseBalances,
@@ -1290,18 +1380,22 @@ export default function HomeScreen() {
                     </View>
                   </View>
                 )}
-                <Pressable
-                  onPress={() => setBaseQrVisible(true)}
-                  style={({ pressed }) => ({
-                    marginTop: 12,
-                    alignSelf: "flex-start",
-                    opacity: pressed ? 0.8 : 1,
-                  })}
-                >
-                  <Text style={[styles.walletActionLink, { color: colors.tint }]}>
-                    Show QR to receive
-                  </Text>
-                </Pressable>
+                {isBaseMainnet(currentNetwork.id) && subdomainStatus?.hasSubdomain && (
+                  <Pressable
+                    onPress={() => setBaseQrVisible(true)}
+                    style={({ pressed }) => ({
+                      marginTop: 12,
+                      alignSelf: "flex-start",
+                      opacity: pressed ? 0.8 : 1,
+                    })}
+                  >
+                    <Text
+                      style={[styles.walletActionLink, { color: colors.tint }]}
+                    >
+                      Show QR to receive
+                    </Text>
+                  </Pressable>
+                )}
               </>
             ) : (
               <Text style={[styles.muted, { color: colors.text }]}>
@@ -1334,16 +1428,19 @@ export default function HomeScreen() {
                     <View style={styles.qrCard}>
                       <View style={styles.qrInner}>
                         <QRCode
-                          value={JSON.stringify({
-                            type: "ghostwater-pay-v1",
-                            handle: subdomainStatus?.fullName ?? evmAddress,
-                            address: evmAddress,
-                            networkId: currentNetwork.id,
-                            preferredChain:
-                              subdomainStatus?.preferredChain ?? null,
-                            preferredToken:
-                              subdomainStatus?.preferredToken ?? null,
-                          })}
+                          value={`ghostwater://?type=pay&handle=${encodeURIComponent(
+                            subdomainStatus?.fullName ?? evmAddress
+                          )}&address=${encodeURIComponent(
+                            evmAddress
+                          )}&chain=${encodeURIComponent(
+                            currentNetwork.id
+                          )}${
+                            subdomainStatus?.preferredToken
+                              ? `&token=${encodeURIComponent(
+                                  subdomainStatus.preferredToken
+                                )}`
+                              : ""
+                          }`}
                           size={220}
                           color="#ffffff"
                           backgroundColor="transparent"
@@ -1940,9 +2037,10 @@ export default function HomeScreen() {
               ]}
               placeholder="0x…"
               placeholderTextColor={colors.tabIconDefault}
-              value={baseDestination}
+              value={baseDestinationInput}
               onChangeText={(t) => {
-                setBaseDestination(t);
+                setBaseDestinationInput(t);
+                setBaseDestinationAddress(null);
                 setBaseSendError(null);
                 setBaseSendSuccess(null);
                 setBaseSendTxHash(null);
@@ -2000,7 +2098,7 @@ export default function HomeScreen() {
                 baseAmountExceedsBalance ||
                 !baseAmount.trim() ||
                 parseFloat(baseAmount) <= 0 ||
-                !baseDestination.trim() ||
+                !baseDestinationInput.trim() ||
                 !selectedBaseToken
               }
               style={[
@@ -2014,7 +2112,7 @@ export default function HomeScreen() {
                     baseAmountExceedsBalance ||
                     !baseAmount.trim() ||
                     parseFloat(baseAmount) <= 0 ||
-                    !baseDestination.trim() ||
+                    !baseDestinationInput.trim() ||
                     !selectedBaseToken
                       ? 0.6
                       : 1,
