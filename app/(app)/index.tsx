@@ -22,6 +22,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import QRCode from "react-native-qrcode-svg";
 
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
@@ -207,6 +208,7 @@ export default function HomeScreen() {
   const [baseSendSuccess, setBaseSendSuccess] = useState<string | null>(null);
   const [baseSendTxHash, setBaseSendTxHash] = useState<string | null>(null);
   const [baseTxHashCopied, setBaseTxHashCopied] = useState(false);
+  const [baseQrVisible, setBaseQrVisible] = useState(false);
   const { signRawHash } = useSignRawHash();
 
   // ENS subdomain (Base mainnet only)
@@ -1236,23 +1238,25 @@ export default function HomeScreen() {
               {currentNetwork.label} wallet
             </Text>
             {evmAddress ? (
-              <Pressable
-                onPress={copyEvmAddress}
-                style={({ pressed }) => [{ opacity: pressed ? 0.9 : 1 }]}
-              >
-                <Text style={[styles.walletHero, { color: colors.text }]} selectable numberOfLines={1}>
-                  {isBaseMainnet(currentNetwork.id) && subdomainStatus?.fullName
-                    ? subdomainStatus.fullName
-                    : evmAddress}
-                </Text>
-                <Text style={[styles.walletShort, { color: colors.text }]}>
-                  {truncateAddress(evmAddress)}
-                </Text>
-                {copiedAddress && (
-                  <Text style={[styles.walletCopied, { color: "#22c55e" }]}>
-                    Copied
+              <>
+                <Pressable
+                  onPress={copyEvmAddress}
+                  style={({ pressed }) => [{ opacity: pressed ? 0.9 : 1 }]}
+                >
+                  <Text style={[styles.walletHero, { color: colors.text }]} selectable numberOfLines={1}>
+                    {isBaseMainnet(currentNetwork.id) && subdomainStatus?.fullName
+                      ? subdomainStatus.fullName
+                      : evmAddress}
                   </Text>
-                )}
+                  <Text style={[styles.walletShort, { color: colors.text }]}>
+                    {truncateAddress(evmAddress)}
+                  </Text>
+                  {copiedAddress && (
+                    <Text style={[styles.walletCopied, { color: "#22c55e" }]}>
+                      Copied
+                    </Text>
+                  )}
+                </Pressable>
                 {isBaseMainnet(currentNetwork.id) && subdomainStatus?.hasSubdomain && (
                   <View style={styles.walletPrefsRow}>
                     <View style={[styles.preferredPill, { backgroundColor: colors.tabIconDefault + "25", borderColor: colors.tabIconDefault + "50" }]}>
@@ -1271,13 +1275,90 @@ export default function HomeScreen() {
                     </View>
                   </View>
                 )}
-              </Pressable>
+                <Pressable
+                  onPress={() => setBaseQrVisible(true)}
+                  style={({ pressed }) => ({
+                    marginTop: 12,
+                    alignSelf: "flex-start",
+                    opacity: pressed ? 0.8 : 1,
+                  })}
+                >
+                  <Text style={[styles.walletActionLink, { color: colors.tint }]}>
+                    Show QR to receive
+                  </Text>
+                </Pressable>
+              </>
             ) : (
               <Text style={[styles.muted, { color: colors.text }]}>
                 No {currentNetwork.label} wallet linked. Add one in your Privy account.
               </Text>
             )}
           </View>
+
+          <Modal
+            visible={baseQrVisible}
+            transparent
+            animationType="fade"
+            onRequestClose={() => setBaseQrVisible(false)}
+          >
+            <Pressable
+              style={styles.modalOverlay}
+              onPress={() => setBaseQrVisible(false)}
+            >
+              <View style={styles.qrModalContent} onStartShouldSetResponder={() => true}>
+                <Text
+                  style={[
+                    styles.inputLabel,
+                    { color: colors.text, marginBottom: 12 },
+                  ]}
+                >
+                  Receive money
+                </Text>
+                {evmAddress ? (
+                  <>
+                    <View style={styles.qrCard}>
+                      <View style={styles.qrInner}>
+                        <QRCode
+                          value={JSON.stringify({
+                            type: "ghostwater-pay-v1",
+                            handle: subdomainStatus?.fullName ?? evmAddress,
+                            address: evmAddress,
+                            networkId: currentNetwork.id,
+                            preferredChain:
+                              subdomainStatus?.preferredChain ?? null,
+                            preferredToken:
+                              subdomainStatus?.preferredToken ?? null,
+                          })}
+                          size={220}
+                          color="#ffffff"
+                          backgroundColor="transparent"
+                        />
+                      </View>
+                      <Text
+                        style={[
+                          styles.qrHandle,
+                          { color: colors.text },
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {subdomainStatus?.fullName ?? truncateAddress(evmAddress)}
+                      </Text>
+                      {subdomainStatus?.preferredChain && (
+                        <Text style={styles.qrMeta}>
+                          {subdomainStatus.preferredChain} ·{" "}
+                          {subdomainStatus.preferredToken ?? "—"}
+                        </Text>
+                      )}
+                    </View>
+                  </>
+                ) : (
+                  <Text style={styles.muted}>
+                    No wallet address available.
+                  </Text>
+                )}
+              </View>
+            </Pressable>
+          </Modal>
 
           {isBaseMainnet(currentNetwork.id) && evmAddress && registrarAddress && (
             <>
@@ -2466,5 +2547,31 @@ const styles = StyleSheet.create({
     paddingVertical: 2,
     fontSize: 11,
     fontWeight: "600",
+  },
+  qrModalContent: {
+    alignItems: "center",
+  },
+  qrCard: {
+    padding: 16,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "rgba(128,128,128,0.5)",
+    backgroundColor: "rgba(15,15,15,0.95)",
+    alignItems: "center",
+  },
+  qrInner: {
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "#000",
+  },
+  qrHandle: {
+    marginTop: 12,
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  qrMeta: {
+    marginTop: 4,
+    fontSize: 13,
+    opacity: 0.7,
   },
 });
