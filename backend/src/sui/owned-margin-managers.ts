@@ -51,14 +51,19 @@ async function getManagersFromCreationEvents(
 
   // Paginate queryEvents (RPC page limit is 50) so we can scan more than the
   // most recent 50 events. Stop after a reasonable cap to avoid unbounded work.
+  type QueryEventsData = Awaited<
+    ReturnType<SuiJsonRpcClient["queryEvents"]>
+  >["data"];
+  type QueryEventsCursor = Awaited<
+    ReturnType<SuiJsonRpcClient["queryEvents"]>
+  >["nextCursor"];
+
   const queryEventsPaginated = async (
     query: Parameters<SuiJsonRpcClient["queryEvents"]>[0]["query"],
     maxEvents = 500
-  ) => {
-    const all: Awaited<
-      ReturnType<SuiJsonRpcClient["queryEvents"]>
-    >["data"] = [];
-    let cursor: string | null | undefined = null;
+  ): Promise<QueryEventsData> => {
+    const all: QueryEventsData = [];
+    let cursor: QueryEventsCursor = null;
     const pageLimit = 50;
     let pages = 0;
     const maxPages = 20;
@@ -77,7 +82,7 @@ async function getManagersFromCreationEvents(
     return all;
   };
 
-  let events: Awaited<ReturnType<typeof tryQuery>> = [];
+  let events: QueryEventsData = [];
   try {
     events = await queryEventsPaginated({ Sender: owner });
   } catch (err) {

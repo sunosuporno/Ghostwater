@@ -12,7 +12,10 @@ import {
 } from "@mysten/deepbook-v3";
 import { messageWithIntent } from "@mysten/sui/cryptography";
 import { getJsonRpcFullnodeUrl, SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
-import { Transaction } from "@mysten/sui/transactions";
+import {
+  Transaction,
+  type TransactionObjectArgument,
+} from "@mysten/sui/transactions";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { Buffer } from "buffer";
 
@@ -103,13 +106,13 @@ export async function prepareMarginWithdraw(
   ).deepbook;
   const marginManager = db.marginManager;
 
-  let withdrawnCoin: unknown;
+  let withdrawnCoin: TransactionObjectArgument;
   if (asset === "base") {
-    withdrawnCoin = marginManager.withdrawBase(MANAGER_KEY, amount)(tx);
+    withdrawnCoin = marginManager.withdrawBase(MANAGER_KEY, amount)(tx) as TransactionObjectArgument;
   } else if (asset === "quote") {
-    withdrawnCoin = marginManager.withdrawQuote(MANAGER_KEY, amount)(tx);
+    withdrawnCoin = marginManager.withdrawQuote(MANAGER_KEY, amount)(tx) as TransactionObjectArgument;
   } else {
-    withdrawnCoin = marginManager.withdrawDeep(MANAGER_KEY, amount)(tx);
+    withdrawnCoin = marginManager.withdrawDeep(MANAGER_KEY, amount)(tx) as TransactionObjectArgument;
   }
   tx.transferObjects([withdrawnCoin], tx.pure.address(sender));
 

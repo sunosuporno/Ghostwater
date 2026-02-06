@@ -103,27 +103,7 @@ export async function prepareAddTpsl(
   const tx = new Transaction();
   tx.setSender(sender);
 
-  const db = (
-    extended as {
-      deepbook: {
-        marginTPSL: {
-          addConditionalOrder: (p: {
-            marginManagerKey: string;
-            conditionalOrderId: number;
-            triggerBelowPrice: boolean;
-            triggerPrice: number;
-            pendingOrder: {
-              clientOrderId: number;
-              quantity: number;
-              isBid: boolean;
-              payWithDeep?: boolean;
-            };
-          }) => (tx: Transaction) => void;
-        };
-      };
-    }
-  ).deepbook;
-  const marginTPSL = db.marginTPSL;
+  const marginTPSL = extended.deepbook.marginTPSL;
 
   // Long: close by selling (isBid: false). TP = trigger when price rises (triggerBelowPrice: false). SL = trigger when price falls (triggerBelowPrice: true).
   // Short: close by buying (isBid: true). TP = trigger when price falls (triggerBelowPrice: true). SL = trigger when price rises (triggerBelowPrice: false).
@@ -134,11 +114,11 @@ export async function prepareAddTpsl(
     const triggerBelowPrice = isLong ? false : true; // TP for long: above; for short: below
     marginTPSL.addConditionalOrder({
       marginManagerKey: MANAGER_KEY,
-      conditionalOrderId: ids.tpCondId,
+      conditionalOrderId: String(ids.tpCondId),
       triggerBelowPrice,
       triggerPrice: tpPrice,
       pendingOrder: {
-        clientOrderId: ids.tpClientId,
+        clientOrderId: String(ids.tpClientId),
         quantity,
         isBid: closeIsBid,
         payWithDeep,
@@ -150,11 +130,11 @@ export async function prepareAddTpsl(
     const triggerBelowPrice = isLong ? true : false; // SL for long: below; for short: above
     marginTPSL.addConditionalOrder({
       marginManagerKey: MANAGER_KEY,
-      conditionalOrderId: ids.slCondId,
+      conditionalOrderId: String(ids.slCondId),
       triggerBelowPrice,
       triggerPrice: slPrice,
       pendingOrder: {
-        clientOrderId: ids.slClientId,
+        clientOrderId: String(ids.slClientId),
         quantity,
         isBid: closeIsBid,
         payWithDeep,
