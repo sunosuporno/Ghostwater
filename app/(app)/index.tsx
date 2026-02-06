@@ -144,7 +144,7 @@ export default function HomeScreen() {
   const colors = Colors[colorScheme ?? "light"];
   const { user, logout } = usePrivy();
   const { wallets: embeddedEthWallets } = useEmbeddedEthereumWallet();
-  const { createWallet: createSuiWallet } = useCreateWallet();
+  const { createWallet: createPrivyWallet } = useCreateWallet();
 
   const { currentNetwork, setCurrentNetworkId } = useNetwork();
 
@@ -543,7 +543,7 @@ export default function HomeScreen() {
         // If linked account has no public_key, fetch wallet via create to get it (idempotent for existing wallet)
         if (existing.publicKey) return;
         try {
-          const { wallet } = await createSuiWallet({ chainType: "sui" });
+          const { wallet } = await createPrivyWallet({ chainType: "sui" });
           if (!cancelled && wallet?.address) {
             const pk =
               (wallet as { publicKey?: string; public_key?: string })
@@ -559,7 +559,7 @@ export default function HomeScreen() {
       }
 
       try {
-        const { wallet } = await createSuiWallet({ chainType: "sui" });
+        const { wallet } = await createPrivyWallet({ chainType: "sui" });
         if (!cancelled && wallet?.address) {
           setSuiAddress(wallet.address);
           const pk =
@@ -583,6 +583,21 @@ export default function HomeScreen() {
       cancelled = true;
     };
   }, [user?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Ensure an embedded EVM wallet exists (for Base/Ethereum) whenever a user logs in.
+  useEffect(() => {
+    const ensureEvmWallet = async () => {
+      try {
+        if (!user?.id) return;
+        // If we already have at least one embedded EVM wallet, nothing to do.
+        if (embeddedEthWallets && embeddedEthWallets.length > 0) return;
+        await createPrivyWallet({ chainType: "ethereum" });
+      } catch {
+        // Best-effort only; UI will still show "No Base wallet linked" if this fails.
+      }
+    };
+    ensureEvmWallet();
+  }, [user?.id, embeddedEthWallets?.length, createPrivyWallet]);
 
   // EVM / Base-style address – mirror Sui flow by using the embedded Ethereum wallet
   // as the single source of truth for the Base account.
