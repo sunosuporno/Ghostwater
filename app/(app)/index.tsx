@@ -942,6 +942,61 @@ export default function HomeScreen() {
               ? recipient
               : undefined;
 
+        // Same chain + same token → simple direct send (no LI.FI)
+        const sameChain = fromChainId === toChainId;
+        const sameToken =
+          fromTokenAddress === toTokenForQuote ||
+          (fromTokenAddress === "0x0000000000000000000000000000000000000000" &&
+            toTokenForQuote === "0x0000000000000000000000000000000000000000");
+        if (sameChain && sameToken && !isDestinationSui) {
+          let txHash: unknown;
+          if (selectedBaseToken === "native") {
+            const valueHex = "0x" + amountRaw.toString(16);
+            txHash = await provider.request({
+              method: "eth_sendTransaction",
+              params: [{
+                from,
+                to: recipient,
+                value: valueHex,
+                chainId: chainIdHex,
+                gasLimit: "0x5208",
+              }],
+            });
+          } else {
+            const selector = "0xa9059cbb";
+            const addr = (recipient as string).toLowerCase().replace(/^0x/, "");
+            const paddedAddress = addr.padStart(64, "0");
+            const valueHex = amountRaw.toString(16);
+            const paddedValue = valueHex.padStart(64, "0");
+            const data = selector + paddedAddress + paddedValue;
+            txHash = await provider.request({
+              method: "eth_sendTransaction",
+              params: [{
+                from,
+                to: selectedBaseToken,
+                value: "0x0",
+                data,
+                chainId: chainIdHex,
+                gasLimit: "0x186A0",
+              }],
+            });
+          }
+          const hashStr = String(txHash);
+          setBaseSendSuccess(
+            `Transaction sent on ${currentNetwork.shortLabel}. Tx hash: ${hashStr}`
+          );
+          setBaseSendTxHash(hashStr);
+          setBaseSendIsCrossChain(false);
+          setBaseSendLifiStatus(null);
+          setBaseAmount("");
+          setBaseDestinationInput("");
+          setBaseDestinationAddress(null);
+          setBaseAmountExceedsBalance(false);
+          refetchBaseBalances();
+          setBaseSendLoading(false);
+          return;
+        }
+
         const quoteResult = (await fetchLifiQuote({
           fromChainId,
           toChainId,
