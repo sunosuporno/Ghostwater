@@ -93,6 +93,7 @@ const REGISTRAR_ABI = [
     inputs: [
       { name: "preferredChain", type: "string" },
       { name: "preferredToken", type: "string" },
+      { name: "suiAddress", type: "string" },
     ],
     outputs: [],
   },
@@ -104,6 +105,7 @@ const REGISTRAR_ABI = [
       { name: "label", type: "string" },
       { name: "preferredChain", type: "string" },
       { name: "preferredToken", type: "string" },
+      { name: "suiAddress", type: "string" },
     ],
     outputs: [],
   },
@@ -163,6 +165,7 @@ const REGISTRY_ABI = [
 /** ENS text record keys used by GhostwaterRegistrar for preferences. */
 export const PREFERRED_CHAIN_KEY = "com.ghostwater.preferredChain";
 export const PREFERRED_TOKEN_KEY = "com.ghostwater.preferredToken";
+export const SUI_ADDRESS_KEY = "com.ghostwater.suiAddress";
 
 function getBaseRpcUrl(): string {
   if (process.env.EXPO_PUBLIC_BASE_RPC_URL) return process.env.EXPO_PUBLIC_BASE_RPC_URL;
@@ -183,10 +186,12 @@ export type SubdomainStatus = {
   label: string | null;
   baseName: string | null;
   fullName: string | null;
-  /** Preferred chain name (e.g. "Base", "Arbitrum") from ENS text record. */
+  /** Preferred chain name (e.g. "Base", "Arbitrum", "Sui") from ENS text record. */
   preferredChain: string | null;
   /** Preferred token symbol or contract address from ENS text record. */
   preferredToken: string | null;
+  /** Sui receive address when preferred chain is Sui (for cross-chain send toAddress). */
+  suiAddress: string | null;
 };
 
 /**
@@ -238,6 +243,7 @@ export async function fetchSubdomainStatus(
 
   let preferredChain: string | null = null;
   let preferredToken: string | null = null;
+  let suiAddress: string | null = null;
   const registryForTextAddress = getL2RegistryAddress() ?? registrarRegistryAddress;
   const registryForText = getContract({
     address: registryForTextAddress,
@@ -246,12 +252,14 @@ export async function fetchSubdomainStatus(
   });
   if (hasSubdomain && hasNode) {
     try {
-      const [chainVal, tokenVal] = await Promise.all([
+      const [chainVal, tokenVal, suiVal] = await Promise.all([
         registryForText.read.text([node, PREFERRED_CHAIN_KEY]),
         registryForText.read.text([node, PREFERRED_TOKEN_KEY]),
+        registryForText.read.text([node, SUI_ADDRESS_KEY]),
       ]);
       preferredChain = chainVal && chainVal.length > 0 ? chainVal : null;
       preferredToken = tokenVal && tokenVal.length > 0 ? tokenVal : null;
+      suiAddress = suiVal && suiVal.length > 0 ? suiVal : null;
     } catch {
       // text records may not exist or registry may not support text()
     }
@@ -264,6 +272,7 @@ export async function fetchSubdomainStatus(
     fullName,
     preferredChain,
     preferredToken,
+    suiAddress,
   };
 }
 
@@ -295,31 +304,33 @@ export function getRegisterCalldata(label: string): `0x${string}` {
 }
 
 /**
- * Build calldata for setPreferences(preferredChain, preferredToken). Use when user already has a subdomain (edit flow).
+ * Build calldata for setPreferences(preferredChain, preferredToken, suiAddress). Use when user already has a subdomain (edit flow).
  */
 export function getSetPreferencesCalldata(
   preferredChain: string,
-  preferredToken: string
+  preferredToken: string,
+  suiAddress: string
 ): `0x${string}` {
   return encodeFunctionData({
     abi: REGISTRAR_ABI,
     functionName: "setPreferences",
-    args: [preferredChain, preferredToken],
+    args: [preferredChain, preferredToken, suiAddress],
   });
 }
 
 /**
- * Build calldata for registerWithPreferences(label, preferredChain, preferredToken). One tx to claim name and set preferences.
+ * Build calldata for registerWithPreferences(label, preferredChain, preferredToken, suiAddress). One tx to claim name and set preferences.
  */
 export function getRegisterWithPreferencesCalldata(
   label: string,
   preferredChain: string,
-  preferredToken: string
+  preferredToken: string,
+  suiAddress: string
 ): `0x${string}` {
   return encodeFunctionData({
     abi: REGISTRAR_ABI,
     functionName: "registerWithPreferences",
-    args: [label, preferredChain, preferredToken],
+    args: [label, preferredChain, preferredToken, suiAddress],
   });
 }
 
@@ -331,7 +342,9 @@ export function getRegistrarAddress(): Address | null {
 
 /** L2 Registry address (for reading text records). Prefer env so we read from the same registry the registrar uses. */
 export function getL2RegistryAddress(): Address | null {
-  const addr = process.env.EXPO_PUBLIC_L2_REGISTRY_ADDRESS;
+  const addr =
+    process.env.EXPO_PUBLIC_GHOSTWATER_L2_REGISTRY_ADDRESS ??
+    process.env.EXPO_PUBLIC_L2_REGISTRY_ADDRESS;
   if (!addr || !addr.startsWith("0x")) return null;
   return addr as Address;
 }

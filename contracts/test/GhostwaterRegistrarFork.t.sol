@@ -7,7 +7,7 @@ import {IL2Registry} from "../src/interfaces/IL2Registry.sol";
 
 /// @title GhostwaterRegistrar fork tests
 /// @notice Run on Base mainnet fork to debug register/setPreferences against real registry.
-/// @dev Requires in contracts/.env: BASE_RPC_URL, GHOSTWATER_REGISTRAR_ADDRESS (and L2_REGISTRY_ADDRESS for reference).
+/// @dev Requires in contracts/.env: BASE_RPC_URL, GHOSTWATER_REGISTRAR_ADDRESS (and GHOSTWATER_L2_REGISTRY_ADDRESS for reference).
 ///      Run: cd contracts && forge test --match-contract GhostwaterRegistrarFork -vvv
 contract GhostwaterRegistrarForkTest is Test {
     GhostwaterRegistrar public registrar;
@@ -49,7 +49,7 @@ contract GhostwaterRegistrarForkTest is Test {
     function testFork_setPreferences_revertsWhenNotClaimed() public {
         vm.prank(user1);
         vm.expectRevert(GhostwaterRegistrar.NotClaimed.selector);
-        registrar.setPreferences("Base", "USDC");
+        registrar.setPreferences("Base", "USDC", "");
     }
 
     /// @notice Revert: label too short
@@ -71,7 +71,7 @@ contract GhostwaterRegistrarForkTest is Test {
         assertEq(registrar.addressToLabel(user1), label);
 
         vm.prank(user1);
-        registrar.setPreferences("Base", "USDC");
+        registrar.setPreferences("Base", "USDC", "");
 
         // If we get here, setPreferences did not revert (registry.setText accepted).
         // Optionally read back via ITextResolver.text(node, key) if the registry implements it.
@@ -129,7 +129,7 @@ contract GhostwaterRegistrarForkTest is Test {
     function testFork_registerWithPreferences_oneTx() public {
         string memory label = "testfork996";
         vm.prank(user1);
-        registrar.registerWithPreferences(label, "Arbitrum", "USDT");
+        registrar.registerWithPreferences(label, "Arbitrum", "USDT", "");
 
         assertTrue(registrar.hasSubdomain(user1));
         assertEq(registrar.addressToLabel(user1), label);
@@ -148,30 +148,46 @@ contract GhostwaterRegistrarForkTest is Test {
         assertEq(abi.decode(tokenBytes, (string)), "USDT");
     }
 
+    /// @notice registerWithPreferences stores suiAddress text record when provided
+    function testFork_registerWithPreferences_setsSuiAddress() public {
+        string memory label = "testfork993";
+        string memory suiAddr = "0x1234567890abcdef1234567890abcdef12345678";
+        vm.prank(user1);
+        registrar.registerWithPreferences(label, "Sui", "USDC", suiAddr);
+
+        bytes32 baseNode = registry.baseNode();
+        bytes32 node = registry.makeNode(baseNode, label);
+        (bool okSui, bytes memory suiBytes) = address(registry).staticcall(
+            abi.encodeWithSignature("text(bytes32,string)", node, "com.ghostwater.suiAddress")
+        );
+        assertTrue(okSui && suiBytes.length > 0);
+        assertEq(abi.decode(suiBytes, (string)), suiAddr);
+    }
+
     /// @notice registerWithPreferences reverts when label too short
     function testFork_registerWithPreferences_revertsWhenLabelTooShort() public {
         vm.prank(user1);
         vm.expectRevert(GhostwaterRegistrar.LabelTooShort.selector);
-        registrar.registerWithPreferences("ab", "Base", "USDC");
+        registrar.registerWithPreferences("ab", "Base", "USDC", "");
     }
 
     /// @notice registerWithPreferences reverts when already claimed
     function testFork_registerWithPreferences_revertsWhenAlreadyClaimed() public {
         vm.prank(user1);
-        registrar.registerWithPreferences("testfork995", "Base", "ETH");
+        registrar.registerWithPreferences("testfork995", "Base", "ETH", "");
 
         vm.prank(user1);
         vm.expectRevert(GhostwaterRegistrar.AlreadyClaimed.selector);
-        registrar.registerWithPreferences("other", "Sui", "USDC");
+        registrar.registerWithPreferences("other", "Sui", "USDC", "");
     }
 
     /// @notice registerWithPreferences reverts when label taken
     function testFork_registerWithPreferences_revertsWhenLabelUnavailable() public {
         vm.prank(user1);
-        registrar.registerWithPreferences("testfork994", "Base", "USDC");
+        registrar.registerWithPreferences("testfork994", "Base", "USDC", "");
 
         vm.prank(user2);
         vm.expectRevert(GhostwaterRegistrar.LabelUnavailable.selector);
-        registrar.registerWithPreferences("testfork994", "Arbitrum", "USDT");
+        registrar.registerWithPreferences("testfork994", "Arbitrum", "USDT", "");
     }
 }

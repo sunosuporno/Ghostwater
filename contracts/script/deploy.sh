@@ -11,8 +11,8 @@ if [ -f .env ]; then
   set +a
 fi
 
-if [ -z "${L2_REGISTRY_ADDRESS}" ] || [ "${L2_REGISTRY_ADDRESS}" = "0x0000000000000000000000000000000000000000" ]; then
-  echo "Error: Set L2_REGISTRY_ADDRESS in .env (your Durin L2 Registry address)"
+if [ -z "${GHOSTWATER_L2_REGISTRY_ADDRESS}" ] || [ "${GHOSTWATER_L2_REGISTRY_ADDRESS}" = "0x0000000000000000000000000000000000000000" ]; then
+  echo "Error: Set GHOSTWATER_L2_REGISTRY_ADDRESS in .env (your Durin L2 Registry address)"
   exit 1
 fi
 

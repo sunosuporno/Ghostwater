@@ -61,14 +61,16 @@ contract GhostwaterRegistrar is ReentrancyGuard, IERC721Receiver {
         emit NameRegistered(label, msg.sender);
     }
 
-    /// @notice Claim your free subdomain and set preferred chain/token in one transaction.
+    /// @notice Claim your free subdomain and set preferred chain/token (and optional Sui address) in one transaction.
     /// @param label The subdomain label (e.g. "alice"). Min 3 chars; must be available.
-    /// @param preferredChain Preferred chain name (e.g. "Base", "Arbitrum").
+    /// @param preferredChain Preferred chain name (e.g. "Base", "Arbitrum", "Sui").
     /// @param preferredToken Preferred token symbol or contract address (e.g. "USDC" or "0x...").
+    /// @param suiAddress Sui receive address when preferred chain is Sui (use "" if not applicable).
     function registerWithPreferences(
         string calldata label,
         string calldata preferredChain,
-        string calldata preferredToken
+        string calldata preferredToken,
+        string calldata suiAddress
     ) external nonReentrant {
         if (addressToNode[msg.sender] != bytes32(0)) revert AlreadyClaimed();
         if (label.strlen() < 3) revert LabelTooShort();
@@ -87,6 +89,9 @@ contract GhostwaterRegistrar is ReentrancyGuard, IERC721Receiver {
 
         _setTextRecord(node, PREFERRED_CHAIN_KEY, preferredChain);
         _setTextRecord(node, PREFERRED_TOKEN_KEY, preferredToken);
+        if (bytes(suiAddress).length > 0) {
+            _setTextRecord(node, SUI_ADDRESS_KEY, suiAddress);
+        }
     }
 
     /// @notice Returns true if the address has claimed a subdomain.
@@ -97,13 +102,21 @@ contract GhostwaterRegistrar is ReentrancyGuard, IERC721Receiver {
     /// @notice Text record keys for preferences (ENS subdomain).
     string public constant PREFERRED_CHAIN_KEY = "com.ghostwater.preferredChain";
     string public constant PREFERRED_TOKEN_KEY = "com.ghostwater.preferredToken";
+    string public constant SUI_ADDRESS_KEY = "com.ghostwater.suiAddress";
 
-    /// @notice Set preferred chain and token in one transaction. Caller must have claimed a subdomain.
-    function setPreferences(string calldata preferredChain, string calldata preferredToken) external nonReentrant {
+    /// @notice Set preferred chain, token, and optional Sui address. Caller must have claimed a subdomain.
+    function setPreferences(
+        string calldata preferredChain,
+        string calldata preferredToken,
+        string calldata suiAddress
+    ) external nonReentrant {
         bytes32 node = addressToNode[msg.sender];
         if (node == bytes32(0)) revert NotClaimed();
         _setTextRecord(node, PREFERRED_CHAIN_KEY, preferredChain);
         _setTextRecord(node, PREFERRED_TOKEN_KEY, preferredToken);
+        if (bytes(suiAddress).length > 0) {
+            _setTextRecord(node, SUI_ADDRESS_KEY, suiAddress);
+        }
     }
 
     /// @dev Internal helper to set a text record on a node.

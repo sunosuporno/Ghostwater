@@ -7,7 +7,7 @@ import {GhostwaterRegistrar} from "../src/GhostwaterRegistrar.sol";
 /// @notice Deploy GhostwaterRegistrar to Base (or Base Sepolia). Then call registry.addRegistrar(registrar) as registry owner.
 contract Deploy is Script {
     function run() external {
-        address registry = vm.envAddress("L2_REGISTRY_ADDRESS");
+        address registry = vm.envAddress("GHOSTWATER_L2_REGISTRY_ADDRESS");
 
         vm.startBroadcast();
         GhostwaterRegistrar registrar = new GhostwaterRegistrar(registry);

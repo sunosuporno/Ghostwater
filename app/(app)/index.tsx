@@ -14,6 +14,7 @@ import {
   AppState,
   AppStateStatus,
   Clipboard,
+  Linking,
   Modal,
   Platform,
   Pressable,
@@ -37,6 +38,8 @@ import {
   resolveSubdomainAddress,
   type SubdomainStatus,
 } from "@/lib/ens-subdomain-base";
+import { getRecipientPreferredTokenAddressAndNetworkId } from "@/lib/preferred-chains-tokens";
+import { fetchLifiQuote, fetchLifiStatus, type LifiStatusResponse } from "@/lib/lifi-quote";
 import { isBaseMainnet, NETWORKS, useNetwork } from "@/lib/network";
 import {
   fetchAllBaseBalances,
@@ -218,6 +221,8 @@ export default function HomeScreen() {
   const [baseSendError, setBaseSendError] = useState<string | null>(null);
   const [baseSendSuccess, setBaseSendSuccess] = useState<string | null>(null);
   const [baseSendTxHash, setBaseSendTxHash] = useState<string | null>(null);
+  const [baseSendIsCrossChain, setBaseSendIsCrossChain] = useState(false);
+  const [baseSendLifiStatus, setBaseSendLifiStatus] = useState<LifiStatusResponse | null>(null);
   const [baseTxHashCopied, setBaseTxHashCopied] = useState(false);
   const [baseQrVisible, setBaseQrVisible] = useState(false);
   const [scannedRecipient, setScannedRecipient] = useState<{
@@ -236,6 +241,7 @@ export default function HomeScreen() {
   const [claimPreferredChain, setClaimPreferredChain] = useState("");
   const [claimPreferredToken, setClaimPreferredToken] = useState<"ETH" | "USDC" | "USDT" | "OTHER" | "">("");
   const [claimPreferredTokenCustom, setClaimPreferredTokenCustom] = useState("");
+  const [claimSuiAddress, setClaimSuiAddress] = useState("");
   const [chainPickerVisible, setChainPickerVisible] = useState(false);
   const [tokenPickerVisibleSubdomain, setTokenPickerVisibleSubdomain] = useState(false);
   const [claimNameAvailable, setClaimNameAvailable] = useState<boolean | null>(null);
@@ -250,6 +256,7 @@ export default function HomeScreen() {
   const [editPrefsChain, setEditPrefsChain] = useState("");
   const [editPrefsToken, setEditPrefsToken] = useState<"ETH" | "USDC" | "USDT" | "OTHER" | "">("");
   const [editPrefsTokenCustom, setEditPrefsTokenCustom] = useState("");
+  const [editPrefsSuiAddress, setEditPrefsSuiAddress] = useState("");
   const [editPrefsLoading, setEditPrefsLoading] = useState(false);
   const [editPrefsError, setEditPrefsError] = useState<string | null>(null);
   const [editChainPickerVisible, setEditChainPickerVisible] = useState(false);
@@ -263,6 +270,9 @@ export default function HomeScreen() {
     chain?: string;
   }>();
   const [deepLinkHandled, setDeepLinkHandled] = useState(false);
+
+  const scrollViewRef = useRef<ScrollView>(null);
+  const hasScrolledForDeepLinkRef = useRef(false);
 
   const refetchBalances = useCallback(() => {
     if (!suiAddress) return;
@@ -424,6 +434,52 @@ export default function HomeScreen() {
     const id = setInterval(refetchBaseBalances, BALANCE_REFRESH_INTERVAL_MS);
     return () => clearInterval(id);
   }, [evmAddress, currentNetwork.id, refetchBaseBalances]);
+
+  // Poll LI.FI status for cross-chain sends until DONE/FAILED or timeout
+  const fromChainIdForStatus = currentNetwork.evmChainId
+    ? parseInt(currentNetwork.evmChainId, 16)
+    : undefined;
+  useEffect(() => {
+    if (!baseSendTxHash || !baseSendIsCrossChain) return;
+
+    let notFoundCount = 0;
+    const maxNotFound = 10;
+    const pollMs = 6000;
+    const maxPolls = 50;
+
+    const poll = async () => {
+      try {
+        const status = await fetchLifiStatus(baseSendTxHash!, fromChainIdForStatus);
+        setBaseSendLifiStatus(status);
+        if (status.status === "NOT_FOUND") {
+          notFoundCount += 1;
+          if (notFoundCount >= maxNotFound) return true;
+        } else {
+          notFoundCount = 0;
+          if (status.status === "DONE" || status.status === "FAILED") return true;
+        }
+      } catch {
+        // keep polling on network error
+      }
+      return false;
+    };
+
+    let pollCount = 0;
+    const id = setInterval(async () => {
+      pollCount += 1;
+      if (pollCount > maxPolls) {
+        clearInterval(id);
+        return;
+      }
+      const done = await poll();
+      if (done) clearInterval(id);
+    }, pollMs);
+
+    // initial fetch
+    poll();
+
+    return () => clearInterval(id);
+  }, [baseSendTxHash, baseSendIsCrossChain, fromChainIdForStatus]);
 
   // Refresh when screen gains focus (e.g. tab switch back to Home)
   useFocusEffect(
@@ -617,6 +673,7 @@ export default function HomeScreen() {
         if (!user?.id) return;
         // If we already have at least one embedded EVM wallet, nothing to do.
         if (embeddedEthWallets && embeddedEthWallets.length > 0) return;
+        // @ts-expect-error - createWallet supports ethereum at runtime; SDK types omit it
         await createPrivyWallet({ chainType: "ethereum" });
       } catch {
         // Best-effort only; UI will still show "No Base wallet linked" if this fails.
@@ -674,6 +731,16 @@ export default function HomeScreen() {
     setCurrentNetworkId,
   ]);
 
+  // When we just opened via pay deep link, scroll to the bottom so the send section is in view.
+  useEffect(() => {
+    if (!deepLinkHandled || hasScrolledForDeepLinkRef.current) return;
+    const t = setTimeout(() => {
+      hasScrolledForDeepLinkRef.current = true;
+      scrollViewRef.current?.scrollToEnd({ animated: true });
+    }, 500);
+    return () => clearTimeout(t);
+  }, [deepLinkHandled]);
+
   // EVM / Base-style address – mirror Sui flow by using the embedded Ethereum wallet
   // as the single source of truth for the Base account.
   useEffect(() => {
@@ -723,6 +790,7 @@ export default function HomeScreen() {
     }
 
     let recipient = baseDestinationAddress ?? null;
+    let isSubdomainReceiver = false;
 
     if (!recipient) {
       if (isHexAddress(rawInput)) {
@@ -734,6 +802,7 @@ export default function HomeScreen() {
           return;
         }
         recipient = resolved;
+        isSubdomainReceiver = true;
       } else {
         setBaseSendError("Enter a valid 0x address or Ghostwater name");
         return;
@@ -762,6 +831,181 @@ export default function HomeScreen() {
     );
     if (amountRaw > BigInt(rawBalance)) {
       setBaseSendError("Amount exceeds your balance");
+      return;
+    }
+
+    // Branch: subdomain receiver → LI.FI quote then send tx; address → send as usual
+    if (isSubdomainReceiver && recipient) {
+      setBaseSendError(null);
+      setBaseSendSuccess(null);
+      setBaseSendTxHash(null);
+      setBaseSendLoading(true);
+      try {
+        const provider = await (embeddedEthWallet as any).getProvider();
+        const chainIdHex = currentNetwork.evmChainId;
+        if (!chainIdHex) {
+          setBaseSendError("Current network is not configured for cross-chain send.");
+          return;
+        }
+        const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+        const from = accounts?.[0];
+        if (!from) {
+          setBaseSendError("No account found in embedded wallet");
+          return;
+        }
+        try {
+          const currentChainId = (await provider.request({ method: "eth_chainId" })) as string;
+          if (currentChainId !== chainIdHex) {
+            await provider.request({
+              method: "wallet_switchEthereumChain",
+              params: [{ chainId: chainIdHex }],
+            });
+          }
+        } catch {
+          setBaseSendError(`Switch to ${currentNetwork.shortLabel} in your wallet and try again.`);
+          return;
+        }
+
+        const registrarAddr = getRegistrarAddress();
+        let recipientPreferredChain: string | null = null;
+        let recipientPreferredToken: string | null = null;
+        let recipientSuiAddress: string | null = null;
+        if (registrarAddr) {
+          try {
+            const status = await fetchSubdomainStatus(
+              registrarAddr,
+              recipient as `0x${string}`
+            );
+            recipientPreferredChain = status.preferredChain ?? null;
+            recipientPreferredToken = status.preferredToken ?? null;
+            recipientSuiAddress = status.suiAddress ?? null;
+          } catch {
+            // keep nulls if fetch fails
+          }
+        }
+        const { favouredTokenAddress, networkId } =
+          getRecipientPreferredTokenAddressAndNetworkId(
+            recipientPreferredChain,
+            recipientPreferredToken
+          );
+        console.log("[Send Base] Receiver is Ghostwater subdomain:", {
+          subdomainName: rawInput,
+          tokenAddress: selectedBaseToken,
+          amount: baseAmount,
+          recipientPreferredChain,
+          recipientPreferredToken,
+          recipientFavouredTokenAddress: favouredTokenAddress,
+          recipientPreferredNetworkId: networkId,
+        });
+
+        // Resolve destination native token for LI.FI (EVM uses 0x0...0, Sui uses SUI coin type)
+        const toTokenForQuote =
+          favouredTokenAddress === "native"
+            ? (networkId === 9270000000000000
+                ? "0x2::sui::SUI"
+                : "0x0000000000000000000000000000000000000000")
+            : favouredTokenAddress;
+
+        const fromChainId = currentNetwork.evmChainId
+          ? parseInt(currentNetwork.evmChainId, 16)
+          : null;
+        if (
+          fromChainId == null ||
+          networkId == null ||
+          !toTokenForQuote ||
+          !evmAddress
+        ) {
+          setBaseSendError("Could not build cross-chain route (missing chain or token).");
+          return;
+        }
+
+        const fromTokenAddress =
+          selectedBaseToken === "native"
+            ? "0x0000000000000000000000000000000000000000"
+            : selectedBaseToken;
+        const toChainId =
+          typeof networkId === "number"
+            ? networkId
+            : String(networkId) === "sui"
+              ? 9270000000000000
+              : parseInt(String(networkId), 10);
+        if (Number.isNaN(toChainId)) {
+          setBaseSendError("Invalid recipient preferred chain.");
+          return;
+        }
+
+        const isDestinationSui = toChainId === 9270000000000000;
+        const toAddressParam =
+          isDestinationSui && recipientSuiAddress?.trim()
+            ? recipientSuiAddress.trim()
+            : !isDestinationSui
+              ? recipient
+              : undefined;
+
+        const quoteResult = (await fetchLifiQuote({
+          fromChainId,
+          toChainId,
+          fromTokenAddress,
+          toTokenAddress: toTokenForQuote,
+          fromAmount: amountRaw.toString(),
+          fromAddress: evmAddress,
+          ...(toAddressParam ? { toAddress: toAddressParam } : {}),
+          slippage: 0.005,
+        })) as {
+          transactionRequest?: {
+            to?: string;
+            data?: string;
+            value?: string;
+            gasLimit?: string;
+            gasPrice?: string;
+            maxFeePerGas?: string;
+            maxPriorityFeePerGas?: string;
+            chainId?: number;
+          };
+        };
+
+        console.log("[Send Base] LI.FI quote result:", quoteResult);
+
+        const txRequest = quoteResult?.transactionRequest;
+        if (!txRequest?.to || !txRequest?.data) {
+          setBaseSendError("No transaction returned from route. Try a different amount or token.");
+          return;
+        }
+
+        const tx: Record<string, string> = {
+          from,
+          to: txRequest.to,
+          data: txRequest.data,
+          value: txRequest.value ?? "0x0",
+        };
+        if (txRequest.gasLimit) tx.gasLimit = txRequest.gasLimit;
+        if (txRequest.gasPrice) tx.gasPrice = txRequest.gasPrice;
+        if (txRequest.maxFeePerGas) tx.maxFeePerGas = txRequest.maxFeePerGas;
+        if (txRequest.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = txRequest.maxPriorityFeePerGas;
+        if (txRequest.chainId != null) tx.chainId = "0x" + Number(txRequest.chainId).toString(16);
+
+        const txHash = await provider.request({
+          method: "eth_sendTransaction",
+          params: [tx],
+        });
+        const hashStr = String(txHash);
+        setBaseSendSuccess(
+          `Cross-chain send submitted on ${currentNetwork.shortLabel}. Tx: ${hashStr}`
+        );
+        setBaseSendTxHash(hashStr);
+        setBaseSendIsCrossChain(true);
+        setBaseSendLifiStatus(null);
+        setBaseAmount("");
+        setBaseDestinationInput("");
+        setBaseDestinationAddress(null);
+        setBaseAmountExceedsBalance(false);
+        refetchBaseBalances();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Cross-chain send failed";
+        setBaseSendError(msg);
+      } finally {
+        setBaseSendLoading(false);
+      }
       return;
     }
 
@@ -847,8 +1091,11 @@ export default function HomeScreen() {
         `Transaction sent on ${currentNetwork.shortLabel}. Tx hash: ${hashStr}`
       );
       setBaseSendTxHash(hashStr);
+      setBaseSendIsCrossChain(false);
+      setBaseSendLifiStatus(null);
       setBaseAmount("");
-      setBaseDestination("");
+      setBaseDestinationInput("");
+      setBaseDestinationAddress(null);
       setBaseAmountExceedsBalance(false);
       refetchBaseBalances();
     } catch (err) {
@@ -923,11 +1170,12 @@ export default function HomeScreen() {
       // Use form values explicitly (no empty strings)
       const preferredChain = claimPreferredChain.trim();
       const preferredToken = tokenValue;
+      const suiAddressParam = preferredChain === "Sui" ? (claimSuiAddress ?? "").trim() : "";
       if (!label || label.length < 3) throw new Error("Invalid label");
       if (!preferredChain) throw new Error("Preferred chain is required");
       if (!preferredToken) throw new Error("Preferred token is required");
 
-      const calldata = getRegisterWithPreferencesCalldata(label, preferredChain, preferredToken);
+      const calldata = getRegisterWithPreferencesCalldata(label, preferredChain, preferredToken, suiAddressParam);
       await provider.request({
         method: "eth_sendTransaction",
         params: [{
@@ -935,7 +1183,7 @@ export default function HomeScreen() {
           to: registrarAddress,
           data: calldata,
           chainId: chainIdHex,
-          gasLimit: "0x60000", // ~400k for registerWithPreferences
+          gasLimit: "0x80000", // ~524k for createSubnode + setAddr x2 + 3x setText (chain, token, optional Sui)
         }],
       });
 
@@ -943,6 +1191,7 @@ export default function HomeScreen() {
       setClaimPreferredChain("");
       setClaimPreferredToken("");
       setClaimPreferredTokenCustom("");
+      setClaimSuiAddress("");
       setClaimNameAvailable(null);
       setClaimStep(null);
       refetchSubdomain();
@@ -967,6 +1216,7 @@ export default function HomeScreen() {
     claimPreferredChain,
     claimPreferredToken,
     claimPreferredTokenCustom,
+    claimSuiAddress,
     embeddedEthWallet,
     currentNetwork.evmChainId,
     registrarAddress,
@@ -978,6 +1228,7 @@ export default function HomeScreen() {
     const chain = subdomainStatus.preferredChain ?? "";
     const token = subdomainStatus.preferredToken ?? "";
     setEditPrefsChain(chain);
+    setEditPrefsSuiAddress(subdomainStatus.suiAddress ?? "");
     if (token === "ETH" || token === "USDC" || token === "USDT") {
       setEditPrefsToken(token);
       setEditPrefsTokenCustom("");
@@ -1031,10 +1282,11 @@ export default function HomeScreen() {
 
       const preferredChain = editPrefsChain.trim();
       const preferredToken = tokenValue;
+      const suiAddressParam = preferredChain === "Sui" ? (editPrefsSuiAddress ?? "").trim() : "";
       if (!preferredChain) throw new Error("Preferred chain is required");
       if (!preferredToken) throw new Error("Preferred token is required");
 
-      const prefsData = getSetPreferencesCalldata(preferredChain, preferredToken);
+      const prefsData = getSetPreferencesCalldata(preferredChain, preferredToken, suiAddressParam);
       await provider.request({
         method: "eth_sendTransaction",
         params: [{
@@ -1042,7 +1294,7 @@ export default function HomeScreen() {
           to: registrarAddress,
           data: prefsData,
           chainId: chainIdHex,
-          gasLimit: "0x30D40",
+          gasLimit: "0x80000", // ~524k for 3x setText (chain, token, optional Sui address)
         }],
       });
 
@@ -1068,6 +1320,7 @@ export default function HomeScreen() {
     editPrefsChain,
     editPrefsToken,
     editPrefsTokenCustom,
+    editPrefsSuiAddress,
     embeddedEthWallet,
     currentNetwork.evmChainId,
     registrarAddress,
@@ -1151,7 +1404,13 @@ export default function HomeScreen() {
         const { digest } = await SuiTransfer.signAndExecuteWithPrivy(
           client,
           txBytes,
-          signRawHash,
+          signRawHash as unknown as (params: {
+            address: string;
+            chainType: "sui";
+            bytes: string;
+            encoding: "hex";
+            hash_function: "blake2b256";
+          }) => Promise<{ signature: string }>,
           suiAddress,
           publicKeyBytes
         );
@@ -1199,6 +1458,7 @@ export default function HomeScreen() {
 
   return (
     <ScrollView
+      ref={scrollViewRef}
       style={styles.scroll}
       contentContainerStyle={[styles.container, { paddingTop: insets.top + 24 }]}
       showsVerticalScrollIndicator={false}
@@ -1338,7 +1598,7 @@ export default function HomeScreen() {
 
       {currentNetwork.capabilities.showEvmWallet && (
         <>
-          <View style={[styles.card, styles.walletCard]}>
+          <View style={[styles.card, styles.walletCard, { borderColor: colors.tabIconDefault }]}>
             <Text style={[styles.cardLabel, styles.walletCardLabel]}>
               {currentNetwork.label} wallet
             </Text>
@@ -1595,7 +1855,11 @@ export default function HomeScreen() {
                   </Pressable>
                   {claimPreferredToken === "OTHER" && (
                     <TextInput
-                      style={[styles.input, styles.subdomainInput, { color: colors.text, marginTop: 8 }]}
+                      style={[
+                        styles.input,
+                        styles.subdomainInput,
+                        { color: colors.text, marginTop: 8, borderColor: colors.tabIconDefault },
+                      ]}
                       placeholder="Paste token contract address (0x...)"
                       placeholderTextColor={colors.text + "80"}
                       value={claimPreferredTokenCustom}
@@ -1605,6 +1869,28 @@ export default function HomeScreen() {
                       }}
                       editable={!claimLoading}
                     />
+                  )}
+                  {claimPreferredChain === "Sui" && (
+                    <>
+                      <Text style={[styles.inputLabel, { color: colors.text, marginTop: 12 }]}>Sui receive address</Text>
+                      <TextInput
+                        style={[
+                          styles.input,
+                          styles.subdomainInput,
+                          { color: colors.text, marginTop: 4, borderColor: colors.tabIconDefault },
+                        ]}
+                        placeholder="0x... (for cross-chain sends to Sui)"
+                        placeholderTextColor={colors.text + "80"}
+                        value={claimSuiAddress}
+                        onChangeText={(t) => {
+                          setClaimSuiAddress(t);
+                          setClaimError(null);
+                        }}
+                        editable={!claimLoading}
+                        autoCapitalize="none"
+                        autoCorrect={false}
+                      />
+                    </>
                   )}
                   <Modal
                     visible={tokenPickerVisibleSubdomain}
@@ -1683,6 +1969,7 @@ export default function HomeScreen() {
                   <View
                     style={[
                       styles.modalContent,
+                      styles.editPrefsModalContent,
                       {
                         backgroundColor: colors.background,
                         borderColor: colors.tabIconDefault,
@@ -1690,6 +1977,12 @@ export default function HomeScreen() {
                     ]}
                     onStartShouldSetResponder={() => true}
                   >
+                    <ScrollView
+                      style={styles.editPrefsModalScroll}
+                      contentContainerStyle={styles.editPrefsModalScrollContent}
+                      keyboardShouldPersistTaps="handled"
+                      showsVerticalScrollIndicator={false}
+                    >
                     <Text style={[styles.inputLabel, { color: colors.text }]}>
                       Edit preferences
                     </Text>
@@ -1779,12 +2072,12 @@ export default function HomeScreen() {
                       </Text>
                       <FontAwesome name="chevron-down" size={14} color={colors.tabIconDefault} />
                     </Pressable>
-                    {editPrefsToken === "OTHER" && (
+                    {editPrefsChain === "Sui" && editPrefsToken === "OTHER" && (
                       <TextInput
                         style={[
                           styles.input,
                           styles.subdomainInput,
-                          { color: colors.text, marginTop: 8 },
+                          { color: colors.text, marginTop: 8, borderColor: colors.tabIconDefault },
                         ]}
                         placeholder="Paste token contract address (0x...)"
                         placeholderTextColor={colors.text + "80"}
@@ -1795,6 +2088,30 @@ export default function HomeScreen() {
                         }}
                         editable={!editPrefsLoading}
                       />
+                    )}
+                    {editPrefsChain === "Sui" && (
+                      <>
+                        <Text style={[styles.inputLabel, { color: colors.text, marginTop: 12 }]}>
+                          Sui receive address
+                        </Text>
+                        <TextInput
+                          style={[
+                            styles.input,
+                            styles.subdomainInput,
+                            { color: colors.text, marginTop: 4, borderColor: colors.tabIconDefault },
+                          ]}
+                          placeholder="0x... (for cross-chain sends to Sui)"
+                          placeholderTextColor={colors.text + "80"}
+                          value={editPrefsSuiAddress}
+                          onChangeText={(t) => {
+                            setEditPrefsSuiAddress(t);
+                            setEditPrefsError(null);
+                          }}
+                          editable={!editPrefsLoading}
+                          autoCapitalize="none"
+                          autoCorrect={false}
+                        />
+                      </>
                     )}
                     <Modal
                       visible={editTokenPickerVisible}
@@ -1843,6 +2160,7 @@ export default function HomeScreen() {
                     {editPrefsError && (
                       <Text style={[styles.error, { marginTop: 8 }]}>{editPrefsError}</Text>
                     )}
+                    </ScrollView>
                     <Pressable
                       onPress={handleUpdatePreferences}
                       disabled={
@@ -1876,8 +2194,8 @@ export default function HomeScreen() {
             </>
           )}
 
-          <View style={styles.card}>
-            <Text style={styles.cardLabel}>
+          <View style={[styles.card, { borderColor: colors.tabIconDefault }]}>
+            <Text style={[styles.cardLabel, { color: colors.text }]}>
               {currentNetwork.label} balances
             </Text>
             {evmAddress ? (
@@ -1942,9 +2260,12 @@ export default function HomeScreen() {
             )}
           </View>
 
-          <View style={styles.card}>
-            <Text style={styles.cardLabel}>
+          <View style={[styles.card, { borderColor: colors.tabIconDefault }]}>
+            <Text style={[styles.cardLabel, { color: colors.text }]}>
               Send on {currentNetwork.shortLabel}
+            </Text>
+            <Text style={[styles.muted, { fontSize: 11, marginBottom: 12 }]}>
+              Send to a 0x address or a Ghostwater name (e.g. alice.ghostwater.eth)
             </Text>
             <Text style={[styles.inputLabel, { color: colors.text }]}>
               Token
@@ -2006,8 +2327,8 @@ export default function HomeScreen() {
                     : colors.tabIconDefault,
                 },
               ]}
-              placeholder="0.00"
-              placeholderTextColor={colors.tabIconDefault}
+              placeholder="0"
+              placeholderTextColor={colors.tabIconDefault + "99"}
               value={baseAmount}
               onChangeText={(t) => {
                 setBaseAmount(t);
@@ -2035,8 +2356,8 @@ export default function HomeScreen() {
                   borderColor: colors.tabIconDefault,
                 },
               ]}
-              placeholder="0x…"
-              placeholderTextColor={colors.tabIconDefault}
+              placeholder="0x… or name.ghostwater.eth"
+              placeholderTextColor={colors.tabIconDefault + "99"}
               value={baseDestinationInput}
               onChangeText={(t) => {
                 setBaseDestinationInput(t);
@@ -2044,6 +2365,8 @@ export default function HomeScreen() {
                 setBaseSendError(null);
                 setBaseSendSuccess(null);
                 setBaseSendTxHash(null);
+                setBaseSendIsCrossChain(false);
+                setBaseSendLifiStatus(null);
               }}
               autoCapitalize="none"
               autoCorrect={false}
@@ -2052,9 +2375,17 @@ export default function HomeScreen() {
               <Text style={styles.error}>{baseSendError}</Text>
             ) : null}
             {baseSendSuccess ? (
-              <View style={{ marginBottom: 8 }}>
-                <Text style={[styles.muted, { color: "#22c55e" }]}>
-                  Transaction sent on {currentNetwork.shortLabel}. Tx hash:{" "}
+              <View
+                style={[
+                  styles.sendSuccessCard,
+                  {
+                    backgroundColor: colors.background,
+                    borderColor: "#22c55e40",
+                  },
+                ]}
+              >
+                <Text style={[styles.sendSuccessTitle, { color: "#22c55e" }]}>
+                  {baseSendIsCrossChain ? "Cross-chain send submitted" : "Transaction sent"}
                 </Text>
                 {baseSendTxHash ? (
                   <Pressable
@@ -2063,30 +2394,140 @@ export default function HomeScreen() {
                       setBaseTxHashCopied(true);
                       setTimeout(() => setBaseTxHashCopied(false), 2000);
                     }}
-                    style={({ pressed }) => ({ opacity: pressed ? 0.8 : 1 })}
+                    style={({ pressed }) => ({
+                      opacity: pressed ? 0.8 : 1,
+                      marginTop: 6,
+                      paddingVertical: 4,
+                    })}
                   >
                     <Text
-                      style={[
-                        styles.muted,
-                        {
-                          color: "#22c55e",
-                          textDecorationLine: "underline",
-                        },
-                      ]}
+                      style={[styles.sendSuccessHash, { color: colors.text }]}
                       selectable
+                      numberOfLines={2}
                     >
                       {baseSendTxHash}
-                      {baseTxHashCopied ? " — Copied!" : " (tap to copy)"}
+                    </Text>
+                    <Text style={[styles.muted, { color: "#22c55e99", fontSize: 11, marginTop: 2 }]}>
+                      {baseTxHashCopied ? "Copied!" : "Tap to copy"}
                     </Text>
                   </Pressable>
                 ) : (
                   <Text
-                    style={[styles.muted, { color: "#22c55e" }]}
+                    style={[styles.muted, { color: "#22c55e", marginTop: 4 }]}
                     selectable
                   >
-                    {baseSendSuccess.replace(/^.*Tx hash: /, "")}
+                    {baseSendSuccess.replace(/^.*Tx:? /, "").replace(/^.*Tx hash: /, "")}
                   </Text>
                 )}
+                {baseSendIsCrossChain && baseSendLifiStatus ? (
+                  <>
+                    <View
+                      style={[
+                        styles.sendStatusBadge,
+                        {
+                          backgroundColor:
+                            baseSendLifiStatus.status === "DONE"
+                              ? "#22c55e22"
+                              : baseSendLifiStatus.status === "FAILED"
+                                ? "#ef444422"
+                                : "#eab30822",
+                          borderColor:
+                            baseSendLifiStatus.status === "DONE"
+                              ? "#22c55e"
+                              : baseSendLifiStatus.status === "FAILED"
+                                ? "#ef4444"
+                                : "#eab308",
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.sendStatusBadgeText,
+                          {
+                            color:
+                              baseSendLifiStatus.status === "DONE"
+                                ? "#22c55e"
+                                : baseSendLifiStatus.status === "FAILED"
+                                  ? "#ef4444"
+                                  : "#eab308",
+                          },
+                        ]}
+                      >
+                        {baseSendLifiStatus.status === "PENDING"
+                          ? "Bridging"
+                          : baseSendLifiStatus.status === "DONE"
+                            ? "Complete"
+                            : baseSendLifiStatus.status === "FAILED"
+                              ? "Failed"
+                              : baseSendLifiStatus.status}
+                      </Text>
+                    </View>
+                    {(baseSendLifiStatus.substatusMessage != null) &&
+                     baseSendLifiStatus.status === "PENDING" ? (
+                      <Text
+                        style={[styles.muted, { color: colors.text, fontSize: 11, marginTop: 6 }]}
+                        numberOfLines={2}
+                      >
+                        {baseSendLifiStatus.substatusMessage}
+                      </Text>
+                    ) : null}
+                    <View style={styles.sendSuccessLinks}>
+                      {baseSendLifiStatus.sending?.txLink ? (
+                        <Pressable
+                          onPress={() =>
+                            baseSendLifiStatus.sending?.txLink &&
+                            Linking.openURL(baseSendLifiStatus.sending.txLink)
+                          }
+                          style={({ pressed }) => [styles.sendSuccessLink, { opacity: pressed ? 0.8 : 1 }]}
+                        >
+                          <Text style={[styles.sendSuccessLinkText, { color: colors.tint }]}>
+                            Source tx
+                          </Text>
+                        </Pressable>
+                      ) : null}
+                      {baseSendLifiStatus.receiving?.txLink ? (
+                        <Pressable
+                          onPress={() =>
+                            baseSendLifiStatus.receiving?.txLink &&
+                            Linking.openURL(baseSendLifiStatus.receiving.txLink)
+                          }
+                          style={({ pressed }) => [styles.sendSuccessLink, { opacity: pressed ? 0.8 : 1 }]}
+                        >
+                          <Text style={[styles.sendSuccessLinkText, { color: colors.tint }]}>
+                            Destination tx
+                          </Text>
+                        </Pressable>
+                      ) : null}
+                      {baseSendLifiStatus.lifiExplorerLink ? (
+                        <Pressable
+                          onPress={() =>
+                            baseSendLifiStatus?.lifiExplorerLink &&
+                            Linking.openURL(baseSendLifiStatus.lifiExplorerLink)
+                          }
+                          style={({ pressed }) => [styles.sendSuccessLink, { opacity: pressed ? 0.8 : 1 }]}
+                        >
+                          <Text style={[styles.sendSuccessLinkText, { color: colors.tint }]}>
+                            Track on LI.FI
+                          </Text>
+                        </Pressable>
+                      ) : null}
+                    </View>
+                  </>
+                ) : baseSendIsCrossChain && baseSendTxHash ? (
+                  <View style={{ marginTop: 10 }}>
+                    <View style={[styles.sendStatusBadge, { backgroundColor: "#eab30822", borderColor: "#eab308" }]}>
+                      <Text style={[styles.sendStatusBadgeText, { color: "#eab308" }]}>Checking…</Text>
+                    </View>
+                    <Pressable
+                      onPress={() => Linking.openURL(`https://scan.li.fi/tx/${baseSendTxHash}`)}
+                      style={({ pressed }) => [styles.sendSuccessLink, { marginTop: 8, opacity: pressed ? 0.8 : 1 }]}
+                    >
+                      <Text style={[styles.sendSuccessLinkText, { color: colors.tint }]}>
+                        Track on LI.FI
+                      </Text>
+                    </Pressable>
+                  </View>
+                ) : null}
               </View>
             ) : null}
             <Pressable
@@ -2232,12 +2673,11 @@ export default function HomeScreen() {
                 styles.input,
                 styles.dropdown,
                 {
-                  color: colors.text,
                   borderColor: colors.tabIconDefault,
                 },
               ]}
             >
-              <Text style={{ fontSize: 14 }}>
+              <Text style={{ fontSize: 14, color: colors.text }}>
                 {selectedSymbol}
                 {selectedBalance != null
                   ? ` (${selectedBalance.formatted} available)`
@@ -2592,6 +3032,15 @@ const styles = StyleSheet.create({
     padding: 16,
     maxHeight: 320,
   },
+  editPrefsModalContent: {
+    maxHeight: "80%",
+  },
+  editPrefsModalScroll: {
+    maxHeight: 280,
+  },
+  editPrefsModalScrollContent: {
+    paddingBottom: 8,
+  },
   pickerItem: {
     paddingVertical: 12,
     paddingHorizontal: 12,
@@ -2603,6 +3052,48 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: "center",
     marginTop: 8,
+  },
+  sendSuccessCard: {
+    marginTop: 16,
+    marginBottom: 8,
+    padding: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+  },
+  sendSuccessTitle: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  sendSuccessHash: {
+    fontSize: 12,
+    fontFamily: "SpaceMono",
+    opacity: 0.9,
+  },
+  sendStatusBadge: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    borderWidth: 1,
+    marginTop: 10,
+  },
+  sendStatusBadgeText: {
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  sendSuccessLinks: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 12,
+    marginTop: 10,
+  },
+  sendSuccessLink: {
+    paddingVertical: 4,
+  },
+  sendSuccessLinkText: {
+    fontSize: 12,
+    textDecorationLine: "underline",
+    fontWeight: "500",
   },
   primaryButtonText: {
     fontSize: 16,

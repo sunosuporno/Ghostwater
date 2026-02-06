@@ -18,7 +18,7 @@ Free, one-per-address, immutable subdomains on Base mainnet via [Durin](https://
 
 ```bash
 cp .env.example .env
-# Edit .env: set L2_REGISTRY_ADDRESS (your Durin L2 registry), BASE_RPC_URL, and PRIVATE_KEY or use --private-key
+# Edit .env: set GHOSTWATER_L2_REGISTRY_ADDRESS (your Durin L2 registry), BASE_RPC_URL, and PRIVATE_KEY or use --private-key
 ```
 
 ## Build
