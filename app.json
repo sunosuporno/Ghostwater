@@ -15,7 +15,8 @@
     },
     "ios": {
       "bundleIdentifier": "com.supornosarkar.Ghostwater",
-      "supportsTablet": true
+      "supportsTablet": true,
+      "buildNumber": "1"
     },
     "android": {
       "adaptiveIcon": {
@@ -34,6 +35,13 @@
     "plugins": ["expo-router"],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "014c9f81-e39e-4eea-9c71-76cd59ba1c78"
+      }
+    },
+    "owner": "sunosuporno"
   }
 }

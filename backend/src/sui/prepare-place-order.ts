@@ -99,44 +99,7 @@ export async function preparePlaceOrder(
   const tx = new Transaction();
   tx.setSender(sender);
 
-  const db = (
-    extended as {
-      deepbook: {
-        marginManager: {
-          borrowBase: (managerKey: string, amount: number) => (tx: Transaction) => void;
-          borrowQuote: (managerKey: string, amount: number) => (tx: Transaction) => void;
-        };
-        poolProxy: {
-          placeLimitOrder: (p: {
-            poolKey: string;
-            marginManagerKey: string;
-            clientOrderId: number;
-            price: number;
-            quantity: number;
-            isBid: boolean;
-            payWithDeep?: boolean;
-          }) => (tx: Transaction) => void;
-          placeMarketOrder: (p: {
-            poolKey: string;
-            marginManagerKey: string;
-            clientOrderId: number;
-            quantity: number;
-            isBid: boolean;
-            payWithDeep?: boolean;
-          }) => (tx: Transaction) => void;
-          placeReduceOnlyMarketOrder: (p: {
-            poolKey: string;
-            marginManagerKey: string;
-            clientOrderId: number;
-            quantity: number;
-            isBid: boolean;
-            payWithDeep?: boolean;
-          }) => (tx: Transaction) => void;
-        };
-      };
-    }
-  ).deepbook;
-  const { marginManager, poolProxy } = db;
+  const { marginManager, poolProxy } = extended.deepbook;
 
   if (borrowBaseAmount != null && borrowBaseAmount > 0) {
     marginManager.borrowBase(MANAGER_KEY, borrowBaseAmount)(tx);
@@ -145,11 +108,12 @@ export async function preparePlaceOrder(
     marginManager.borrowQuote(MANAGER_KEY, borrowQuoteAmount)(tx);
   }
 
+  const clientOrderIdStr = String(clientOrderId);
   if (orderType === "limit") {
     poolProxy.placeLimitOrder({
       poolKey,
       marginManagerKey: MANAGER_KEY,
-      clientOrderId,
+      clientOrderId: clientOrderIdStr,
       price: price!,
       quantity,
       isBid,
@@ -159,7 +123,7 @@ export async function preparePlaceOrder(
     poolProxy.placeReduceOnlyMarketOrder({
       poolKey,
       marginManagerKey: MANAGER_KEY,
-      clientOrderId,
+      clientOrderId: clientOrderIdStr,
       quantity,
       isBid,
       payWithDeep,
@@ -168,7 +132,7 @@ export async function preparePlaceOrder(
     poolProxy.placeMarketOrder({
       poolKey,
       marginManagerKey: MANAGER_KEY,
-      clientOrderId,
+      clientOrderId: clientOrderIdStr,
       quantity,
       isBid,
       payWithDeep,
