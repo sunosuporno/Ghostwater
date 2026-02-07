@@ -12,6 +12,7 @@ import { prepareMarginDeposit } from "./sui/prepare-margin-deposit.js";
 import { prepareMarginWithdraw } from "./sui/prepare-margin-withdraw.js";
 import { preparePlaceOrder } from "./sui/prepare-place-order.js";
 import { prepareRepay } from "./sui/prepare-repay.js";
+import { prepareExternalSuiTx } from "./sui/prepare-external-sui-tx.js";
 import { prepareTransfer } from "./sui/prepare-transfer.js";
 if (typeof globalThis.Buffer === "undefined") {
   (globalThis as unknown as { Buffer: typeof Buffer }).Buffer = Buffer;
@@ -53,6 +54,28 @@ app.post("/api/prepare-transfer", async (req, res) => {
     res.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Prepare failed";
+    res.status(400).json({ error: message });
+  }
+});
+
+/**
+ * POST /api/prepare-external-sui-tx
+ * Body: { txBytesBase64 } — arbitrary Sui tx bytes (e.g. from LiFi quote).
+ * Returns: { intentMessageHashHex } for the client to sign. Then POST /api/execute-transfer.
+ */
+app.post("/api/prepare-external-sui-tx", async (req, res) => {
+  try {
+    const { txBytesBase64 } = req.body;
+    if (!txBytesBase64) {
+      res.status(400).json({ error: "Missing required field: txBytesBase64" });
+      return;
+    }
+    const result = await prepareExternalSuiTx({ txBytesBase64 });
+    res.json(result);
+  } catch (err) {
+    console.error("[prepare-external-sui-tx] error:", err);
+    const message =
+      err instanceof Error ? err.message : "Prepare external Sui tx failed";
     res.status(400).json({ error: message });
   }
 });

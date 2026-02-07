@@ -145,11 +145,12 @@ export function TickerProvider({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { currentNetwork } = useNetwork();
-  const isSuiNetwork = currentNetwork.kind === "sui";
+  // Run ticker on Sui (Margin tab) and when Pools tab is shown (Base mainnet).
+  const tickerEnabled =
+    currentNetwork.kind === "sui" || currentNetwork.capabilities.showPoolsTab;
 
   const refetch = useCallback(() => {
-    if (!isSuiNetwork) {
-      // When not on Sui, ticker is a no-op: clear any existing data and stop loading.
+    if (!tickerEnabled) {
       setTicker({});
       setLoading(false);
       setError(null);
@@ -161,11 +162,10 @@ export function TickerProvider({
         setError(e instanceof Error ? e.message : "Failed to load prices")
       )
       .finally(() => setLoading(false));
-  }, [isSuiNetwork]);
+  }, [tickerEnabled]);
 
   useEffect(() => {
-    if (!isSuiNetwork) {
-      // Disable ticker polling entirely when we're on a non-Sui network.
+    if (!tickerEnabled) {
       setTicker({});
       setLoading(false);
       setError(null);
@@ -179,7 +179,7 @@ export function TickerProvider({
     }
     const id = setInterval(refetch, refreshIntervalMs);
     return () => clearInterval(id);
-  }, [refetch, refreshIntervalMs, isSuiNetwork]);
+  }, [refetch, refreshIntervalMs, tickerEnabled]);
 
   const value = useMemo(
     () => ({ ticker, loading, error, refetch }),

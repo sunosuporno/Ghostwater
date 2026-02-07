@@ -12,6 +12,8 @@ export type NetworkId = "sui-mainnet" | "base-sepolia" | "base-mainnet";
 export type NetworkCapabilities = {
   /** Whether the Margin tab and trading screens should be visible. */
   showMarginTab: boolean;
+  /** Whether the Pools tab (Sui margin pools — deposit from Base) should be visible. Base mainnet only. */
+  showPoolsTab: boolean;
   /** Whether Sui-specific wallet UI (balances, send) should be rendered. */
   showSuiWallet: boolean;
   /** Whether EVM-style wallet UI (e.g. Base) should be rendered. */
@@ -42,6 +44,7 @@ export const NETWORKS: NetworkConfig[] = [
     accentColor: "#32D583",
     capabilities: {
       showMarginTab: true,
+      showPoolsTab: false,
       showSuiWallet: true,
       showEvmWallet: false,
       showBaseMainnetExclusiveFeature: false,
@@ -57,6 +60,7 @@ export const NETWORKS: NetworkConfig[] = [
     evmChainId: "0x14a34", // 84532
     capabilities: {
       showMarginTab: false,
+      showPoolsTab: false,
       showSuiWallet: false,
       showEvmWallet: true,
       showBaseMainnetExclusiveFeature: false,
@@ -72,6 +76,7 @@ export const NETWORKS: NetworkConfig[] = [
     evmChainId: "0x2105", // 8453
     capabilities: {
       showMarginTab: false,
+      showPoolsTab: true,
       showSuiWallet: false,
       showEvmWallet: true,
       showBaseMainnetExclusiveFeature: true,

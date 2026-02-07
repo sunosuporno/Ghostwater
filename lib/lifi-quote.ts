@@ -96,3 +96,25 @@ export async function fetchLifiStatus(
   }
   return res.json();
 }
+
+/** Build LI.FI Explorer URL with prefilled params for Sui → Base (or other chains). */
+export function buildLifiExplorerUrl(params: {
+  fromChainId: number;
+  toChainId: number;
+  fromTokenAddress: string;
+  toTokenAddress: string;
+  fromAmount: string;
+  fromAddress: string;
+  toAddress?: string;
+}): string {
+  const search = new URLSearchParams({
+    fromChain: String(params.fromChainId),
+    toChain: String(params.toChainId),
+    fromToken: params.fromTokenAddress,
+    toToken: params.toTokenAddress,
+    fromAmount: params.fromAmount,
+    fromAddress: params.fromAddress,
+  });
+  if (params.toAddress) search.set("toAddress", params.toAddress);
+  return `https://explorer.li.fi?${search.toString()}`;
+}

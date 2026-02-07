@@ -10,6 +10,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  AppState,
+  AppStateStatus,
+  Linking,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -59,10 +62,21 @@ import {
   getSelectedMarginManagerId,
   setSelectedMarginManagerId,
 } from "@/lib/margin-manager-storage";
+import { useNetwork } from "@/lib/network";
 import { placeOrderViaBackend } from "@/lib/place-order-via-backend";
 import { getSuiAddressFromUser, getSuiWalletFromUser } from "@/lib/sui";
-import { fetchSuiBalance } from "@/lib/sui-balance-fetch";
+import { fetchAllBaseBalances, type BaseBalanceItem } from "@/lib/base-balance-fetch";
+import {
+  BASE_MAINNET_CHAIN_ID,
+  BASE_USDC_ADDRESS,
+  BRIDGE_TO_MARGIN_DEFAULT_LEVERAGE,
+  BRIDGE_TO_MARGIN_RECEIVE_TOKEN_SUI,
+  SUI_CHAIN_ID,
+} from "@/lib/bridge-to-margin-constants";
+import { fetchLifiQuote, fetchLifiStatus, type LifiStatusResponse } from "@/lib/lifi-quote";
+import { fetchAllSuiBalances, fetchSuiBalance } from "@/lib/sui-balance-fetch";
 import { publicKeyToHex } from "@/lib/sui-transfer-via-backend";
+import { useEmbeddedEthereumWallet } from "@privy-io/expo";
 import { usePrivy } from "@privy-io/expo";
 import { useSignRawHash } from "@privy-io/expo/extended-chains";
 
@@ -138,14 +152,451 @@ function formatCollateralAmount(amountRaw: string, assetType: string): string {
 }
 
 export default function PairDetailScreen() {
-  const { poolName } = useLocalSearchParams<{ poolName: string }>();
+  const { poolName, from } =
+    useLocalSearchParams<{ poolName: string; from?: string }>();
   const decodedPoolName = poolName ? decodeURIComponent(poolName) : null;
+  const cameFromPools = from === "pools";
+  const { currentNetwork } = useNetwork();
+  const showPlaceOrderBlock = currentNetwork.capabilities.showMarginTab;
 
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
   const insets = useSafeAreaInsets();
   const { user } = usePrivy();
   const suiAddress = getSuiAddressFromUser(user);
+  const { wallets: embeddedEthWallets } = useEmbeddedEthereumWallet();
+  const embeddedEthWallet = embeddedEthWallets?.[0] ?? null;
+
+  // When Place order is hidden (Base), show Base + Sui balances instead.
+  const [evmAddress, setEvmAddress] = useState<string | null>(null);
+  const [baseBalances, setBaseBalances] = useState<BaseBalanceItem[]>([]);
+  const [baseBalanceLoading, setBaseBalanceLoading] = useState(false);
+  const [suiBalancesForBlock, setSuiBalancesForBlock] = useState<
+    Array<{ symbol: string; formatted: string }>
+  >([]);
+  const [suiBalanceLoadingForBlock, setSuiBalanceLoadingForBlock] =
+    useState(false);
+
+  // Base trading block: long/short, token from Base wallet, amount, send (bridge later).
+  const [baseTradeSide, setBaseTradeSide] = useState<"long" | "short">("long");
+  const [selectedBaseToken, setSelectedBaseToken] =
+    useState<BaseBalanceItem | null>(null);
+  const [baseTradeAmount, setBaseTradeAmount] = useState("");
+  const [baseTradeTokenPickerOpen, setBaseTradeTokenPickerOpen] =
+    useState(false);
+
+  // Bridge (Base → Sui USDC) for Trade block: track tx and LI.FI status until DONE
+  const [bridgeTxHash, setBridgeTxHash] = useState<string | null>(null);
+  const [bridgeLifiStatus, setBridgeLifiStatus] =
+    useState<LifiStatusResponse | null>(null);
+  const [bridgeLoading, setBridgeLoading] = useState(false);
+  const [bridgeError, setBridgeError] = useState<string | null>(null);
+  const [depositAndOpenLoading, setDepositAndOpenLoading] = useState(false);
+
+  /** Sui→Base bridge: same inline experience as Base→Sui (quote → send → status, no modal). */
+  const [withdrawBridgePending, setWithdrawBridgePending] = useState<{
+    amountRaw: string;
+    fromAddress: string;
+    toAddress: string | null;
+  } | null>(null);
+  const [withdrawBridgeTxHash, setWithdrawBridgeTxHash] = useState<string | null>(null);
+  const [withdrawBridgeStatus, setWithdrawBridgeStatus] = useState<LifiStatusResponse | null>(null);
+  const [withdrawBridgeLoading, setWithdrawBridgeLoading] = useState(false);
+  const [withdrawBridgeError, setWithdrawBridgeError] = useState<string | null>(null);
+  /** Which flow started the current bridge: only that flow's tracker is shown. */
+  const [withdrawBridgeStartedBy, setWithdrawBridgeStartedBy] = useState<'withdraw-button' | 'close-and-send' | null>(null);
+  const onBridgeToBaseRef = useRef<(payload?: { amountRaw: string; fromAddress: string; toAddress: string | null }) => Promise<void>>(() => Promise.resolve());
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!embeddedEthWallet) {
+      setEvmAddress(null);
+      return () => {
+        cancelled = true;
+      };
+    }
+    (async () => {
+      try {
+        const provider = await (embeddedEthWallet as { getProvider?: () => Promise<{ request: (args: { method: string }) => Promise<string[]> }> }).getProvider?.();
+        const accounts = provider
+          ? (await provider.request({ method: "eth_requestAccounts" })) as string[]
+          : [];
+        if (!cancelled) setEvmAddress(accounts?.[0] ?? null);
+      } catch {
+        if (!cancelled) setEvmAddress(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [embeddedEthWallet]);
+
+  useEffect(() => {
+    if (showPlaceOrderBlock || !evmAddress) {
+      setBaseBalances([]);
+      setBaseBalanceLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setBaseBalanceLoading(true);
+    fetchAllBaseBalances(evmAddress, "base-mainnet")
+      .then((list) => {
+        if (!cancelled) setBaseBalances(list);
+      })
+      .catch(() => {
+        if (!cancelled) setBaseBalances([]);
+      })
+      .finally(() => {
+        if (!cancelled) setBaseBalanceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showPlaceOrderBlock, evmAddress]);
+
+  const refetchSuiBalancesForBlock = useCallback(() => {
+    if (showPlaceOrderBlock || !suiAddress) return;
+    setSuiBalanceLoadingForBlock(true);
+    fetchAllSuiBalances(suiAddress)
+      .then((list) =>
+        setSuiBalancesForBlock(
+          list.map((b) => ({ symbol: b.symbol, formatted: b.formatted }))
+        )
+      )
+      .catch(() => setSuiBalancesForBlock([]))
+      .finally(() => setSuiBalanceLoadingForBlock(false));
+  }, [showPlaceOrderBlock, suiAddress]);
+
+  useEffect(() => {
+    if (showPlaceOrderBlock || !suiAddress) {
+      setSuiBalancesForBlock([]);
+      setSuiBalanceLoadingForBlock(false);
+      return;
+    }
+    refetchSuiBalancesForBlock();
+  }, [showPlaceOrderBlock, suiAddress, refetchSuiBalancesForBlock]);
+
+  // Poll LI.FI status for Trade-block bridge (Base→Sui) until DONE/FAILED or timeout
+  useEffect(() => {
+    if (!bridgeTxHash) return;
+
+    let notFoundCount = 0;
+    const maxNotFound = 10;
+    const pollMs = 6000;
+    const maxPolls = 100; // ~10 min; bridges can take a while
+    let pollCount = 0;
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    const poll = async (): Promise<boolean> => {
+      try {
+        const status = await fetchLifiStatus(
+          bridgeTxHash!,
+          BASE_MAINNET_CHAIN_ID
+        );
+        setBridgeLifiStatus(status);
+        if (status.status === "NOT_FOUND") {
+          notFoundCount += 1;
+          if (notFoundCount >= maxNotFound) return true;
+        } else {
+          notFoundCount = 0;
+          if (status.status === "DONE" || status.status === "FAILED")
+            return true;
+        }
+      } catch {
+        // keep polling on network error
+      }
+      return false;
+    };
+
+    const schedulePoll = () => {
+      intervalId = setInterval(async () => {
+        pollCount += 1;
+        if (pollCount > maxPolls && intervalId) {
+          clearInterval(intervalId);
+          intervalId = null;
+          return;
+        }
+        const done = await poll();
+        if (done && intervalId) {
+          clearInterval(intervalId);
+          intervalId = null;
+        }
+      }, pollMs);
+    };
+
+    // Run first poll immediately so we show DONE quickly if bridge already completed
+    poll().then((done) => {
+      if (!done) schedulePoll();
+    });
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [bridgeTxHash]);
+
+  // Poll LI.FI status for Sui→Base bridge (withdraw/close-and-send) until DONE/FAILED
+  useEffect(() => {
+    if (!withdrawBridgeTxHash) return;
+    const pollMs = 6000;
+    const maxPolls = 100; // ~10 min; bridges can take a while
+    let pollCount = 0;
+    let intervalId: ReturnType<typeof setInterval> | null = null;
+
+    const doPoll = async (): Promise<boolean> => {
+      try {
+        const status = await fetchLifiStatus(withdrawBridgeTxHash!, SUI_CHAIN_ID);
+        setWithdrawBridgeStatus(status);
+        return status.status === "DONE" || status.status === "FAILED";
+      } catch {
+        return false;
+      }
+    };
+
+    const schedulePoll = () => {
+      intervalId = setInterval(async () => {
+        pollCount += 1;
+        if (pollCount > maxPolls && intervalId) {
+          clearInterval(intervalId);
+          intervalId = null;
+          return;
+        }
+        const done = await doPoll();
+        if (done && intervalId) {
+          clearInterval(intervalId);
+          intervalId = null;
+        }
+      }, pollMs);
+    };
+
+    // Run first poll immediately so we show DONE quickly if bridge already completed
+    doPoll().then((done) => {
+      if (!done) schedulePoll();
+    });
+
+    return () => {
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [withdrawBridgeTxHash]);
+
+  // When app comes to foreground, refresh bridge status once (bridge may have completed while away)
+  const bridgeTxHashRef = useRef(bridgeTxHash);
+  bridgeTxHashRef.current = bridgeTxHash;
+  const bridgeLifiStatusRef = useRef(bridgeLifiStatus);
+  bridgeLifiStatusRef.current = bridgeLifiStatus;
+  const withdrawBridgeTxHashRef = useRef(withdrawBridgeTxHash);
+  withdrawBridgeTxHashRef.current = withdrawBridgeTxHash;
+  const withdrawBridgeStatusRef = useRef(withdrawBridgeStatus);
+  withdrawBridgeStatusRef.current = withdrawBridgeStatus;
+  useEffect(() => {
+    const sub = AppState.addEventListener("change", (nextState: AppStateStatus) => {
+      if (nextState !== "active") return;
+      // Base→Sui (Trade block)
+      const baseSuiHash = bridgeTxHashRef.current;
+      const baseSuiStatus = bridgeLifiStatusRef.current;
+      if (baseSuiHash && (!baseSuiStatus || (baseSuiStatus.status !== "DONE" && baseSuiStatus.status !== "FAILED"))) {
+        fetchLifiStatus(baseSuiHash, BASE_MAINNET_CHAIN_ID)
+          .then((s) => setBridgeLifiStatus(s))
+          .catch(() => {});
+      }
+      // Sui→Base (withdraw)
+      const suiBaseHash = withdrawBridgeTxHashRef.current;
+      const suiBaseStatus = withdrawBridgeStatusRef.current;
+      if (suiBaseHash && (!suiBaseStatus || suiBaseStatus.status === "PENDING")) {
+        fetchLifiStatus(suiBaseHash, SUI_CHAIN_ID)
+          .then((s) => setWithdrawBridgeStatus(s))
+          .catch(() => {});
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  const handleSendBridge = useCallback(async () => {
+    if (!evmAddress?.trim()) {
+      setBridgeError("No Base wallet address");
+      return;
+    }
+    if (!embeddedEthWallet) {
+      setBridgeError("No Privy EVM wallet available for sending.");
+      return;
+    }
+    if (!suiAddress?.trim()) {
+      setBridgeError("Link a Sui wallet in Home to receive on Sui.");
+      return;
+    }
+    if (!selectedBaseToken) {
+      setBridgeError("Select a token");
+      return;
+    }
+    const amountNum = parseFloat(baseTradeAmount);
+    if (isNaN(amountNum) || amountNum <= 0) {
+      setBridgeError("Enter a valid amount");
+      return;
+    }
+    const decimals = selectedBaseToken.decimals;
+    const amountRaw = BigInt(
+      Math.round(amountNum * Math.pow(10, decimals))
+    );
+    if (amountRaw > BigInt(selectedBaseToken.rawBalance)) {
+      setBridgeError("Amount exceeds your balance");
+      return;
+    }
+    const chainIdHex = currentNetwork.evmChainId;
+    if (!chainIdHex) {
+      setBridgeError("Current network is not configured for cross-chain send.");
+      return;
+    }
+
+    setBridgeError(null);
+    setBridgeTxHash(null);
+    setBridgeLifiStatus(null);
+    setBridgeLoading(true);
+
+    try {
+      const provider = await (embeddedEthWallet as { getProvider?: () => Promise<{ request: (args: { method: string; params?: unknown[] }) => Promise<unknown> }> }).getProvider?.();
+      if (!provider) {
+        setBridgeError("Could not get wallet provider");
+        setBridgeLoading(false);
+        return;
+      }
+      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+      const from = accounts?.[0];
+      if (!from) {
+        setBridgeError("No account found in embedded wallet");
+        setBridgeLoading(false);
+        return;
+      }
+      try {
+        const currentChainId = (await provider.request({ method: "eth_chainId" })) as string;
+        if (currentChainId !== chainIdHex) {
+          await provider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: chainIdHex }],
+          });
+        }
+      } catch {
+        setBridgeError(`Switch to ${currentNetwork.shortLabel} in your wallet and try again.`);
+        setBridgeLoading(false);
+        return;
+      }
+
+      const fromTokenAddress =
+        selectedBaseToken.tokenAddress === null
+          ? "0x0000000000000000000000000000000000000000"
+          : selectedBaseToken.tokenAddress;
+
+      const quoteResult = (await fetchLifiQuote({
+        fromChainId: BASE_MAINNET_CHAIN_ID,
+        toChainId: SUI_CHAIN_ID,
+        fromTokenAddress,
+        toTokenAddress: BRIDGE_TO_MARGIN_RECEIVE_TOKEN_SUI,
+        fromAmount: amountRaw.toString(),
+        fromAddress: evmAddress,
+        toAddress: suiAddress,
+        slippage: 0.005,
+      })) as {
+        transactionRequest?: {
+          to?: string;
+          data?: string;
+          value?: string;
+          gasLimit?: string;
+          gasPrice?: string;
+          maxFeePerGas?: string;
+          maxPriorityFeePerGas?: string;
+          chainId?: number;
+        };
+        estimate?: { approvalAddress?: string };
+      };
+
+      const txRequest = quoteResult?.transactionRequest;
+      if (!txRequest?.to || !txRequest?.data) {
+        setBridgeError("No route returned. Try a different amount or token.");
+        setBridgeLoading(false);
+        return;
+      }
+
+      // Fetch current nonce from chain so we don't use a stale one (avoids "nonce too low" after a previous tx completed).
+      const nonceHex = (await provider.request({
+        method: "eth_getTransactionCount",
+        params: [from, "latest"],
+      })) as string;
+      let nextNonce = parseInt(nonceHex, 16);
+
+      // ERC20 allowance: if the route spends an ERC20 (e.g. USDC), LI.FI returns approvalAddress.
+      // We must approve that contract to spend our tokens before the bridge tx (which uses transferFrom).
+      const isErc20 = fromTokenAddress !== "0x0000000000000000000000000000000000000000";
+      const approvalAddress = quoteResult?.estimate?.approvalAddress;
+      if (isErc20 && approvalAddress) {
+        const pad64 = (hex: string) => hex.replace(/^0x/, "").padStart(64, "0");
+        const approveData =
+          "0x095ea7b3" +
+          pad64(approvalAddress) +
+          pad64(amountRaw.toString(16));
+        const approveTxHash = (await provider.request({
+          method: "eth_sendTransaction",
+          params: [
+            {
+              from,
+              to: fromTokenAddress,
+              data: approveData,
+              value: "0x0",
+              gasLimit: "0xfde8", // 65000
+              nonce: "0x" + nextNonce.toString(16),
+            },
+          ],
+        })) as string;
+        nextNonce += 1;
+        const deadline = Date.now() + 60_000;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 2000));
+          const receipt = (await provider.request({
+            method: "eth_getTransactionReceipt",
+            params: [approveTxHash],
+          })) as { blockNumber?: string } | null;
+          if (receipt?.blockNumber) break;
+        }
+        // Refresh nonce after approval so bridge tx uses the correct one (in case of reorg or delay).
+        const nonceAfterApprove = (await provider.request({
+          method: "eth_getTransactionCount",
+          params: [from, "latest"],
+        })) as string;
+        nextNonce = parseInt(nonceAfterApprove, 16);
+      }
+
+      const tx: Record<string, string> = {
+        from,
+        to: txRequest.to,
+        data: txRequest.data,
+        value: txRequest.value ?? "0x0",
+        nonce: "0x" + nextNonce.toString(16),
+      };
+      if (txRequest.gasLimit) tx.gasLimit = txRequest.gasLimit;
+      if (txRequest.gasPrice) tx.gasPrice = txRequest.gasPrice;
+      if (txRequest.maxFeePerGas) tx.maxFeePerGas = txRequest.maxFeePerGas;
+      if (txRequest.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = txRequest.maxPriorityFeePerGas;
+      if (txRequest.chainId != null) tx.chainId = "0x" + Number(txRequest.chainId).toString(16);
+
+      const txHash = await provider.request({
+        method: "eth_sendTransaction",
+        params: [tx],
+      });
+      const hashStr = String(txHash);
+      setBridgeTxHash(hashStr);
+      setBaseTradeAmount("");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Bridge send failed";
+      setBridgeError(msg);
+    } finally {
+      setBridgeLoading(false);
+    }
+  }, [
+    evmAddress,
+    embeddedEthWallet,
+    suiAddress,
+    selectedBaseToken,
+    baseTradeAmount,
+    currentNetwork.evmChainId,
+    currentNetwork.shortLabel,
+  ]);
 
   const { ticker } = useTicker(PRICE_POLL_MS);
   const livePrice = decodedPoolName
@@ -416,6 +867,17 @@ export default function PairDetailScreen() {
     }, [marginManagerId, refreshMarginHistory])
   );
 
+  // When on Base (Trade block): clear bridge state on focus so user can start a new bridge after leaving and returning.
+  useFocusEffect(
+    useCallback(() => {
+      if (!showPlaceOrderBlock) {
+        setBridgeTxHash(null);
+        setBridgeLifiStatus(null);
+        setBridgeError(null);
+      }
+    }, [showPlaceOrderBlock])
+  );
+
   const [orderSide, setOrderSide] = useState<"buy" | "sell">("buy");
   const [orderType, setOrderType] = useState<"limit" | "market">("limit");
   const [leverage, setLeverage] = useState(1);
@@ -450,6 +912,9 @@ export default function PairDetailScreen() {
     useState(false);
   const [orderLoading, setOrderLoading] = useState(false);
   const [closePositionLoading, setClosePositionLoading] = useState(false);
+  const [closeAndWithdrawLoading, setCloseAndWithdrawLoading] = useState(false);
+  const [closeAndSendToBaseLoading, setCloseAndSendToBaseLoading] = useState(false);
+  const [withdrawToBaseLoading, setWithdrawToBaseLoading] = useState(false);
   const [tpPrice, setTpPrice] = useState("");
   const [slPrice, setSlPrice] = useState("");
   const [tpslLoading, setTpslLoading] = useState(false);
@@ -808,6 +1273,25 @@ export default function PairDetailScreen() {
     decodedPoolName,
     poolInfoForPair?.base_asset_id,
     poolInfoForPair?.quote_asset_symbol,
+  ]);
+
+  /** Show Position block only when at least one of base/quote borrowed (human) is >= 0.09. Indexer state uses human debt. */
+  const BORROWED_THRESHOLD_POSITION_BLOCK = 0.09;
+  const showPositionBlock = useMemo(() => {
+    if (!livePnl.hasPosition || !livePnl.hasDebt || livePnl.positionSide === "none")
+      return false;
+    const baseBorrowedHuman = state ? Number(state.base_debt) : 0;
+    const quoteBorrowedHuman = state ? Number(state.quote_debt) : 0;
+    return (
+      baseBorrowedHuman >= BORROWED_THRESHOLD_POSITION_BLOCK ||
+      quoteBorrowedHuman >= BORROWED_THRESHOLD_POSITION_BLOCK
+    );
+  }, [
+    livePnl.hasPosition,
+    livePnl.hasDebt,
+    livePnl.positionSide,
+    state?.base_debt,
+    state?.quote_debt,
   ]);
 
   // (Removed verbose balance/source debug logging to keep console clean.)
@@ -1275,220 +1759,511 @@ export default function PairDetailScreen() {
     refreshMarginState,
   ]);
 
-  const onClosePosition = useCallback(async () => {
-    if (
-      !livePnl.hasPosition ||
-      !livePnl.hasDebt ||
-      livePnl.positionSide === "none"
-    )
+  const handleDepositAndOpenPosition = useCallback(async () => {
+    const status = bridgeLifiStatus;
+    if (status?.status !== "DONE" || !status.receiving?.amount) {
+      Alert.alert("Deposit & open position", "Bridge not complete or amount unknown.");
       return;
-    const baseDebt = state ? Number(state.base_debt) : 0;
-    const quoteDebt = state ? Number(state.quote_debt) : 0;
-    const hasDebt = baseDebt > 0 || quoteDebt > 0;
-    // One position per margin manager. Convert quote → base first when short (use USDC to buy SUI); then repay.
-    const latestTrade = tradeHistory[0];
-    const mark = livePnl.currentPrice;
-    const quoteAsset = state ? Number(state.quote_asset) : 0;
-    const baseAsset = state ? Number(state.base_asset) : 0;
-    const onChainPositionSize = Math.abs(livePnl.netBasePosition);
-
-    let closeQuantity: number;
+    }
+    const rawAmount = status.receiving.amount;
+    const decimals = status.receiving.token?.decimals ?? 6;
+    const depositAmountHuman = Number(rawAmount) / Math.pow(10, decimals);
     if (
-      livePnl.positionSide === "short" &&
-      latestTrade?.quote_volume != null &&
-      latestTrade?.price != null &&
-      mark > 0
+      !Number.isFinite(depositAmountHuman) ||
+      depositAmountHuman < MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT
     ) {
-      // Short: only swap the position (size + unrealized) in USDC — the amount that went into the trade. Convert that to base.
-      const sizeInQuote = Number(latestTrade.quote_volume);
-      const entry = Number(latestTrade.price);
-      const unrealizedInQuote = sizeInQuote * (entry - mark) / entry;
-      const totalQuoteToConvert = sizeInQuote + unrealizedInQuote;
-      closeQuantity = totalQuoteToConvert / mark;
-      if (quoteAsset > 0) {
-        closeQuantity = Math.min(closeQuantity, quoteAsset / mark);
-      }
-    } else if (livePnl.positionSide === "short" && quoteAsset > 0 && mark > 0) {
-      closeQuantity = quoteAsset / mark;
-    } else if (livePnl.positionSide === "long" && baseAsset > 0) {
-      // Long: close only the SUI involved in the trade (size + unrealized PnL),
-      // not extra SUI collateral sitting in the account.
-      if (
-        latestTrade?.quote_volume != null &&
-        latestTrade?.price != null &&
-        mark > 0
-      ) {
-        const sizeInQuote = Number(latestTrade.quote_volume); // trade notional in USDC
-        const entry = Number(latestTrade.price);
-        const unrealizedInQuote = sizeInQuote * (mark - entry) / entry;
-        const totalQuoteToConvert = sizeInQuote + unrealizedInQuote;
-        const qtyFromTrade = totalQuoteToConvert / mark; // SUI = (size + PnL)/mark
-        closeQuantity = Math.min(
-          qtyFromTrade,
-          baseAsset,
-          onChainPositionSize || qtyFromTrade
-        );
-      } else if (latestTrade?.base_volume != null) {
-        const tradeBaseSize = Number(latestTrade.base_volume);
-        closeQuantity = Math.min(tradeBaseSize, baseAsset);
-      } else {
-        closeQuantity = Math.min(baseAsset, onChainPositionSize || baseAsset);
-      }
-    } else if (
-      latestTrade?.quote_volume != null &&
-      latestTrade?.price != null &&
-      mark > 0
-    ) {
-      const sizeInSameDenom = Number(latestTrade.quote_volume);
-      const entry = Number(latestTrade.price);
-      const unrealizedInSameDenom =
-        livePnl.positionSide === "long"
-          ? sizeInSameDenom * (mark - entry) / entry
-          : sizeInSameDenom * (entry - mark) / entry;
-      closeQuantity = (sizeInSameDenom + unrealizedInSameDenom) / mark;
-      closeQuantity = Math.min(closeQuantity, onChainPositionSize || closeQuantity);
-    } else if (latestTrade?.base_volume != null) {
-      closeQuantity = Math.min(Number(latestTrade.base_volume), onChainPositionSize || Number(latestTrade.base_volume));
-    } else {
-      closeQuantity = onChainPositionSize;
-    }
-    if (__DEV__) {
-      console.log("[ClosePosition] computed raw close quantity", {
-        positionSide: livePnl.positionSide,
-        baseAsset,
-        quoteAsset,
-        baseDebt,
-        quoteDebt,
-        onChainPositionSize,
-        latestTrade,
-        mark,
-        closeQuantity,
-      });
-    }
-    closeQuantity = Math.round(closeQuantity * 1e6) / 1e6;
-    const canPlaceCloseOrder = closeQuantity >= MIN_ORDER_QUANTITY;
-    if (__DEV__) {
-      console.log("[ClosePosition] normalized close quantity", {
-        closeQuantity,
-        canPlaceCloseOrder,
-        minOrderQuantity: MIN_ORDER_QUANTITY,
-      });
-    }
-
-    if (!canPlaceCloseOrder && !hasDebt) {
       Alert.alert(
-        "Close position",
-        `Position size (${closeQuantity.toFixed(6)}) is below minimum order ${MIN_ORDER_QUANTITY}. Nothing to repay.`
+        "Deposit & open position",
+        `Received amount is below minimum deposit (${MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT}).`
       );
       return;
     }
-    if (!marginManagerId || !decodedPoolName || !suiAddress) {
-      Alert.alert("Close position", "Select a margin account first.");
+    if (typeof livePrice !== "number" || livePrice <= 0) {
+      Alert.alert("Deposit & open position", "Price not available. Try again in a moment.");
+      return;
+    }
+    if (!suiAddress || !decodedPoolName || !poolInfoForPair) {
+      Alert.alert("Deposit & open position", "Missing wallet or pool.");
       return;
     }
     if (!signRawHash || !suiWallet?.publicKey) {
-      Alert.alert("Close position", "Wallet signing not available.");
+      Alert.alert(
+        "Deposit & open position",
+        "Signing not available. Link your Sui wallet on Home."
+      );
       return;
     }
-    setClosePositionLoading(true);
+
+    let effectiveManagerId = managerForThisPool?.margin_manager_id ?? null;
+    setDepositAndOpenLoading(true);
     try {
       const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
-      if (canPlaceCloseOrder) {
-        if (__DEV__) {
-          console.log("[ClosePosition] placing close order via backend", {
+      if (!effectiveManagerId) {
+        const result = await createMarginManagerViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          poolKey: decodedPoolName,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+        effectiveManagerId = result.margin_manager_id;
+        setJustCreatedManager({
+          margin_manager_id: result.margin_manager_id,
+          deepbook_pool_id: poolInfoForPair.deepbook_pool_id,
+        });
+        await refreshOwned();
+        // Allow the new margin manager object to propagate before deposit tx references it
+        await new Promise((r) => setTimeout(r, 2500));
+      }
+      const doDeposit = () =>
+        depositMarginViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId: effectiveManagerId!,
+          poolKey: decodedPoolName,
+          asset: "quote",
+          amount: depositAmountHuman,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+      try {
+        await doDeposit();
+      } catch (depositErr) {
+        const msg =
+          depositErr instanceof Error ? depositErr.message : String(depositErr);
+        if (msg.includes("does not exist")) {
+          await new Promise((r) => setTimeout(r, 2000));
+          await doDeposit();
+        } else {
+          throw depositErr;
+        }
+      }
+      // --- Post-deposit: open position at 2× (same logic as main Sui Place order) ---
+      // Step 1: Wait for deposit to be visible on chain (so borrow + order tx sees updated balance).
+      await new Promise((r) => setTimeout(r, 3500));
+
+      // Step 2: Read collateral from chain via SDK (balanceManager / calculateAssets). No indexer (avoids delay).
+      const chainState = await fetchMarginBorrowedSharesViaBackend({
+        apiUrl,
+        marginManagerId: effectiveManagerId!,
+        poolKey: decodedPoolName,
+        network: "mainnet",
+      });
+      const assets = chainState.calculateAssets;
+      if (!assets || (Number(assets.quote_asset) <= 0 && Number(assets.base_asset) <= 0)) {
+        throw new Error("Could not read margin balance from chain. Try again in a moment.");
+      }
+
+      // Step 3: Convert raw chain amounts to human (chain returns u64 in token smallest units).
+      const quoteDecimals = poolInfoForPair?.quote_asset_id
+        ? getDecimalsForCoinType(poolInfoForPair.quote_asset_id)
+        : 6;
+      const baseDecimals = poolInfoForPair?.base_asset_id
+        ? getDecimalsForCoinType(poolInfoForPair.base_asset_id)
+        : 9;
+      const collateralQuoteRaw = Number(assets.quote_asset);
+      const collateralBaseRaw = Number(assets.base_asset);
+      const collateralQuote = collateralQuoteRaw / Math.pow(10, quoteDecimals);
+      const collateralBaseHuman = collateralBaseRaw / Math.pow(10, baseDecimals);
+
+      // Step 4: Borrow same amount as the asset we have. If both > 0, use the one with higher value (quote value vs base value in USD).
+      const quoteValue = collateralQuote;
+      const baseValue = collateralBaseHuman * livePrice;
+      const useQuote =
+        collateralQuote > 0 &&
+        (collateralBaseHuman <= 0 || quoteValue >= baseValue);
+
+      let borrowQuoteAmount: number | undefined;
+      let borrowBaseAmount: number | undefined;
+      let orderQty: number;
+      const isBid = useQuote;
+
+      if (useQuote) {
+        borrowQuoteAmount = Math.round(collateralQuote * 1e6) / 1e6;
+        borrowBaseAmount = undefined;
+        orderQty = (2 * collateralQuote) / livePrice;
+      } else {
+        borrowQuoteAmount = undefined;
+        borrowBaseAmount = Math.round(collateralBaseHuman * 1e6) / 1e6;
+        orderQty = 2 * collateralBaseHuman;
+      }
+
+      let orderQtyRounded = Math.floor(orderQty * 10) / 10;
+      if (orderQtyRounded < MIN_ORDER_QUANTITY) {
+        throw new Error(`Position size at 2× would be below minimum (${MIN_ORDER_QUANTITY}). Need more collateral.`);
+      }
+
+      const expectedQuoteAfterBorrow = collateralQuote + (borrowQuoteAmount ?? 0);
+      const expectedBaseAfterBorrow = collateralBaseHuman + (borrowBaseAmount ?? 0);
+
+      // Cap order size so we don't use 100% of expected balance (avoids withdraw_with_proof abort from rounding).
+      const RESERVE_FRACTION = 0.995; // use at most 99.5% of expected after borrow
+      if (isBid) {
+        const maxNotionalQuote = expectedQuoteAfterBorrow * RESERVE_FRACTION;
+        const maxQtyFromQuote = maxNotionalQuote / livePrice;
+        if (orderQtyRounded > maxQtyFromQuote) {
+          orderQtyRounded = Math.floor(maxQtyFromQuote * 10) / 10;
+        }
+      } else {
+        const maxBase = expectedBaseAfterBorrow * RESERVE_FRACTION;
+        if (orderQtyRounded > maxBase) {
+          orderQtyRounded = Math.floor(maxBase * 10) / 10;
+        }
+      }
+      if (orderQtyRounded < MIN_ORDER_QUANTITY) {
+        throw new Error(`Position size after reserve would be below minimum (${MIN_ORDER_QUANTITY}). Need more collateral.`);
+      }
+
+      const orderNotionalQuote = orderQtyRounded * livePrice;
+      console.log("[Deposit & open position] After borrow (expected):", {
+        quote: expectedQuoteAfterBorrow,
+        base: expectedBaseAfterBorrow,
+      });
+      console.log("[Deposit & open position] placeMarketOrder using:", {
+        quantity: orderQtyRounded,
+        isBid,
+        notionalQuote: orderNotionalQuote,
+      });
+
+      await placeOrderViaBackend({
+        apiUrl,
+        sender: suiAddress,
+        marginManagerId: effectiveManagerId!,
+        poolKey: decodedPoolName,
+        orderType: "market",
+        isBid,
+        quantity: orderQtyRounded,
+        payWithDeep: false,
+        borrowBaseAmount,
+        borrowQuoteAmount,
+        signRawHash,
+        publicKeyHex,
+        network: "mainnet",
+      });
+      refreshMarginState?.();
+      refreshMarginHistory?.();
+      refreshOpenOrders?.();
+      refreshOrderHistory?.();
+      refreshTradeHistory?.();
+      setBridgeTxHash(null);
+      setBridgeLifiStatus(null);
+      Alert.alert("Deposit & open position", "Position opened at 2× leverage.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Something went wrong.";
+      Alert.alert("Deposit & open position", msg);
+    } finally {
+      setDepositAndOpenLoading(false);
+    }
+  }, [
+    bridgeLifiStatus,
+    livePrice,
+    baseTradeSide,
+    managerForThisPool,
+    suiAddress,
+    decodedPoolName,
+    poolInfoForPair,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    refreshOwned,
+    refreshMarginState,
+    refreshMarginHistory,
+    refreshOpenOrders,
+    refreshOrderHistory,
+    refreshTradeHistory,
+  ]);
+
+  const onClosePosition = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = options?.silent === true;
+    if (!livePnl.hasPosition || livePnl.positionSide === "none") return;
+
+    const MAX_CLOSE_ITERATIONS = 10;
+    // Wait for previous tx to commit so next tx uses fresh object versions (avoids "not available for consumption").
+    const CLOSE_WAIT_MS = 12_000;
+    let currentState: typeof state = state;
+    let iterations = 0;
+    let didPlaceAnyOrder = false;
+    let didRepayAny = false;
+    let dustDeadlock = false;
+    let lastDustDebtQuote = 0;
+
+    while (iterations < MAX_CLOSE_ITERATIONS) {
+      let baseDebt = currentState ? Number(currentState.base_debt) : 0;
+      let quoteDebt = currentState ? Number(currentState.quote_debt) : 0;
+      if (iterations === 0 && marginManagerId && decodedPoolName && (baseDebt > 0 || quoteDebt > 0)) {
+        try {
+          const chain = await fetchMarginBorrowedSharesViaBackend({
+            apiUrl,
+            marginManagerId,
+            poolKey: decodedPoolName,
+            network: "mainnet",
+          });
+          const quoteDecimals = poolInfoForPair?.quote_asset_id
+            ? getDecimalsForCoinType(poolInfoForPair.quote_asset_id)
+            : 6;
+          const baseDecimals = poolInfoForPair?.base_asset_id
+            ? getDecimalsForCoinType(poolInfoForPair.base_asset_id)
+            : 9;
+          if (chain.calculateDebts?.quote_debt)
+            quoteDebt = Number(chain.calculateDebts.quote_debt) / Math.pow(10, quoteDecimals);
+          if (chain.calculateDebts?.base_debt)
+            baseDebt = Number(chain.calculateDebts.base_debt) / Math.pow(10, baseDecimals);
+        } catch (_) {
+          /* keep indexer values */
+        }
+      }
+      const hasDebt = baseDebt > 0 || quoteDebt > 0;
+      const mark =
+        Number(
+          decodedPoolName && ticker[decodedPoolName]?.last_price
+            ? ticker[decodedPoolName].last_price
+            : 0
+        ) || livePnl.currentPrice;
+      const quoteAsset = currentState ? Number(currentState.quote_asset) : 0;
+      const baseAsset = currentState ? Number(currentState.base_asset) : 0;
+      const netBaseSigned =
+        currentState != null
+          ? Number(currentState.base_asset) - Number(currentState.base_debt)
+          : 0;
+      const onChainPositionSize = Math.abs(netBaseSigned);
+      // Derive side from on-chain state only. Do not use livePnl.positionSide:
+      // after a close-sell the latest trade is "sell" so UI would show "short",
+      // but we may still have net long (base_asset > base_debt).
+      const currentPositionSide: "long" | "short" =
+        netBaseSigned > 0 ? "long" : netBaseSigned < 0 ? "short" : "long";
+
+      if (onChainPositionSize < MIN_ORDER_QUANTITY) break;
+
+      console.log("[ClosePosition] inputs from state & livePnl", {
+        iteration: iterations + 1,
+        base_asset: baseAsset,
+        quote_asset: quoteAsset,
+        base_debt: baseDebt,
+        quote_debt: quoteDebt,
+        netBasePosition: netBaseSigned,
+        positionSide: currentPositionSide,
+        mark,
+        hasDebt,
+      });
+
+      // Close quantity = size + unrealized, but contract (ENotReduceOnlyOrder = 3) requires:
+      // - Long (ask): quote_quantity from get_quote_quantity_out(quantity) <= quote_debt - quote_asset.
+      //   When net quote debt is 0 (position left after repay), we can still close the full base.
+      // - Short (bid): quantity <= base_debt - base_asset. When net base debt is 0, close with available quote.
+      const unrealizedPnlQuote = livePnl.unrealizedPnlQuote ?? 0;
+      const unrealizedInBase = mark > 0 ? unrealizedPnlQuote / mark : 0;
+      const sizePlusUnrealized = onChainPositionSize + unrealizedInBase;
+      const FEE_BUFFER = 0.99; // stay under contract limit after fees
+
+      let closeQuantity: number;
+      if (currentPositionSide === "long") {
+        const netQuoteDebt = Math.max(0, quoteDebt - quoteAsset);
+        const maxBaseByNetQuoteDebt =
+          netQuoteDebt > 0 && mark > 0
+            ? (netQuoteDebt * FEE_BUFFER) / mark
+            : baseAsset; // no debt => close full base
+        closeQuantity = Math.min(
+          baseAsset,
+          sizePlusUnrealized,
+          maxBaseByNetQuoteDebt
+        );
+        console.log("[ClosePosition] long branch (capped by net quote debt)", {
+          onChainPositionSize,
+          sizePlusUnrealized,
+          baseAsset,
+          quoteDebt,
+          quoteAsset,
+          netQuoteDebt,
+          maxBaseByNetQuoteDebt,
+          closeQuantityRaw: closeQuantity,
+        });
+      } else {
+        const netBaseDebt = Math.max(0, baseDebt - baseAsset);
+        const maxBaseByNetDebt =
+          netBaseDebt > 0 ? netBaseDebt * FEE_BUFFER : Infinity; // no debt => close with quote
+        if (quoteAsset > 0 && mark > 0) {
+          const maxBaseFromQuote = (quoteAsset / mark) * FEE_BUFFER;
+          closeQuantity = Math.min(
+            maxBaseFromQuote,
+            sizePlusUnrealized,
+            maxBaseByNetDebt
+          );
+        } else {
+          closeQuantity = Math.min(sizePlusUnrealized, maxBaseByNetDebt);
+        }
+        console.log("[ClosePosition] short branch (capped by net base debt)", {
+          onChainPositionSize,
+          sizePlusUnrealized,
+          baseDebt,
+          baseAsset,
+          netBaseDebt,
+          maxBaseByNetDebt,
+          closeQuantityRaw: closeQuantity,
+        });
+      }
+      // Slight reserve so we stay under on-chain limit (rounding/fees).
+      const CLOSE_RESERVE_FRACTION = 0.99;
+      closeQuantity = closeQuantity * CLOSE_RESERVE_FRACTION;
+      const baseDecimals = poolInfoForPair?.base_asset_id
+        ? getDecimalsForCoinType(poolInfoForPair.base_asset_id)
+        : 9;
+      const scalar = Math.pow(10, baseDecimals);
+      let rawFloor = Math.floor(closeQuantity * scalar);
+      const safeRaw = Math.max(0, rawFloor - 1);
+      closeQuantity = safeRaw / scalar;
+      const lotSizeRaw = Math.pow(10, baseDecimals);
+      const rawRoundedToLot = Math.floor(safeRaw / lotSizeRaw) * lotSizeRaw;
+      closeQuantity = rawRoundedToLot / scalar;
+      // Only place order if we have at least MIN and a valid lot multiple (pool rejects e.g. 0.1 if min is 1 WAL).
+      const canPlaceCloseOrder = closeQuantity >= MIN_ORDER_QUANTITY;
+      console.log("[ClosePosition] after reserve + 1-raw + lot round & min check", {
+        CLOSE_RESERVE_FRACTION,
+        closeQuantity,
+        rawRoundedToLot,
+        lotSizeRaw,
+        canPlaceCloseOrder,
+        MIN_ORDER_QUANTITY,
+      });
+
+      if (!marginManagerId || !decodedPoolName || !suiAddress) {
+        Alert.alert("Close position", "Select a margin account first.");
+        break;
+      }
+      if (!signRawHash || !suiWallet?.publicKey) {
+        Alert.alert("Close position", "Wallet signing not available.");
+        break;
+      }
+
+      if (iterations === 0 && !silent) setClosePositionLoading(true);
+      try {
+        const publicKeyHex = publicKeyToHex(suiWallet!.publicKey);
+        if (canPlaceCloseOrder) {
+          console.log("[ClosePosition] placing close order", {
+            poolKey: decodedPoolName,
+            isBid: currentPositionSide === "short",
+            quantity: closeQuantity,
+            positionSide: currentPositionSide,
+          });
+          await placeOrderViaBackend({
             apiUrl,
             sender: suiAddress,
             marginManagerId,
             poolKey: decodedPoolName,
             orderType: "market",
-            isBid: livePnl.positionSide === "short",
+            isBid: currentPositionSide === "short",
             quantity: closeQuantity,
             payWithDeep: false,
-            reduceOnly: false,
+            reduceOnly: true,
+            signRawHash,
+            publicKeyHex,
+            network: "mainnet",
           });
+          console.log("[ClosePosition] close order placed successfully");
+          didPlaceAnyOrder = true;
+          // Let the close tx commit before building repay (avoids stale object version).
+          await new Promise((r) => setTimeout(r, 5000));
         }
-        await placeOrderViaBackend({
-          apiUrl,
-          sender: suiAddress,
-          marginManagerId,
-          poolKey: decodedPoolName,
-          orderType: "market",
-          isBid: livePnl.positionSide === "short",
-          quantity: closeQuantity,
-          // Pay fees in quote asset for close; DEEP balance is optional.
-          payWithDeep: false,
-          // Use a regular market order for closing; repay step handles debt.
-          reduceOnly: false,
-          signRawHash,
-          publicKeyHex,
-          network: "mainnet",
-        });
-      }
-      if (hasDebt) {
-        // Use fresh state after order so we repay with the SUI we just got (and current quote).
-        const stateForRepay = (await refreshMarginState?.()) ?? state;
-        if (stateForRepay) {
-          const baseAsset = Number(stateForRepay.base_asset);
-          const quoteAsset = Number(stateForRepay.quote_asset);
-          // After closing the position, margin manager should have enough assets
-          // to cover its debts; otherwise it would be liquidated. Repay full debt
-          // amounts (capped by protocol), rather than clamping by asset here.
-          const baseRepay = baseDebt > 0 ? baseDebt : 0;
-          const quoteRepay = quoteDebt > 0 ? quoteDebt : 0;
-          if (__DEV__) {
-            console.log("[ClosePosition] repay inputs", {
-              stateForRepay,
-              baseDebt,
-              quoteDebt,
-              baseAsset,
-              quoteAsset,
-              baseRepay,
-              quoteRepay,
+        if (hasDebt) {
+          const stateForRepay = (await refreshMarginState?.()) ?? currentState;
+          if (stateForRepay) {
+            const quoteAvail = Number(stateForRepay.quote_asset);
+            const baseAvail = Number(stateForRepay.base_asset);
+            // Repay only what we have; requesting more than balance causes withdraw_with_proof abort.
+            const baseRepay =
+              baseDebt > 0 ? Math.min(baseDebt, baseAvail) : 0;
+            const quoteRepay =
+              quoteDebt > 0 ? Math.min(quoteDebt, quoteAvail) : 0;
+            console.log("[ClosePosition] repay step", {
+              stateAfterClose: {
+                base_asset: baseAvail,
+                quote_asset: quoteAvail,
+              },
+              debtToRepay: { base: baseRepay, quote: quoteRepay },
             });
-          }
-          if (baseRepay > 0 || quoteRepay > 0) {
-            await repayViaBackend({
-              apiUrl,
-              sender: suiAddress,
-              marginManagerId,
-              poolKey: decodedPoolName,
-              baseAmount: baseRepay > 0 ? baseRepay : undefined,
-              quoteAmount: quoteRepay > 0 ? quoteRepay : undefined,
-              signRawHash,
-              publicKeyHex,
-              network: "mainnet",
-            });
+            if (baseRepay > 0 || quoteRepay > 0) {
+              await repayViaBackend({
+                apiUrl,
+                sender: suiAddress,
+                marginManagerId,
+                poolKey: decodedPoolName,
+                baseAmount: baseRepay > 0 ? baseRepay : undefined,
+                quoteAmount: quoteRepay > 0 ? quoteRepay : undefined,
+                signRawHash,
+                publicKeyHex,
+                network: "mainnet",
+              });
+              console.log("[ClosePosition] repay completed successfully");
+              didRepayAny = true;
+            } else if (
+              !canPlaceCloseOrder &&
+              quoteDebt > 0 &&
+              quoteAvail <= 0
+            ) {
+              dustDeadlock = true;
+              lastDustDebtQuote = quoteDebt;
+              console.log("[ClosePosition] dust deadlock: cannot close (rounds to 0 lots) and cannot repay (no USDC in margin)");
+              break;
+            }
           }
         }
+
+        if (!canPlaceCloseOrder && !hasDebt) break;
+        iterations += 1;
+        if (iterations >= MAX_CLOSE_ITERATIONS) break;
+        await new Promise((r) => setTimeout(r, CLOSE_WAIT_MS));
+        await refreshTradeHistory?.();
+        currentState = (await refreshMarginState?.()) ?? null;
+        if (!currentState) break;
+        const nextNetBase =
+          Number(currentState.base_asset) - Number(currentState.base_debt);
+        if (Math.abs(nextNetBase) < MIN_ORDER_QUANTITY) break;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Close position failed";
+        const stack = err instanceof Error ? err.stack : undefined;
+        console.log("[ClosePosition] error", { message: msg, stack });
+        if (!silent) Alert.alert("Close position", msg);
+        throw err;
       }
-      refreshMarginState?.();
-      refreshOpenOrders?.();
-      refreshOrderHistory?.();
-      refreshTradeHistory?.();
-      if (canPlaceCloseOrder && hasDebt) {
+    }
+
+    refreshMarginState?.();
+    refreshOpenOrders?.();
+    refreshOrderHistory?.();
+    refreshTradeHistory?.();
+    if (!silent) {
+      setClosePositionLoading(false);
+      if (didPlaceAnyOrder && didRepayAny) {
         Alert.alert("Close position", "Position closed and debt repaid.");
-      } else if (canPlaceCloseOrder) {
+      } else if (didPlaceAnyOrder) {
         Alert.alert("Close position", "Position closed.");
-      } else {
+      } else if (didRepayAny) {
         Alert.alert(
           "Close position",
           "Debt repaid. Position size was below minimum order, so no close order was placed; a small position may remain."
         );
+      } else if (dustDeadlock) {
+        const debtUsd = lastDustDebtQuote.toFixed(2);
+        Alert.alert(
+          "Small debt left — deposit USDC to finish",
+          `A small debt (~$${debtUsd} USDC) remains and there is no USDC in your margin to repay it. The remaining position is too small to close in one order (rounds to 0).\n\nDeposit at least 0.02 USDC to your margin account (from your Sui wallet or bridge from Base), then tap Close again. After repaying, the rest of your position will close and you can withdraw USDC to Base.`
+        );
+      } else if (iterations > 0) {
+        Alert.alert("Close position", "Position closed.");
+      } else if (!didPlaceAnyOrder && !didRepayAny) {
+        Alert.alert(
+          "Close position",
+          `Position size is below minimum order ${MIN_ORDER_QUANTITY}. Nothing to repay.`
+        );
       }
-    } catch (err) {
-      if (__DEV__) {
-        console.log("[ClosePosition] error", err);
-      }
-      const msg = err instanceof Error ? err.message : "Close position failed";
-      Alert.alert("Close position", msg);
-    } finally {
-      setClosePositionLoading(false);
     }
   }, [
     livePnl.hasPosition,
-    livePnl.hasDebt,
     livePnl.positionSide,
     livePnl.netBasePosition,
+    livePnl.unrealizedPnlQuote,
+    livePnl.currentPrice,
     marginManagerId,
     decodedPoolName,
     suiAddress,
@@ -1496,12 +2271,431 @@ export default function PairDetailScreen() {
     suiWallet?.publicKey,
     apiUrl,
     state,
-    tradeHistory,
+    ticker,
+    poolInfoForPair?.base_asset_id,
     refreshMarginState,
     refreshOpenOrders,
     refreshOrderHistory,
     refreshTradeHistory,
   ]);
+
+  const onCloseAndWithdrawToSui = useCallback(async () => {
+    if (
+      !livePnl.hasPosition ||
+      livePnl.positionSide === "none" ||
+      !marginManagerId ||
+      !decodedPoolName ||
+      !suiAddress ||
+      !signRawHash ||
+      !suiWallet?.publicKey
+    )
+      return;
+    setCloseAndWithdrawLoading(true);
+    try {
+      await onClosePosition({ silent: true });
+      await new Promise((r) => setTimeout(r, 3500));
+      const newState = await refreshMarginState?.() ?? null;
+      if (newState) {
+        const quoteAvail = Number(newState.quote_asset);
+        if (quoteAvail >= MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT) {
+          const publicKeyHex = publicKeyToHex(suiWallet!.publicKey);
+          await withdrawMarginViaBackend({
+            apiUrl,
+            sender: suiAddress,
+            marginManagerId,
+            poolKey: decodedPoolName,
+            asset: "quote",
+            amount: quoteAvail,
+            signRawHash,
+            publicKeyHex,
+            network: "mainnet",
+          });
+          refreshMarginState?.();
+          refreshMarginHistory?.();
+          const bridgePayload = {
+            amountRaw: Math.round(quoteAvail * 1e6).toString(),
+            fromAddress: suiAddress,
+            toAddress: evmAddress?.trim() ?? null,
+          };
+          setWithdrawBridgeStartedBy('close-and-send');
+          setWithdrawBridgePending(bridgePayload);
+          if (bridgePayload.toAddress) {
+            await onBridgeToBaseRef.current(bridgePayload);
+          } else {
+            Alert.alert(
+              "Close & withdraw",
+              "USDC withdrawn to your Sui wallet. Enter Base address above and tap \"Bridge to Base\" to send."
+            );
+          }
+        } else {
+          Alert.alert(
+            "Close & withdraw",
+            "Position closed. No USDC above minimum to withdraw."
+          );
+        }
+      } else {
+        Alert.alert(
+          "Close & withdraw",
+          "Position closed. Pull to refresh to see balance."
+        );
+      }
+      refreshMarginState?.();
+      refreshMarginHistory?.();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Close & withdraw failed";
+      Alert.alert("Close & withdraw", msg);
+    } finally {
+      setCloseAndWithdrawLoading(false);
+    }
+  }, [
+    livePnl.hasPosition,
+    livePnl.hasDebt,
+    livePnl.positionSide,
+    marginManagerId,
+    decodedPoolName,
+    suiAddress,
+    evmAddress,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    refreshMarginState,
+    refreshMarginHistory,
+    onClosePosition,
+  ]);
+
+  /**
+   * Full exit: sell ALL WAL for USDC (one market order), repay borrowed USDC (borrowedQuoteShares),
+   * then withdraw rest and open LI.FI to Base.
+   * Uses chain state: base_asset (raw) and borrowedQuoteShares (raw) for exact amounts.
+   */
+  const onCloseAndSendToBase = useCallback(async () => {
+    if (
+      !livePnl.hasPosition ||
+      livePnl.positionSide === "none" ||
+      !marginManagerId ||
+      !decodedPoolName ||
+      !suiAddress ||
+      !signRawHash ||
+      !suiWallet?.publicKey
+    )
+      return;
+    setCloseAndSendToBaseLoading(true);
+    try {
+      const publicKeyHex = publicKeyToHex(suiWallet!.publicKey);
+      const chain = await fetchMarginBorrowedSharesViaBackend({
+        apiUrl,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        network: "mainnet",
+      });
+      const baseDecimals = poolInfoForPair?.base_asset_id
+        ? getDecimalsForCoinType(poolInfoForPair.base_asset_id)
+        : 9;
+      const quoteDecimals = poolInfoForPair?.quote_asset_id
+        ? getDecimalsForCoinType(poolInfoForPair.quote_asset_id)
+        : 6;
+      const baseAssetHuman =
+        chain.calculateAssets?.base_asset != null
+          ? Number(chain.calculateAssets.base_asset) / Math.pow(10, baseDecimals)
+          : state != null
+            ? Number(state.base_asset)
+            : 0;
+      const lotSize = 1;
+      const sellQuantity = Math.floor(baseAssetHuman / lotSize) * lotSize;
+      if (sellQuantity < MIN_ORDER_QUANTITY) {
+        Alert.alert(
+          "Close & send to Base",
+          `Not enough WAL to sell (${baseAssetHuman.toFixed(4)}). Min order: ${MIN_ORDER_QUANTITY}.`
+        );
+        setCloseAndSendToBaseLoading(false);
+        return;
+      }
+      await placeOrderViaBackend({
+        apiUrl,
+        sender: suiAddress,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        orderType: "market",
+        isBid: false,
+        quantity: sellQuantity,
+        payWithDeep: false,
+        reduceOnly: false,
+        signRawHash,
+        publicKeyHex,
+        network: "mainnet",
+      });
+      await new Promise((r) => setTimeout(r, 5000));
+      const quoteDebtHuman =
+        chain.borrowedQuoteShares != null
+          ? Number(chain.borrowedQuoteShares) / Math.pow(10, quoteDecimals)
+          : state != null
+            ? Number(state.quote_debt)
+            : 0;
+      /** Ignore dust: only repay when borrowed quote (e.g. 17722 raw ≈ 0.018 USDC) is above this. */
+      const MIN_QUOTE_DEBT_TO_REPAY = 0.02;
+      if (quoteDebtHuman >= MIN_QUOTE_DEBT_TO_REPAY) {
+        await repayViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          quoteAmount: quoteDebtHuman,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+      // Use chain/SDK data (real-time) for post-repay balance; retry once if RPC is slow.
+      let chainAfter = await fetchMarginBorrowedSharesViaBackend({
+        apiUrl,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        network: "mainnet",
+      });
+      let quoteAvail =
+        chainAfter.calculateAssets?.quote_asset != null
+          ? Number(chainAfter.calculateAssets.quote_asset) / Math.pow(10, quoteDecimals)
+          : 0;
+      if (quoteAvail < MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT) {
+        await new Promise((r) => setTimeout(r, 2000));
+        chainAfter = await fetchMarginBorrowedSharesViaBackend({
+          apiUrl,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          network: "mainnet",
+        });
+        quoteAvail =
+          chainAfter.calculateAssets?.quote_asset != null
+            ? Number(chainAfter.calculateAssets.quote_asset) / Math.pow(10, quoteDecimals)
+            : 0;
+      }
+      if (quoteAvail < MIN_MARGIN_DEPOSIT_WITHDRAW_AMOUNT) {
+        Alert.alert(
+          "Close & send to Base",
+          "Position closed. No USDC above minimum to withdraw."
+        );
+        refreshMarginState?.();
+        refreshMarginHistory?.();
+        setCloseAndSendToBaseLoading(false);
+        return;
+      }
+      await withdrawMarginViaBackend({
+        apiUrl,
+        sender: suiAddress,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        asset: "quote",
+        amount: quoteAvail,
+        signRawHash,
+        publicKeyHex,
+        network: "mainnet",
+      });
+      refreshMarginState?.();
+      refreshMarginHistory?.();
+      const amountRaw = Math.round(quoteAvail * 1e6).toString();
+      const bridgePayload = {
+        amountRaw,
+        fromAddress: suiAddress,
+        toAddress: evmAddress?.trim() ?? null,
+      };
+      setWithdrawBridgeStartedBy('close-and-send');
+      setWithdrawBridgePending(bridgePayload);
+      // Append bridge: start LiFi bridge immediately so user doesn't have to tap again.
+      await onBridgeToBaseRef.current(bridgePayload);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Close & send to Base failed";
+      Alert.alert("Close & send to Base", msg);
+    } finally {
+      setCloseAndSendToBaseLoading(false);
+    }
+  }, [
+    livePnl.hasPosition,
+    livePnl.positionSide,
+    marginManagerId,
+    decodedPoolName,
+    suiAddress,
+    evmAddress,
+    signRawHash,
+    suiWallet?.publicKey,
+    apiUrl,
+    state,
+    poolInfoForPair?.base_asset_id,
+    poolInfoForPair?.quote_asset_id,
+    refreshMarginState,
+    refreshMarginHistory,
+  ]);
+
+  /** Send Sui wallet USDC to Base via LI.FI. Only checks Sui wallet balance (ignores margin). */
+  const MIN_SUI_WALLET_USDC_TO_BRIDGE = 100_000; // 6 decimals = 0.1 USDC
+  const onWithdrawToBase = useCallback(async () => {
+    if (!suiAddress || !signRawHash || !suiWallet?.publicKey) return;
+
+    setWithdrawToBaseLoading(true);
+    try {
+      const { totalBalance } = await fetchSuiBalance(suiAddress, BRIDGE_TO_MARGIN_RECEIVE_TOKEN_SUI);
+      const suiWalletUsdcRaw = totalBalance ?? "0";
+      const suiWalletUsdcNum = Number(suiWalletUsdcRaw) / 1e6;
+      if (__DEV__) {
+        console.log("[Withdraw to Base] Sui wallet USDC (raw):", suiWalletUsdcRaw, "human:", suiWalletUsdcNum.toFixed(2));
+      }
+      if (BigInt(suiWalletUsdcRaw) < BigInt(MIN_SUI_WALLET_USDC_TO_BRIDGE)) {
+        Alert.alert(
+          "Withdraw to Base",
+          `Not enough USDC in your Sui wallet (you have ${suiWalletUsdcNum.toFixed(2)} USDC; min 0.1 to bridge).`
+        );
+        return;
+      }
+      const bridgePayload = {
+        amountRaw: suiWalletUsdcRaw,
+        fromAddress: suiAddress,
+        toAddress: evmAddress?.trim() ?? null,
+      };
+      setWithdrawBridgeStartedBy('withdraw-button');
+      setWithdrawBridgePending(bridgePayload);
+      if (bridgePayload.toAddress) {
+        await onBridgeToBaseRef.current(bridgePayload);
+      } else {
+        Alert.alert(
+          "Withdraw to Base",
+          "USDC ready to bridge. Enter your Base wallet address above and tap \"Bridge to Base\" in the Place order section."
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to read Sui wallet balance";
+      if (__DEV__) console.warn("[Withdraw to Base]", msg);
+      Alert.alert("Withdraw to Base", msg);
+    } finally {
+      setWithdrawToBaseLoading(false);
+    }
+  }, [suiAddress, evmAddress, signRawHash, suiWallet?.publicKey]);
+
+  /** Same as Base→Sui handleSendBridge: get quote, send EVM tx or Sui tx if returned, set tx hash for inline status. */
+  const onBridgeToBase = useCallback(async (overridePayload?: { amountRaw: string; fromAddress: string; toAddress: string | null }) => {
+    const payload = overridePayload ?? withdrawBridgePending;
+    if (!payload) return;
+    setWithdrawBridgeError(null);
+    setWithdrawBridgeTxHash(null);
+    setWithdrawBridgeStatus(null);
+    setWithdrawBridgeLoading(true);
+    try {
+      const quoteResult = (await fetchLifiQuote({
+        fromChainId: SUI_CHAIN_ID,
+        toChainId: BASE_MAINNET_CHAIN_ID,
+        fromTokenAddress: BRIDGE_TO_MARGIN_RECEIVE_TOKEN_SUI,
+        toTokenAddress: BASE_USDC_ADDRESS,
+        fromAmount: payload.amountRaw,
+        fromAddress: payload.fromAddress,
+        toAddress: payload.toAddress ?? undefined,
+        slippage: 0.005,
+      })) as Record<string, unknown>;
+      if (__DEV__) {
+        console.log("[LiFi Sui→Base quote] top-level keys:", Object.keys(quoteResult));
+        console.log("[LiFi Sui→Base quote] full response:", JSON.stringify(quoteResult, null, 2));
+      }
+      const txRequest = quoteResult?.transactionRequest as
+        | { to?: string; data?: string; value?: string; chainId?: number }
+        | undefined;
+      const action = quoteResult?.action as { fromChainId?: number } | undefined;
+      const fromChainId = action?.fromChainId;
+
+      // 1) EVM tx (e.g. claim on Base) – chainId 8453
+      if (txRequest?.to && txRequest?.data && txRequest?.chainId === BASE_MAINNET_CHAIN_ID && embeddedEthWallet) {
+        const provider = await (embeddedEthWallet as { getProvider?: () => Promise<{ request: (p: { method: string; params: unknown[] }) => Promise<string> }> }).getProvider?.();
+        if (!provider) throw new Error("No EVM wallet");
+        const hash = await provider.request({
+          method: "eth_sendTransaction",
+          params: [{
+            from: evmAddress,
+            to: txRequest.to,
+            data: txRequest.data,
+            value: txRequest.value ?? "0x0",
+          }],
+        }) as string;
+        setWithdrawBridgeTxHash(hash);
+        setWithdrawBridgeLoading(false);
+        return;
+      }
+
+      // 2) Sui tx – LiFi returns transactionRequest.data as base64-encoded Sui transaction (BCS)
+      const suiTxBase64 = typeof txRequest?.data === "string" && txRequest.data.length > 0 ? txRequest.data : null;
+      if (fromChainId === SUI_CHAIN_ID && suiTxBase64 && signRawHash && suiWallet?.publicKey && suiAddress) {
+        const base = apiUrl.replace(/\/$/, "");
+        const prepareRes = await fetch(`${base}/api/prepare-external-sui-tx`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ txBytesBase64: suiTxBase64 }),
+        });
+        if (!prepareRes.ok) {
+          const errText = await prepareRes.text();
+          let errJson: Record<string, unknown> = {};
+          try {
+            errJson = JSON.parse(errText) as Record<string, unknown>;
+          } catch {
+            // not JSON
+          }
+          const serverMsg = (errJson.error as string) ?? (errText || "Prepare Sui tx failed");
+          if (__DEV__) {
+            console.error("[Bridge to Base] prepare-external-sui-tx failed:", prepareRes.status, errText);
+          }
+          if (prepareRes.status === 404) {
+            throw new Error(
+              "Backend does not have /api/prepare-external-sui-tx. Restart the backend (cd backend && npm run dev) or rebuild (npm run build && npm run start)."
+            );
+          }
+          throw new Error(serverMsg);
+        }
+        const prepareJson = await prepareRes.json();
+        const intentMessageHashHex =
+          prepareJson.intentMessageHashHex ?? prepareJson.intent_message_hash_hex;
+        if (!intentMessageHashHex) throw new Error("Missing intentMessageHashHex from backend");
+        const { signature: signatureHex } = await signRawHash({
+          address: suiAddress,
+          chainType: "sui",
+          hash: intentMessageHashHex.startsWith("0x")
+            ? (intentMessageHashHex as `0x${string}`)
+            : (`0x${intentMessageHashHex}` as `0x${string}`),
+        });
+        const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
+        const executeRes = await fetch(`${base}/api/execute-transfer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            txBytesBase64: suiTxBase64,
+            signatureHex,
+            publicKeyHex: publicKeyHex.startsWith("0x") ? publicKeyHex : "0x" + publicKeyHex,
+            network: "mainnet",
+          }),
+        });
+        const executeJson = await executeRes.json();
+        if (!executeRes.ok) {
+          throw new Error((executeJson.error as string) ?? "Execute failed");
+        }
+        const digest = executeJson.digest;
+        if (digest) {
+          setWithdrawBridgeTxHash(digest);
+          setWithdrawBridgeLoading(false);
+          return;
+        }
+      }
+
+      setWithdrawBridgeError("This route requires signing on Sui. Use LI.FI Explorer to complete.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Bridge quote failed";
+      setWithdrawBridgeError(msg);
+    } finally {
+      setWithdrawBridgeLoading(false);
+    }
+  }, [
+    withdrawBridgePending,
+    embeddedEthWallet,
+    evmAddress,
+    apiUrl,
+    signRawHash,
+    suiWallet?.publicKey,
+    suiAddress,
+  ]);
+  onBridgeToBaseRef.current = onBridgeToBase;
 
   const onSetTpsl = useCallback(async () => {
     const tp = tpPrice.trim() ? parseFloat(tpPrice.trim()) : undefined;
@@ -1631,7 +2825,14 @@ export default function PairDetailScreen() {
         <View style={styles.pairHeader}>
           <View style={styles.pairHeaderTopRow}>
             <Pressable
-              onPress={() => navigation.goBack()}
+              onPress={() => {
+                if (cameFromPools) {
+                  router.replace("/(app)/pools");
+                } else {
+                  // Explicit replace so back always works (e.g. on Sui when stack history is missing)
+                  router.replace("/(app)/trading");
+                }
+              }}
               hitSlop={8}
               style={({ pressed }) => ({
                 marginRight: 12,
@@ -1757,6 +2958,8 @@ export default function PairDetailScreen() {
 
         {suiAddress && (
           <>
+            {showPlaceOrderBlock && (
+            <>
             <View style={styles.card}>
               <View style={styles.marginHeaderRow}>
                 <Text style={styles.cardLabel}>Margin account</Text>
@@ -2192,7 +3395,850 @@ export default function PairDetailScreen() {
                 </View>
               </>
             )}
+            </>
+            )}
 
+            {!showPlaceOrderBlock && (
+              <>
+                <Text style={styles.sectionTitle}>Your balances</Text>
+                <View style={styles.card}>
+                  <Text style={[styles.inputLabel, { color: colors.text }]}>
+                    Base (current network)
+                  </Text>
+                  {baseBalanceLoading ? (
+                    <ActivityIndicator size="small" color={colors.tint} style={{ marginVertical: 8 }} />
+                  ) : baseBalances.length === 0 ? (
+                    <Text style={styles.muted}>No tokens on Base.</Text>
+                  ) : (
+                    <View style={{ marginTop: 8 }}>
+                      {baseBalances.map((b) => (
+                        <View
+                          key={b.symbol}
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {b.symbol}
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {b.formatted}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+                </View>
+                <View style={[styles.card, { marginTop: 12 }]}>
+                  <View
+                    style={{
+                      flexDirection: "row",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 4,
+                    }}
+                  >
+                    <Text style={[styles.inputLabel, { color: colors.text }]}>
+                      Sui network account
+                    </Text>
+                    <Pressable
+                      onPress={refetchSuiBalancesForBlock}
+                      disabled={suiBalanceLoadingForBlock}
+                      style={({ pressed }) => ({
+                        padding: 6,
+                        opacity: pressed || suiBalanceLoadingForBlock ? 0.7 : 1,
+                      })}
+                      accessibilityLabel="Refresh Sui balances"
+                    >
+                      <Text style={{ fontSize: 16, color: colors.tint }}>⟳</Text>
+                    </Pressable>
+                  </View>
+                  {suiBalanceLoadingForBlock ? (
+                    <ActivityIndicator size="small" color={colors.tint} style={{ marginVertical: 8 }} />
+                  ) : suiBalancesForBlock.length === 0 ? (
+                    <Text style={styles.muted}>
+                      No SUI or tokens on your Sui account. Link a Sui wallet in Home to see balances.
+                    </Text>
+                  ) : (
+                    <View style={{ marginTop: 8 }}>
+                      {suiBalancesForBlock.map((b) => (
+                        <View
+                          key={b.symbol}
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {b.symbol}
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {b.formatted}
+                          </Text>
+                        </View>
+                      ))}
+                    </View>
+                  )}
+                </View>
+
+                {managerForThisPool && (
+                  <View style={[styles.card, { marginTop: 12 }]}>
+                    <View
+                      style={{
+                        flexDirection: "row",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        marginBottom: 4,
+                      }}
+                    >
+                      <Text style={[styles.inputLabel, { color: colors.text }]}>
+                        Margin account state
+                      </Text>
+                      <Pressable
+                        onPress={() => refreshMarginState?.()}
+                        disabled={stateLoading}
+                        style={({ pressed }) => ({
+                          padding: 6,
+                          opacity: pressed || stateLoading ? 0.7 : 1,
+                        })}
+                        accessibilityLabel="Refresh margin state"
+                      >
+                        <Text style={{ fontSize: 16, color: colors.tint }}>⟳</Text>
+                      </Pressable>
+                    </View>
+                    {stateLoading && !state ? (
+                      <ActivityIndicator size="small" color={colors.tint} style={{ marginVertical: 8 }} />
+                    ) : stateError ? (
+                      <Text style={[styles.muted, styles.errorText]}>{stateError}</Text>
+                    ) : state ? (
+                      <View style={{ marginTop: 8 }}>
+                        <View
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {poolInfoForPair?.quote_asset_symbol ?? "USDC"} (in margin)
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {Number(state.quote_asset).toLocaleString("en-US", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 6,
+                            })}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {poolInfoForPair?.base_asset_symbol ?? "Base"} (in margin)
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {Number(state.base_asset).toLocaleString("en-US", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 6,
+                            })}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            Collateral (USD)
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            $
+                            {collateralUsdTotal.toLocaleString("en-US", {
+                              minimumFractionDigits: 2,
+                              maximumFractionDigits: 2,
+                            })}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            Debt (USD)
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            ${debtUsdFromState(state)}
+                          </Text>
+                        </View>
+                        <View
+                          style={[
+                            styles.orderSideRow,
+                            { justifyContent: "space-between", marginBottom: 6 },
+                          ]}
+                        >
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            Risk ratio
+                          </Text>
+                          <Text style={[styles.muted, { color: colors.text }]}>
+                            {formatRiskRatio(state.risk_ratio)}×
+                          </Text>
+                        </View>
+                      </View>
+                    ) : (
+                      <Text style={styles.muted}>No state loaded.</Text>
+                    )}
+                  </View>
+                )}
+
+                {suiAddress && (
+                  <Pressable
+                    onPress={onWithdrawToBase}
+                    disabled={withdrawToBaseLoading}
+                    style={[
+                      styles.primaryButton,
+                      {
+                        marginTop: 12,
+                        backgroundColor: colors.background,
+                        borderWidth: 1,
+                        borderColor: "#fff",
+                        opacity: withdrawToBaseLoading ? 0.7 : 1,
+                      },
+                    ]}
+                  >
+                    {withdrawToBaseLoading ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text
+                        style={[
+                          styles.primaryButtonText,
+                          { color: "#fff" },
+                        ]}
+                      >
+                        Withdraw USDC to Base
+                      </Text>
+                    )}
+                  </Pressable>
+                )}
+
+                {/* Sui→Base bridge tracker when Withdraw USDC to Base started the flow */}
+                {(withdrawBridgePending || withdrawBridgeTxHash) && withdrawBridgeStartedBy === 'withdraw-button' && (
+                  <View style={{ marginTop: 16 }}>
+                    {withdrawBridgeError ? (
+                      <Text style={[styles.muted, styles.errorText, { marginBottom: 8 }]}>
+                        {withdrawBridgeError}
+                      </Text>
+                    ) : null}
+                    {withdrawBridgeTxHash && withdrawBridgeStatus ? (
+                      <>
+                        <View
+                          style={[
+                            {
+                              alignSelf: "flex-start",
+                              paddingHorizontal: 10,
+                              paddingVertical: 5,
+                              borderRadius: 8,
+                              borderWidth: 1,
+                            },
+                            {
+                              backgroundColor:
+                                withdrawBridgeStatus.status === "DONE"
+                                  ? "#22c55e22"
+                                  : withdrawBridgeStatus.status === "FAILED"
+                                    ? "#ef444422"
+                                    : "#eab30822",
+                              borderColor:
+                                withdrawBridgeStatus.status === "DONE"
+                                  ? "#22c55e"
+                                  : withdrawBridgeStatus.status === "FAILED"
+                                    ? "#ef4444"
+                                    : "#eab308",
+                            },
+                          ]}
+                        >
+                          <Text
+                            style={[
+                              styles.primaryButtonText,
+                              {
+                                fontSize: 12,
+                                color:
+                                  withdrawBridgeStatus.status === "DONE"
+                                    ? "#22c55e"
+                                    : withdrawBridgeStatus.status === "FAILED"
+                                      ? "#ef4444"
+                                      : "#eab308",
+                              },
+                            ]}
+                          >
+                            {withdrawBridgeStatus.status === "PENDING"
+                              ? "Bridging"
+                              : withdrawBridgeStatus.status === "DONE"
+                                ? "Complete"
+                                : withdrawBridgeStatus.status === "FAILED"
+                                  ? "Failed"
+                                  : withdrawBridgeStatus.status}
+                          </Text>
+                        </View>
+                        {withdrawBridgeStatus.substatusMessage != null &&
+                         withdrawBridgeStatus.status === "PENDING" ? (
+                          <Text
+                            style={[
+                              styles.muted,
+                              { color: colors.text, fontSize: 11, marginTop: 6 },
+                            ]}
+                            numberOfLines={2}
+                          >
+                            {withdrawBridgeStatus.substatusMessage}
+                          </Text>
+                        ) : null}
+                        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12, marginTop: 10 }}>
+                          {withdrawBridgeStatus.sending?.txLink ? (
+                            <Pressable
+                              onPress={() =>
+                                withdrawBridgeStatus.sending?.txLink &&
+                                Linking.openURL(withdrawBridgeStatus.sending.txLink)
+                              }
+                              style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                            >
+                              <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                                Source tx
+                              </Text>
+                            </Pressable>
+                          ) : null}
+                          {withdrawBridgeStatus.receiving?.txLink ? (
+                            <Pressable
+                              onPress={() =>
+                                withdrawBridgeStatus.receiving?.txLink &&
+                                Linking.openURL(withdrawBridgeStatus.receiving.txLink)
+                              }
+                              style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                            >
+                              <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                                Destination tx
+                              </Text>
+                            </Pressable>
+                          ) : null}
+                          <Pressable
+                            onPress={() =>
+                              Linking.openURL(
+                                withdrawBridgeStatus?.lifiExplorerLink ?? `https://scan.li.fi/tx/${withdrawBridgeTxHash}`
+                              )
+                            }
+                            style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                          >
+                            <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                              Track on LI.FI
+                            </Text>
+                          </Pressable>
+                        </View>
+                      </>
+                    ) : withdrawBridgeTxHash ? (
+                      <View>
+                        <View
+                          style={{
+                            alignSelf: "flex-start",
+                            paddingHorizontal: 10,
+                            paddingVertical: 5,
+                            borderRadius: 8,
+                            borderWidth: 1,
+                            backgroundColor: "#eab30822",
+                            borderColor: "#eab308",
+                          }}
+                        >
+                          <Text style={[styles.primaryButtonText, { fontSize: 12, color: "#eab308" }]}>
+                            Checking…
+                          </Text>
+                        </View>
+                        <Pressable
+                          onPress={() => Linking.openURL(`https://scan.li.fi/tx/${withdrawBridgeTxHash}`)}
+                          style={({ pressed }) => ({ paddingVertical: 4, marginTop: 8, opacity: pressed ? 0.8 : 1 })}
+                        >
+                          <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                            Track on LI.FI
+                          </Text>
+                        </Pressable>
+                      </View>
+                    ) : null}
+                    {(!withdrawBridgeTxHash || withdrawBridgeStatus?.status === "FAILED") && withdrawBridgePending ? (
+                      <>
+                        <Pressable
+                          onPress={() => onBridgeToBase()}
+                          disabled={withdrawBridgeLoading}
+                          style={({ pressed }) => [
+                            styles.primaryButton,
+                            {
+                              backgroundColor: colors.tint,
+                              opacity: withdrawBridgeLoading || pressed ? 0.8 : 1,
+                              marginTop: 12,
+                            },
+                          ]}
+                        >
+                          {withdrawBridgeLoading ? (
+                            <ActivityIndicator size="small" color={colors.background} />
+                          ) : (
+                            <Text style={[styles.primaryButtonText, { color: colors.background }]}>
+                              Bridge to Base
+                            </Text>
+                          )}
+                        </Pressable>
+                        {withdrawBridgeError?.includes("LI.FI Explorer") ? (
+                          <Pressable
+                            onPress={() => {
+                              const p = withdrawBridgePending!;
+                              const params = new URLSearchParams({
+                                fromChain: String(SUI_CHAIN_ID),
+                                toChain: String(BASE_MAINNET_CHAIN_ID),
+                                fromToken: BRIDGE_TO_MARGIN_RECEIVE_TOKEN_SUI,
+                                toToken: BASE_USDC_ADDRESS,
+                                fromAmount: p.amountRaw,
+                                fromAddress: p.fromAddress,
+                              });
+                              if (p.toAddress) params.set("toAddress", p.toAddress);
+                              Linking.openURL(`https://explorer.li.fi?${params.toString()}`);
+                            }}
+                            style={({ pressed }) => ({ paddingVertical: 8, marginTop: 8, opacity: pressed ? 0.8 : 1 })}
+                          >
+                            <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                              Open LI.FI Explorer
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                      </>
+                    ) : null}
+                  </View>
+                )}
+
+                <Text style={[styles.sectionTitle, { marginTop: 24 }]}>
+                  Trade
+                </Text>
+                <View style={styles.card}>
+                  <Text style={styles.inputLabel}>Side</Text>
+                  <View style={styles.orderSideRow}>
+                    <Pressable
+                      onPress={() => setBaseTradeSide("long")}
+                      style={[
+                        styles.sideButton,
+                        baseTradeSide === "long" && {
+                          backgroundColor: "#22c55e",
+                          opacity: 1,
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.sideButtonText,
+                          baseTradeSide === "long" && styles.sideButtonTextActive,
+                        ]}
+                      >
+                        Long
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      onPress={() => setBaseTradeSide("short")}
+                      style={[
+                        styles.sideButton,
+                        baseTradeSide === "short" && {
+                          backgroundColor: "#ef4444",
+                          opacity: 1,
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.sideButtonText,
+                          baseTradeSide === "short" &&
+                            styles.sideButtonTextActive,
+                        ]}
+                      >
+                        Short
+                      </Text>
+                    </Pressable>
+                  </View>
+                  <Text style={styles.inputLabel}>Token (Base wallet)</Text>
+                  <Pressable
+                    onPress={() =>
+                      setBaseTradeTokenPickerOpen(!baseTradeTokenPickerOpen)
+                    }
+                    style={[
+                      styles.input,
+                      {
+                        color: colors.text,
+                        borderColor: colors.tabIconDefault,
+                        flexDirection: "row",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                      },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.muted,
+                        { color: colors.text },
+                        !selectedBaseToken && { opacity: 0.7 },
+                      ]}
+                    >
+                      {selectedBaseToken
+                        ? `${selectedBaseToken.symbol} (${selectedBaseToken.formatted} available)`
+                        : "Select token"}
+                    </Text>
+                    <FontAwesome
+                      name={baseTradeTokenPickerOpen ? "chevron-up" : "chevron-down"}
+                      size={14}
+                      color={colors.tabIconDefault}
+                    />
+                  </Pressable>
+                  {baseTradeTokenPickerOpen && baseBalances.length > 0 && (
+                    <ScrollView
+                      style={{
+                        marginTop: 6,
+                        borderWidth: 1,
+                        borderColor: colors.tabIconDefault + "60",
+                        borderRadius: 8,
+                        overflow: "hidden",
+                        maxHeight: baseBalances.length > 4 ? 176 : undefined,
+                      }}
+                      nestedScrollEnabled
+                      showsVerticalScrollIndicator={baseBalances.length > 4}
+                    >
+                      {baseBalances.map((b) => (
+                        <Pressable
+                          key={b.symbol}
+                          onPress={() => {
+                            setSelectedBaseToken(b);
+                            setBaseTradeTokenPickerOpen(false);
+                          }}
+                          style={({
+                            pressed,
+                          }: {
+                            pressed: boolean;
+                          }) => ({
+                            paddingVertical: 12,
+                            paddingHorizontal: 12,
+                            backgroundColor:
+                              selectedBaseToken?.symbol === b.symbol
+                                ? colors.tint + "20"
+                                : pressed
+                                  ? colors.tabIconDefault + "15"
+                                  : "transparent",
+                          })}
+                        >
+                          <Text
+                            style={[styles.muted, { color: colors.text }]}
+                          >
+                            {b.symbol} — {b.formatted}
+                          </Text>
+                        </Pressable>
+                      ))}
+                    </ScrollView>
+                  )}
+                  <Text style={[styles.inputLabel, { marginTop: 12 }]}>
+                    Amount
+                  </Text>
+                  <TextInput
+                    style={[
+                      styles.input,
+                      {
+                        color: colors.text,
+                        borderColor: colors.tabIconDefault,
+                      },
+                    ]}
+                    placeholder="0"
+                    placeholderTextColor={colors.tabIconDefault + "99"}
+                    value={baseTradeAmount}
+                    onChangeText={setBaseTradeAmount}
+                    keyboardType="decimal-pad"
+                  />
+                  {bridgeError ? (
+                    <Text
+                      style={[styles.muted, styles.errorText, { marginTop: 12 }]}
+                    >
+                      {bridgeError}
+                    </Text>
+                  ) : null}
+                  {bridgeTxHash && bridgeLifiStatus ? (
+                    <>
+                      <View
+                        style={[
+                          {
+                            alignSelf: "flex-start",
+                            paddingHorizontal: 10,
+                            paddingVertical: 5,
+                            borderRadius: 8,
+                            borderWidth: 1,
+                            marginTop: 16,
+                          },
+                          {
+                            backgroundColor:
+                              bridgeLifiStatus.status === "DONE"
+                                ? "#22c55e22"
+                                : bridgeLifiStatus.status === "FAILED"
+                                  ? "#ef444422"
+                                  : "#eab30822",
+                            borderColor:
+                              bridgeLifiStatus.status === "DONE"
+                                ? "#22c55e"
+                                : bridgeLifiStatus.status === "FAILED"
+                                  ? "#ef4444"
+                                  : "#eab308",
+                          },
+                        ]}
+                      >
+                        <Text
+                          style={[
+                            styles.primaryButtonText,
+                            {
+                              fontSize: 12,
+                              color:
+                                bridgeLifiStatus.status === "DONE"
+                                  ? "#22c55e"
+                                  : bridgeLifiStatus.status === "FAILED"
+                                    ? "#ef4444"
+                                    : "#eab308",
+                            },
+                          ]}
+                        >
+                          {bridgeLifiStatus.status === "PENDING"
+                            ? "Bridging"
+                            : bridgeLifiStatus.status === "DONE"
+                              ? "Complete"
+                              : bridgeLifiStatus.status === "FAILED"
+                                ? "Failed"
+                                : bridgeLifiStatus.status}
+                        </Text>
+                      </View>
+                      {bridgeLifiStatus.substatusMessage != null &&
+                       bridgeLifiStatus.status === "PENDING" ? (
+                        <Text
+                          style={[
+                            styles.muted,
+                            { color: colors.text, fontSize: 11, marginTop: 6 },
+                          ]}
+                          numberOfLines={2}
+                        >
+                          {bridgeLifiStatus.substatusMessage}
+                        </Text>
+                      ) : null}
+                      <View
+                        style={{
+                          flexDirection: "row",
+                          flexWrap: "wrap",
+                          gap: 12,
+                          marginTop: 10,
+                        }}
+                      >
+                        {bridgeLifiStatus.sending?.txLink ? (
+                          <Pressable
+                            onPress={() =>
+                              bridgeLifiStatus.sending?.txLink &&
+                              Linking.openURL(
+                                bridgeLifiStatus.sending.txLink
+                              )
+                            }
+                            style={({ pressed }) => ({
+                              paddingVertical: 4,
+                              opacity: pressed ? 0.8 : 1,
+                            })}
+                          >
+                            <Text
+                              style={[
+                                styles.muted,
+                                {
+                                  fontSize: 12,
+                                  textDecorationLine: "underline",
+                                  color: colors.tint,
+                                },
+                              ]}
+                            >
+                              Source tx
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                        {bridgeLifiStatus.receiving?.txLink ? (
+                          <Pressable
+                            onPress={() =>
+                              bridgeLifiStatus.receiving?.txLink &&
+                              Linking.openURL(
+                                bridgeLifiStatus.receiving.txLink
+                              )
+                            }
+                            style={({ pressed }) => ({
+                              paddingVertical: 4,
+                              opacity: pressed ? 0.8 : 1,
+                            })}
+                          >
+                            <Text
+                              style={[
+                                styles.muted,
+                                {
+                                  fontSize: 12,
+                                  textDecorationLine: "underline",
+                                  color: colors.tint,
+                                },
+                              ]}
+                            >
+                              Destination tx
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                        {bridgeLifiStatus.lifiExplorerLink ? (
+                          <Pressable
+                            onPress={() =>
+                              bridgeLifiStatus?.lifiExplorerLink &&
+                              Linking.openURL(
+                                bridgeLifiStatus.lifiExplorerLink
+                              )
+                            }
+                            style={({ pressed }) => ({
+                              paddingVertical: 4,
+                              opacity: pressed ? 0.8 : 1,
+                            })}
+                          >
+                            <Text
+                              style={[
+                                styles.muted,
+                                {
+                                  fontSize: 12,
+                                  textDecorationLine: "underline",
+                                  color: colors.tint,
+                                },
+                              ]}
+                            >
+                              Track on LI.FI
+                            </Text>
+                          </Pressable>
+                        ) : null}
+                      </View>
+                    </>
+                  ) : bridgeTxHash ? (
+                    <View style={{ marginTop: 16 }}>
+                      <View
+                        style={{
+                          alignSelf: "flex-start",
+                          paddingHorizontal: 10,
+                          paddingVertical: 5,
+                          borderRadius: 8,
+                          borderWidth: 1,
+                          backgroundColor: "#eab30822",
+                          borderColor: "#eab308",
+                        }}
+                      >
+                        <Text
+                          style={[
+                            styles.primaryButtonText,
+                            { fontSize: 12, color: "#eab308" },
+                          ]}
+                        >
+                          Checking…
+                        </Text>
+                      </View>
+                      <Pressable
+                        onPress={() =>
+                          Linking.openURL(
+                            `https://scan.li.fi/tx/${bridgeTxHash}`
+                          )
+                        }
+                        style={({ pressed }) => ({
+                          paddingVertical: 4,
+                          marginTop: 8,
+                          opacity: pressed ? 0.8 : 1,
+                        })}
+                      >
+                        <Text
+                          style={[
+                            styles.muted,
+                            {
+                              fontSize: 12,
+                              textDecorationLine: "underline",
+                              color: colors.tint,
+                            },
+                          ]}
+                        >
+                          Track on LI.FI
+                        </Text>
+                      </Pressable>
+                    </View>
+                  ) : null}
+                  {bridgeLifiStatus?.status === "DONE" ? (
+                    <>
+                      <Pressable
+                        onPress={handleDepositAndOpenPosition}
+                        disabled={depositAndOpenLoading}
+                        style={({ pressed }) => [
+                          styles.primaryButton,
+                          {
+                            backgroundColor: colors.tint,
+                            opacity: depositAndOpenLoading || pressed ? 0.8 : 1,
+                            marginTop: 16,
+                          },
+                        ]}
+                      >
+                        {depositAndOpenLoading ? (
+                          <ActivityIndicator
+                            size="small"
+                            color={colors.background}
+                          />
+                        ) : (
+                          <Text
+                            style={[
+                              styles.primaryButtonText,
+                              { color: colors.background },
+                            ]}
+                          >
+                            Deposit & open position
+                          </Text>
+                        )}
+                      </Pressable>
+                      <Text
+                        style={[
+                          styles.muted,
+                          { color: colors.text, fontSize: 12, marginTop: 10 },
+                        ]}
+                      >
+                        {managerForThisPool
+                          ? "You have a margin manager for this pool. Next: deposit USDC and open your position."
+                          : "You don't have a margin manager for this pool yet. We'll create one, then deposit and open your position."}
+                      </Text>
+                    </>
+                  ) : !bridgeTxHash || bridgeLifiStatus?.status === "FAILED" ? (
+                    <Pressable
+                      onPress={handleSendBridge}
+                      disabled={bridgeLoading}
+                      style={({ pressed }) => [
+                        styles.primaryButton,
+                        {
+                          backgroundColor: colors.tint,
+                          opacity: bridgeLoading || pressed ? 0.8 : 1,
+                          marginTop: 16,
+                        },
+                      ]}
+                    >
+                      {bridgeLoading ? (
+                        <ActivityIndicator
+                          size="small"
+                          color={colors.background}
+                        />
+                      ) : (
+                        <Text
+                          style={[
+                            styles.primaryButtonText,
+                            { color: colors.background },
+                          ]}
+                        >
+                          Send
+                        </Text>
+                      )}
+                    </Pressable>
+                  ) : null}
+                </View>
+              </>
+            )}
+
+            {showPlaceOrderBlock && (
+              <>
             <Text style={styles.sectionTitle}>Place order</Text>
             <View style={styles.card}>
               <View style={styles.orderSideRow}>
@@ -2521,10 +4567,14 @@ export default function PairDetailScreen() {
                 )}
               </Pressable>
             </View>
+              </>
+            )}
 
-            {livePnl.hasPosition &&
-              livePnl.hasDebt &&
-              livePnl.positionSide !== "none" && (
+          </>
+        )}
+
+            {/* Position block: only when there is open debt and at least one borrowed (human) >= 0.09. */}
+            {showPositionBlock && (
               <>
                 <Text style={styles.sectionTitle}>Position</Text>
                 <View style={styles.card}>
@@ -2693,23 +4743,31 @@ export default function PairDetailScreen() {
                     </View>
                   </ScrollView>
                   <Pressable
-                    onPress={onClosePosition}
-                    disabled={closePositionLoading}
+                    onPress={onCloseAndSendToBase}
+                    disabled={
+                      closePositionLoading ||
+                      closeAndWithdrawLoading ||
+                      closeAndSendToBaseLoading
+                    }
                     style={({ pressed }) => [
                       styles.primaryButton,
                       {
                         marginTop: 12,
-                        backgroundColor:
-                          livePnl.positionSide === "long"
-                            ? "#ef4444"
-                            : "#22c55e",
-                        opacity: closePositionLoading ? 0.6 : pressed ? 0.8 : 1,
+                        backgroundColor: colors.tint,
+                        opacity:
+                          closePositionLoading ||
+                          closeAndWithdrawLoading ||
+                          closeAndSendToBaseLoading
+                            ? 0.6
+                            : pressed
+                              ? 0.8
+                              : 1,
                       },
                     ]}
                     accessibilityRole="button"
-                    accessibilityLabel="Close position"
+                    accessibilityLabel="Close and send to Base"
                   >
-                    {closePositionLoading ? (
+                    {closeAndSendToBaseLoading ? (
                       <ActivityIndicator
                         size="small"
                         color={colors.background}
@@ -2721,16 +4779,238 @@ export default function PairDetailScreen() {
                           { color: colors.background },
                         ]}
                       >
-                        Close position
+                        Close & send to Base
                       </Text>
                     )}
                   </Pressable>
+                  <Text style={[styles.muted, { fontSize: 12, marginTop: 8 }]}>
+                    Closes position, repays loan, withdraws USDC to Sui wallet,
+                    then starts bridge to Base (sign when prompted).
+                  </Text>
+                  {/* Sui→Base bridge tracker: shown here when Close & send to Base started the flow */}
+                  {(withdrawBridgePending || withdrawBridgeTxHash) && withdrawBridgeStartedBy === 'close-and-send' && (
+                    <View style={{ marginTop: 16 }}>
+                      {withdrawBridgeError ? (
+                        <Text style={[styles.muted, styles.errorText, { marginBottom: 8 }]}>
+                          {withdrawBridgeError}
+                        </Text>
+                      ) : null}
+                      {withdrawBridgeTxHash && withdrawBridgeStatus ? (
+                        <>
+                          <View
+                            style={[
+                              {
+                                alignSelf: "flex-start",
+                                paddingHorizontal: 10,
+                                paddingVertical: 5,
+                                borderRadius: 8,
+                                borderWidth: 1,
+                              },
+                              {
+                                backgroundColor:
+                                  withdrawBridgeStatus.status === "DONE"
+                                    ? "#22c55e22"
+                                    : withdrawBridgeStatus.status === "FAILED"
+                                      ? "#ef444422"
+                                      : "#eab30822",
+                                borderColor:
+                                  withdrawBridgeStatus.status === "DONE"
+                                    ? "#22c55e"
+                                    : withdrawBridgeStatus.status === "FAILED"
+                                      ? "#ef4444"
+                                      : "#eab308",
+                              },
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.primaryButtonText,
+                                {
+                                  fontSize: 12,
+                                  color:
+                                    withdrawBridgeStatus.status === "DONE"
+                                      ? "#22c55e"
+                                      : withdrawBridgeStatus.status === "FAILED"
+                                        ? "#ef4444"
+                                        : "#eab308",
+                                },
+                              ]}
+                            >
+                              {withdrawBridgeStatus.status === "PENDING"
+                                ? "Bridging"
+                                : withdrawBridgeStatus.status === "DONE"
+                                  ? "Complete"
+                                  : withdrawBridgeStatus.status === "FAILED"
+                                    ? "Failed"
+                                    : withdrawBridgeStatus.status}
+                            </Text>
+                          </View>
+                          {withdrawBridgeStatus.substatusMessage != null &&
+                           withdrawBridgeStatus.status === "PENDING" ? (
+                            <Text
+                              style={[
+                                styles.muted,
+                                { color: colors.text, fontSize: 11, marginTop: 6 },
+                              ]}
+                              numberOfLines={2}
+                            >
+                              {withdrawBridgeStatus.substatusMessage}
+                            </Text>
+                          ) : null}
+                          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12, marginTop: 10 }}>
+                            {withdrawBridgeStatus.sending?.txLink ? (
+                              <Pressable
+                                onPress={() =>
+                                  withdrawBridgeStatus.sending?.txLink &&
+                                  Linking.openURL(withdrawBridgeStatus.sending.txLink)
+                                }
+                                style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                              >
+                                <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                                  Source tx
+                                </Text>
+                              </Pressable>
+                            ) : null}
+                            {withdrawBridgeStatus.receiving?.txLink ? (
+                              <Pressable
+                                onPress={() =>
+                                  withdrawBridgeStatus.receiving?.txLink &&
+                                  Linking.openURL(withdrawBridgeStatus.receiving.txLink)
+                                }
+                                style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                              >
+                                <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                                  Destination tx
+                                </Text>
+                              </Pressable>
+                            ) : null}
+                            <Pressable
+                              onPress={() =>
+                                Linking.openURL(
+                                  withdrawBridgeStatus?.lifiExplorerLink ?? `https://scan.li.fi/tx/${withdrawBridgeTxHash}`
+                                )
+                              }
+                              style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                            >
+                              <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                                Track on LI.FI
+                              </Text>
+                            </Pressable>
+                          </View>
+                        </>
+                      ) : withdrawBridgeTxHash ? (
+                        <View>
+                          <View
+                            style={{
+                              alignSelf: "flex-start",
+                              paddingHorizontal: 10,
+                              paddingVertical: 5,
+                              borderRadius: 8,
+                              borderWidth: 1,
+                              backgroundColor: "#eab30822",
+                              borderColor: "#eab308",
+                            }}
+                          >
+                            <Text style={[styles.primaryButtonText, { fontSize: 12, color: "#eab308" }]}>
+                              Checking…
+                            </Text>
+                          </View>
+                          <Pressable
+                            onPress={() => Linking.openURL(`https://scan.li.fi/tx/${withdrawBridgeTxHash}`)}
+                            style={({ pressed }) => ({ paddingVertical: 4, marginTop: 8, opacity: pressed ? 0.8 : 1 })}
+                          >
+                            <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                              Track on LI.FI
+                            </Text>
+                          </Pressable>
+                        </View>
+                      ) : null}
+                      {(!withdrawBridgeTxHash || withdrawBridgeStatus?.status === "FAILED") && withdrawBridgePending ? (
+                        <>
+                          <Pressable
+                            onPress={() => onBridgeToBase()}
+                            disabled={withdrawBridgeLoading}
+                            style={({ pressed }) => [
+                              styles.primaryButton,
+                              {
+                                backgroundColor: colors.tint,
+                                opacity: withdrawBridgeLoading || pressed ? 0.8 : 1,
+                                marginTop: 12,
+                              },
+                            ]}
+                          >
+                            {withdrawBridgeLoading ? (
+                              <ActivityIndicator size="small" color={colors.background} />
+                            ) : (
+                              <Text style={[styles.primaryButtonText, { color: colors.background }]}>
+                                Bridge to Base
+                              </Text>
+                            )}
+                          </Pressable>
+                          {withdrawBridgeError?.includes("LI.FI Explorer") ? (
+                            <Pressable
+                              onPress={() => {
+                                const p = withdrawBridgePending!;
+                                const params = new URLSearchParams({
+                                  fromChain: String(SUI_CHAIN_ID),
+                                  toChain: String(BASE_MAINNET_CHAIN_ID),
+                                  fromToken: BRIDGE_TO_MARGIN_RECEIVE_TOKEN_SUI,
+                                  toToken: BASE_USDC_ADDRESS,
+                                  fromAmount: p.amountRaw,
+                                  fromAddress: p.fromAddress,
+                                });
+                                if (p.toAddress) params.set("toAddress", p.toAddress);
+                                Linking.openURL(`https://explorer.li.fi?${params.toString()}`);
+                              }}
+                              style={({ pressed }) => ({ paddingVertical: 8, marginTop: 8, opacity: pressed ? 0.8 : 1 })}
+                            >
+                              <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                                Open LI.FI Explorer
+                              </Text>
+                            </Pressable>
+                          ) : null}
+                        </>
+                      ) : null}
+                    </View>
+                  )}
+                  {showPlaceOrderBlock && (
+                    <Pressable
+                      onPress={() => onClosePosition()}
+                      disabled={closePositionLoading}
+                      style={({ pressed }) => [
+                        styles.primaryButton,
+                        {
+                          marginTop: 12,
+                          backgroundColor: "transparent",
+                          borderWidth: 1,
+                          borderColor: colors.tabIconDefault,
+                          opacity: closePositionLoading ? 0.6 : pressed ? 0.8 : 1,
+                        },
+                      ]}
+                      accessibilityRole="button"
+                      accessibilityLabel="Close position only"
+                    >
+                      {closePositionLoading ? (
+                        <ActivityIndicator
+                          size="small"
+                          color={colors.text}
+                        />
+                      ) : (
+                        <Text
+                          style={[
+                            styles.primaryButtonText,
+                            { color: colors.text, fontSize: 14 },
+                          ]}
+                        >
+                          Close position only (keep USDC in margin)
+                        </Text>
+                      )}
+                    </Pressable>
+                  )}
                 </View>
               </>
             )}
 
-          </>
-        )}
       </ScrollView>
 
       {/* Always-mounted overlay so opening/closing never adds/removes nodes and the chart keeps its gradient. */}
