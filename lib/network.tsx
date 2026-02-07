@@ -14,6 +14,8 @@ export type NetworkCapabilities = {
   showMarginTab: boolean;
   /** Whether the Pools tab (Sui margin pools — deposit from Base) should be visible. Base mainnet only. */
   showPoolsTab: boolean;
+  /** Whether the LST (Liquid Staking → Lido on Ethereum) tab should be visible. Base mainnet only. */
+  showLstTab: boolean;
   /** Whether Sui-specific wallet UI (balances, send) should be rendered. */
   showSuiWallet: boolean;
   /** Whether EVM-style wallet UI (e.g. Base) should be rendered. */
@@ -45,6 +47,7 @@ export const NETWORKS: NetworkConfig[] = [
     capabilities: {
       showMarginTab: true,
       showPoolsTab: false,
+      showLstTab: false,
       showSuiWallet: true,
       showEvmWallet: false,
       showBaseMainnetExclusiveFeature: false,
@@ -61,6 +64,7 @@ export const NETWORKS: NetworkConfig[] = [
     capabilities: {
       showMarginTab: false,
       showPoolsTab: false,
+      showLstTab: false,
       showSuiWallet: false,
       showEvmWallet: true,
       showBaseMainnetExclusiveFeature: false,
@@ -77,6 +81,7 @@ export const NETWORKS: NetworkConfig[] = [
     capabilities: {
       showMarginTab: false,
       showPoolsTab: true,
+      showLstTab: true,
       showSuiWallet: false,
       showEvmWallet: true,
       showBaseMainnetExclusiveFeature: true,

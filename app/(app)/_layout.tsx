@@ -27,15 +27,21 @@ function FilteredTabBar(props: BottomTabBarProps) {
   const { state, descriptors } = props;
   const isPoolsRoute = (name: string) =>
     name === "pools" || name.startsWith("pools/");
-  const filteredRoutes = state.routes.filter((r) => !isPoolsRoute(r.name));
+  const isLstRoute = (name: string) => name === "lst" || name.startsWith("lst/");
+  const filteredRoutes = state.routes.filter(
+    (r) => !isPoolsRoute(r.name) && !(isLstRoute(r.name) && !currentNetwork.capabilities.showLstTab)
+  );
   const currentRoute = state.routes[state.index];
-  const newIndex =
-    currentRoute && isPoolsRoute(currentRoute.name)
-      ? 0
-      : Math.max(
-          0,
-          filteredRoutes.findIndex((r) => r.name === currentRoute?.name)
-        );
+  const currentFilteredOut =
+    currentRoute &&
+    (isPoolsRoute(currentRoute.name) ||
+      (isLstRoute(currentRoute.name) && !currentNetwork.capabilities.showLstTab));
+  const newIndex = currentFilteredOut
+    ? 0
+    : Math.max(
+        0,
+        filteredRoutes.findIndex((r) => r.name === currentRoute?.name)
+      );
   const filteredState = {
     ...state,
     routes: filteredRoutes,
@@ -72,15 +78,17 @@ function AppTabs() {
         name="index"
         options={{
           title: "Home",
+          tabBarLabel: "Home",
           tabBarIcon: ({ color }) => <TabBarIcon name="home" color={color} />,
         }}
       />
       <Tabs.Screen
         name="pools"
         options={{
-          title: "Pools",
+          title: "Deepbook",
+          tabBarLabel: "Deepbook",
           tabBarIcon: ({ color }) => (
-            <TabBarIcon name="list-alt" color={color} />
+            <TabBarIcon name="book" color={color} />
           ),
         }}
       />
@@ -88,9 +96,20 @@ function AppTabs() {
         name="trading"
         options={{
           title: "Margin",
+          tabBarLabel: "Margin",
           href: currentNetwork.capabilities.showMarginTab ? undefined : null,
           tabBarIcon: ({ color }) => (
             <TabBarIcon name="line-chart" color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="lst"
+        options={{
+          title: "LST",
+          tabBarLabel: "LST",
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="tint" color={color} />
           ),
         }}
       />
