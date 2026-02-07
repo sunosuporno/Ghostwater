@@ -162,7 +162,25 @@ export async function fetchAllSuiBalances(owner: string): Promise<
   if (json.error) {
     throw new Error(json.error.message ?? "RPC error");
   }
-  const list = (json.result ?? []) as SuiBalanceItem[];
+  const rawList = (json.result ?? []) as SuiBalanceItem[];
+  // Sui RPC can return multiple entries for the same coinType (e.g. multiple coin objects). Merge by coinType.
+  const byCoinType = new Map<string, SuiBalanceItem>();
+  for (const item of rawList) {
+    const key = item.coinType;
+    const existing = byCoinType.get(key);
+    if (existing) {
+      const sum =
+        BigInt(existing.totalBalance ?? "0") + BigInt(item.totalBalance ?? "0");
+      byCoinType.set(key, {
+        ...existing,
+        totalBalance: sum.toString(),
+        coinObjectCount: (existing.coinObjectCount ?? 0) + (item.coinObjectCount ?? 0),
+      });
+    } else {
+      byCoinType.set(key, { ...item });
+    }
+  }
+  const list = Array.from(byCoinType.values());
   // Fetch metadata (decimals, symbol) from chain for each coin type in parallel
   const metadataList = await Promise.all(
     list.map((item) => fetchCoinMetadata(item.coinType))
@@ -185,9 +203,33 @@ export async function fetchAllSuiBalances(owner: string): Promise<
       decimals,
     };
   });
+  // Sui can have multiple coin types for the same symbol (e.g. different USDC packages). Merge by symbol.
+  const bySymbol = new Map<
+    string,
+    { coinType: string; totalBalance: string; symbol: string; formatted: string; decimals: number }
+  >();
+  for (const row of mapped) {
+    const key = row.symbol;
+    const existing = bySymbol.get(key);
+    if (existing) {
+      const sum =
+        BigInt(existing.totalBalance) + BigInt(row.totalBalance);
+      const decimals = existing.decimals;
+      bySymbol.set(key, {
+        coinType: existing.coinType,
+        totalBalance: sum.toString(),
+        symbol: existing.symbol,
+        formatted: formatBalance(sum.toString(), decimals),
+        decimals,
+      });
+    } else {
+      bySymbol.set(key, { ...row });
+    }
+  }
+  const merged = Array.from(bySymbol.values());
   // SUI first, then rest alphabetically by symbol
   const SUI_COIN_TYPE = "0x2::sui::SUI";
-  return mapped.sort((a, b) => {
+  return merged.sort((a, b) => {
     if (a.coinType === SUI_COIN_TYPE) return -1;
     if (b.coinType === SUI_COIN_TYPE) return 1;
     return a.symbol.localeCompare(b.symbol);

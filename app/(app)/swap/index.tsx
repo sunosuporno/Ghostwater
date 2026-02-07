@@ -1,15 +1,21 @@
 /**
- * Swap / Bridge — Base only.
- * From: fixed Base + user's wallet tokens (enriched with LI.FI token details).
- * To: chain selector (LI.FI chains) + tokens for selected chain (LI.FI tokens).
+ * Swap / Bridge — Base or Sui as source.
+ * From: fixed Base (or Sui) + user's wallet tokens.
+ * To: chain selector (LI.FI chains) + tokens for selected chain.
+ * Destination: always open when From is Sui, except when To chain is also Sui (then checkbox).
  */
 
 import { useEmbeddedEthereumWallet } from "@privy-io/expo";
+import { useSignRawHash } from "@privy-io/expo/extended-chains";
+import { usePrivy } from "@privy-io/expo";
 import FontAwesome from "@expo/vector-icons/FontAwesome";
+import { useFocusEffect } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   Image,
+  Linking,
   Modal,
   Pressable,
   ScrollView,
@@ -38,8 +44,11 @@ import {
   fetchAllBaseBalances,
   type BaseBalanceItem,
 } from "@/lib/base-balance-fetch";
-import { fetchLifiQuote } from "@/lib/lifi-quote";
+import { fetchLifiQuote, fetchLifiStatus, type LifiStatusResponse } from "@/lib/lifi-quote";
 import { useNetwork } from "@/lib/network";
+import { getSuiAddressFromUser, getSuiWalletFromUser } from "@/lib/sui";
+import { fetchAllSuiBalances } from "@/lib/sui-balance-fetch";
+import { publicKeyToHex } from "@/lib/sui-transfer-via-backend";
 
 /**
  * Base chain logo — must be PNG/JPG/WebP (React Native Image does not support SVG).
@@ -58,19 +67,43 @@ function truncateAddress(addr: string): string {
   return `${addr.slice(0, 6)}...${addr.slice(-4)}`;
 }
 
-/** From-side token: wallet balance + optional LI.FI details (logo, etc.) */
-type FromTokenOption = BaseBalanceItem & { lifiToken?: LifiToken | null };
+/** From-side token: Base (EVM) or Sui wallet balance + optional LI.FI details */
+type SuiFromItem = {
+  coinType: string;
+  totalBalance: string;
+  symbol: string;
+  formatted: string;
+  decimals: number;
+  lifiToken?: LifiToken | null;
+};
+type FromTokenOption = (BaseBalanceItem & { lifiToken?: LifiToken | null }) | SuiFromItem;
+
+function isBaseFromToken(t: FromTokenOption): t is BaseBalanceItem & { lifiToken?: LifiToken | null } {
+  return "tokenAddress" in t;
+}
+function isSuiFromToken(t: FromTokenOption): t is SuiFromItem {
+  return "coinType" in t;
+}
 
 export default function SwapScreen() {
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
   const insets = useSafeAreaInsets();
   const { currentNetwork } = useNetwork();
+  const { user } = usePrivy();
   const { wallets: embeddedEthWallets } = useEmbeddedEthereumWallet();
   const embeddedEthWallet = embeddedEthWallets?.[0];
+  const suiAddress = getSuiAddressFromUser(user);
+  const suiWallet = getSuiWalletFromUser(user);
+  const { signRawHash } = useSignRawHash();
+
+  const isBase = currentNetwork.id === "base-mainnet";
+  const isSui = currentNetwork.id === "sui-mainnet";
+  const canSwap = isBase || isSui;
 
   const [evmAddress, setEvmAddress] = useState<string | null>(null);
-  const [baseBalances, setBaseBalances] = useState<FromTokenOption[]>([]);
+  const [baseBalances, setBaseBalances] = useState<(BaseBalanceItem & { lifiToken?: LifiToken | null })[]>([]);
+  const [suiBalances, setSuiBalances] = useState<SuiFromItem[]>([]);
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [balanceError, setBalanceError] = useState<string | null>(null);
 
@@ -100,10 +133,17 @@ export default function SwapScreen() {
   const [swapLoading, setSwapLoading] = useState(false);
   const [swapError, setSwapError] = useState<string | null>(null);
   const [swapSuccess, setSwapSuccess] = useState<string | null>(null);
+  const [swapSuccessTxHash, setSwapSuccessTxHash] = useState<string | null>(null);
+  const [swapSuccessIsSui, setSwapSuccessIsSui] = useState(false);
+  const [swapSuccessIsBridge, setSwapSuccessIsBridge] = useState(false);
+  const [swapLifiStatus, setSwapLifiStatus] = useState<LifiStatusResponse | null>(null);
 
-  const isBase = currentNetwork.id === "base-mainnet";
+  const apiUrl =
+    (typeof process !== "undefined" && process.env?.EXPO_PUBLIC_API_URL) ||
+    "http://localhost:3001";
 
   const baseChain = chains.find((c) => c.id === LIFI_BASE_CHAIN_ID);
+  const suiChain = chains.find((c) => c.id === LIFI_SUI_CHAIN_ID);
   const hasLoggedBaseChainRef = useRef(false);
 
   useEffect(() => {
@@ -114,21 +154,32 @@ export default function SwapScreen() {
   }, [baseChain?.logoURI, isBase]);
 
   const refetchBalances = useCallback(() => {
-    if (!evmAddress || !isBase) {
-      setBaseBalances([]);
+    if (isBase && evmAddress) {
       setBalanceError(null);
-      return;
+      setBalanceLoading(true);
+      fetchAllBaseBalances(evmAddress, "base-mainnet")
+        .then((list) => setBaseBalances(list.map((b) => ({ ...b, lifiToken: undefined }))))
+        .catch((err) => {
+          setBalanceError(err instanceof Error ? err.message : "Failed to load balances");
+          setBaseBalances([]);
+        })
+        .finally(() => setBalanceLoading(false));
+    } else if (isSui && suiAddress) {
+      setBalanceError(null);
+      setBalanceLoading(true);
+      fetchAllSuiBalances(suiAddress)
+        .then((list) => setSuiBalances(list.map((b) => ({ ...b, lifiToken: undefined }))))
+        .catch((err) => {
+          setBalanceError(err instanceof Error ? err.message : "Failed to load Sui balances");
+          setSuiBalances([]);
+        })
+        .finally(() => setBalanceLoading(false));
+    } else {
+      if (!isBase) setBaseBalances([]);
+      if (!isSui) setSuiBalances([]);
+      setBalanceError(null);
     }
-    setBalanceError(null);
-    setBalanceLoading(true);
-    fetchAllBaseBalances(evmAddress, "base-mainnet")
-      .then((list) => setBaseBalances(list.map((b) => ({ ...b, lifiToken: undefined }))))
-      .catch((err) => {
-        setBalanceError(err instanceof Error ? err.message : "Failed to load balances");
-        setBaseBalances([]);
-      })
-      .finally(() => setBalanceLoading(false));
-  }, [evmAddress, isBase]);
+  }, [evmAddress, isBase, isSui, suiAddress]);
 
   useEffect(() => {
     if (!embeddedEthWallet) {
@@ -153,17 +204,64 @@ export default function SwapScreen() {
   }, [embeddedEthWallet]);
 
   useEffect(() => {
-    if (evmAddress && isBase) refetchBalances();
-  }, [evmAddress, isBase, refetchBalances]);
+    if (canSwap && (evmAddress && isBase || suiAddress && isSui)) refetchBalances();
+  }, [canSwap, evmAddress, isBase, isSui, suiAddress, refetchBalances]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (canSwap && (evmAddress && isBase || suiAddress && isSui)) refetchBalances();
+    }, [canSwap, evmAddress, isBase, isSui, suiAddress, refetchBalances])
+  );
+
+  // Poll LI.FI status for cross-chain (bridge) swaps until DONE/FAILED
+  const swapFromChainId = swapSuccessIsSui ? LIFI_SUI_CHAIN_ID : LIFI_BASE_CHAIN_ID;
+  useEffect(() => {
+    if (!swapSuccessTxHash || !swapSuccessIsBridge) return;
+    let notFoundCount = 0;
+    const maxNotFound = 10;
+    const pollMs = 6000;
+    const maxPolls = 50;
+    const poll = async () => {
+      try {
+        const status = await fetchLifiStatus(swapSuccessTxHash!, swapFromChainId);
+        setSwapLifiStatus(status);
+        if (status.status === "NOT_FOUND") {
+          notFoundCount += 1;
+          if (notFoundCount >= maxNotFound) return true;
+        } else {
+          notFoundCount = 0;
+          if (status.status === "DONE" || status.status === "FAILED") {
+            refetchBalances();
+            return true;
+          }
+        }
+      } catch {
+        // keep polling on network error
+      }
+      return false;
+    };
+    let pollCount = 0;
+    const id = setInterval(async () => {
+      pollCount += 1;
+      if (pollCount > maxPolls) {
+        clearInterval(id);
+        return;
+      }
+      const done = await poll();
+      if (done) clearInterval(id);
+    }, pollMs);
+    poll();
+    return () => clearInterval(id);
+  }, [swapSuccessTxHash, swapSuccessIsBridge, swapFromChainId, refetchBalances]);
 
   useEffect(() => {
-    if (!isBase) return;
+    if (!canSwap) return;
     setChainsLoading(true);
     fetchLifiChains()
       .then((list) => setChains(getSwapChains(list)))
       .catch(() => setChains([]))
       .finally(() => setChainsLoading(false));
-  }, [isBase]);
+  }, [canSwap]);
 
   const toChainIdStr = toChain ? String(toChain.id) : "";
   const toTokens = (toChainIdStr && tokensByChain[toChainIdStr]) || [];
@@ -178,26 +276,37 @@ export default function SwapScreen() {
           (t.name && t.name.toLowerCase().includes(tokenSearchLower))
       )
     : toTokens;
-  const fromTokenAddressForCompare =
-    fromToken ? (fromToken.tokenAddress ?? NATIVE_TOKEN_ADDRESS).toLowerCase() : "";
+  const fromTokenIdForCompare = fromToken
+    ? (isBaseFromToken(fromToken)
+        ? (fromToken.tokenAddress ?? NATIVE_TOKEN_ADDRESS).toLowerCase()
+        : (fromToken as SuiFromItem).coinType.toLowerCase())
+    : "";
   const selectableToTokens =
-    toChain?.id === LIFI_BASE_CHAIN_ID && fromTokenAddressForCompare
+    fromTokenIdForCompare &&
+    ((isBase && toChain?.id === LIFI_BASE_CHAIN_ID) ||
+      (isSui && toChain?.id === LIFI_SUI_CHAIN_ID))
       ? filteredToTokens.filter(
-          (t) => t.address.toLowerCase() !== fromTokenAddressForCompare
+          (t) => t.address.toLowerCase() !== fromTokenIdForCompare
         )
       : filteredToTokens;
   const isSameTokenSameNetwork =
-    toChain?.id === LIFI_BASE_CHAIN_ID &&
     !!fromToken &&
     !!toToken &&
-    toToken.address.toLowerCase() === fromTokenAddressForCompare;
+    !!toChain &&
+    ((isBase &&
+      toChain.id === LIFI_BASE_CHAIN_ID &&
+      toToken.address.toLowerCase() === fromTokenIdForCompare) ||
+      (isSui &&
+        toChain.id === LIFI_SUI_CHAIN_ID &&
+        isSuiFromToken(fromToken) &&
+        toToken.address.toLowerCase() === (fromToken as SuiFromItem).coinType.toLowerCase()));
 
   useEffect(() => {
     if (isSameTokenSameNetwork && toToken) setToToken(null);
   }, [isSameTokenSameNetwork, toToken]);
 
   useEffect(() => {
-    if (!isBase || !toChain) return;
+    if (!canSwap || !toChain) return;
     const chainIdStr = String(toChain.id);
     if (tokensByChain[chainIdStr] !== undefined) return;
     setTokensLoading(true);
@@ -209,16 +318,15 @@ export default function SwapScreen() {
         setTokensByChain((prev) => ({ ...prev, [chainIdStr]: [] }));
       })
       .finally(() => setTokensLoading(false));
-  }, [isBase, toChain?.id]);
+  }, [canSwap, toChain?.id]);
 
   useEffect(() => {
-    if (!fromToken || !isBase) {
+    if (!fromToken || !isBase || !isBaseFromToken(fromToken)) {
       setFromTokenLifiDetail(null);
       return;
     }
     const chainKey = String(LIFI_BASE_CHAIN_ID);
-    const tokenParam =
-      fromToken.tokenAddress ?? NATIVE_TOKEN_ADDRESS;
+    const tokenParam = (fromToken as BaseBalanceItem & { lifiToken?: LifiToken }).tokenAddress ?? NATIVE_TOKEN_ADDRESS;
     let cancelled = false;
     fetchLifiToken(chainKey, tokenParam)
       .then((t) => {
@@ -230,17 +338,20 @@ export default function SwapScreen() {
     return () => {
       cancelled = true;
     };
-  }, [fromToken?.tokenAddress, fromToken?.symbol, isBase]);
+  }, [fromToken, isBase]);
 
-  // Debounced LI.FI quote: wait 1s after amount/tokens change, then fetch quote and set To amount
+  // Debounced LI.FI quote: wait 1s after amount/tokens change, then fetch quote and set To amount. Don't call when destination is required but empty.
   useEffect(() => {
+    const fromAddress = isBase ? evmAddress : suiAddress;
+    const needDest = (isBase && isToChainSuiOrSolana) || (isSui && toChain?.id !== LIFI_SUI_CHAIN_ID);
     const haveAll =
       fromToken &&
       toChain &&
       toToken &&
-      evmAddress &&
+      fromAddress &&
       amount.trim() !== "" &&
-      parseFloat(amount) > 0;
+      parseFloat(amount) > 0 &&
+      (!needDest || toAddress.trim() !== "");
 
     if (!haveAll) {
       if (quoteTimeoutRef.current) {
@@ -261,11 +372,18 @@ export default function SwapScreen() {
       const fromAmountRaw = BigInt(
         Math.round(amountNum * Math.pow(10, fromDecimals))
       ).toString();
-      const fromTokenAddress =
-        fromToken!.tokenAddress ?? NATIVE_TOKEN_ADDRESS;
+      const fromChainId = isBase ? LIFI_BASE_CHAIN_ID : LIFI_SUI_CHAIN_ID;
+      const fromTokenAddress = isBaseFromToken(fromToken!)
+        ? ((fromToken as BaseBalanceItem).tokenAddress ?? NATIVE_TOKEN_ADDRESS)
+        : (fromToken as SuiFromItem).coinType;
       const toDecimals = toToken!.decimals ?? 18;
-      const toAddressParam =
-        destinationSameAsSource || !toAddress.trim()
+      const toAddressParam = isSui
+        ? toChain!.id === LIFI_SUI_CHAIN_ID
+          ? destinationSameAsSource || !toAddress.trim()
+            ? undefined
+            : toAddress.trim()
+          : toAddress.trim() || undefined
+        : destinationSameAsSource || !toAddress.trim()
           ? undefined
           : toAddress.trim();
 
@@ -273,14 +391,14 @@ export default function SwapScreen() {
       setQuoteError(null);
 
       fetchLifiQuote({
-        fromChainId: LIFI_BASE_CHAIN_ID,
+        fromChainId,
         toChainId: toChain!.id,
         fromTokenAddress,
         toTokenAddress: toToken!.address,
         fromAmount: fromAmountRaw,
-        fromAddress: evmAddress!,
+        fromAddress: fromAddress!,
         ...(toAddressParam ? { toAddress: toAddressParam } : {}),
-        slippage: 0.005,
+        slippage: 0.01,
       })
         .then((res) => {
           if (requestId !== quoteRequestIdRef.current) return;
@@ -321,9 +439,13 @@ export default function SwapScreen() {
     fromToken,
     toChain,
     toToken,
+    isBase,
+    isSui,
     evmAddress,
+    suiAddress,
     destinationSameAsSource,
     toAddress,
+    isToChainSuiOrSolana,
   ]);
 
   const selectFromToken = useCallback((item: FromTokenOption) => {
@@ -351,64 +473,58 @@ export default function SwapScreen() {
   }, []);
 
   const handleSwap = useCallback(async () => {
+    const fromAddress = isBase ? evmAddress : suiAddress;
+    const needDest = (isBase && isToChainSuiOrSolana) || (isSui && toChain?.id !== LIFI_SUI_CHAIN_ID);
     if (
       !fromToken ||
       !toChain ||
       !toToken ||
       !amount.trim() ||
-      !evmAddress ||
-      (isToChainSuiOrSolana && !toAddress.trim())
+      !fromAddress
     ) {
       return;
     }
-    if (toChain.id === LIFI_BASE_CHAIN_ID && (fromToken.tokenAddress ?? NATIVE_TOKEN_ADDRESS).toLowerCase() === toToken.address.toLowerCase()) {
+    if (needDest && !toAddress.trim()) {
+      Alert.alert("Enter destination address", "Please enter the destination address to continue.");
+      return;
+    }
+    if (isSameTokenSameNetwork) {
       setSwapError("Choose a different token or chain.");
-      return;
-    }
-    const provider = await (embeddedEthWallet as { getProvider?: () => Promise<{ request: (args: { method: string; params?: unknown[] }) => Promise<unknown> }> })?.getProvider?.();
-    if (!provider) {
-      setSwapError("Wallet not connected");
-      return;
-    }
-    const chainIdHex = currentNetwork.evmChainId;
-    if (!chainIdHex) {
-      setSwapError("Base network not configured");
       return;
     }
     setSwapError(null);
     setSwapSuccess(null);
+    setSwapSuccessTxHash(null);
+    setSwapSuccessIsBridge(false);
+    setSwapLifiStatus(null);
     setSwapLoading(true);
-    try {
-      const currentChainId = (await provider.request({ method: "eth_chainId" })) as string;
-      if (currentChainId !== chainIdHex) {
-        await provider.request({
-          method: "wallet_switchEthereumChain",
-          params: [{ chainId: chainIdHex }],
-        });
-      }
-      const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
-      const from = accounts?.[0];
-      if (!from) {
-        throw new Error("No account found");
-      }
-      const fromDecimals = fromToken.decimals ?? 18;
-      const amountNum = parseFloat(amount);
-      const fromAmountRaw = BigInt(
-        Math.round(amountNum * Math.pow(10, fromDecimals))
-      ).toString();
-      const fromTokenAddress = fromToken.tokenAddress ?? NATIVE_TOKEN_ADDRESS;
-      const toAddressParam =
-        destinationSameAsSource || !toAddress.trim() ? undefined : toAddress.trim();
 
+    const fromDecimals = fromToken.decimals ?? 18;
+    const amountNum = parseFloat(amount);
+    const fromAmountRaw = BigInt(
+      Math.round(amountNum * Math.pow(10, fromDecimals))
+    ).toString();
+    const fromChainId = isBase ? LIFI_BASE_CHAIN_ID : LIFI_SUI_CHAIN_ID;
+    const fromTokenAddress = isBaseFromToken(fromToken)
+      ? ((fromToken as BaseBalanceItem).tokenAddress ?? NATIVE_TOKEN_ADDRESS)
+      : (fromToken as SuiFromItem).coinType;
+    const toAddressParam =
+      needDest && toAddress.trim()
+        ? toAddress.trim()
+        : destinationSameAsSource || !toAddress.trim()
+          ? undefined
+          : toAddress.trim();
+
+    try {
       const quoteResult = (await fetchLifiQuote({
-        fromChainId: LIFI_BASE_CHAIN_ID,
+        fromChainId,
         toChainId: toChain.id,
         fromTokenAddress,
         toTokenAddress: toToken.address,
         fromAmount: fromAmountRaw,
-        fromAddress: evmAddress,
+        fromAddress: fromAddress,
         ...(toAddressParam ? { toAddress: toAddressParam } : {}),
-        slippage: 0.005,
+        slippage: 0.01,
       })) as {
         transactionRequest?: {
           to?: string;
@@ -421,56 +537,153 @@ export default function SwapScreen() {
           chainId?: number;
         };
         estimate?: { approvalAddress?: string };
+        action?: { fromChainId?: number };
       };
 
       const txRequest = quoteResult?.transactionRequest;
-      if (!txRequest?.to || !txRequest?.data) {
+      const action = quoteResult?.action as { fromChainId?: number } | undefined;
+      const quoteFromChainId = action?.fromChainId;
+
+      const hasSuiTxData = typeof txRequest?.data === "string" && txRequest.data.length > 0;
+      const hasEvmTx = txRequest?.to && txRequest?.data;
+      if (!hasSuiTxData && !hasEvmTx) {
         throw new Error("No route returned. Try a different amount or token.");
       }
 
-      const isErc20 = fromToken.tokenAddress != null;
-      const approvalAddress = quoteResult?.estimate?.approvalAddress;
-      if (isErc20 && approvalAddress) {
-        const pad64 = (hex: string) => hex.replace(/^0x/, "").padStart(64, "0");
-        const amountHex = BigInt(fromAmountRaw).toString(16);
-        const approveData = "0x095ea7b3" + pad64(approvalAddress) + pad64(amountHex);
-        await provider.request({
-          method: "eth_sendTransaction",
-          params: [
-            {
-              from,
-              to: fromToken.tokenAddress,
-              data: approveData,
-              value: "0x0",
-              gasLimit: "0xfde8",
-              chainId: chainIdHex,
-            },
-          ],
-        });
-        await new Promise((r) => setTimeout(r, 3000));
+      if (isSui && quoteFromChainId === LIFI_SUI_CHAIN_ID && signRawHash && suiWallet?.publicKey && suiAddress) {
+        const suiTxBase64 = hasSuiTxData ? txRequest.data! : null;
+        if (suiTxBase64) {
+          const base = apiUrl.replace(/\/$/, "");
+          const prepareRes = await fetch(`${base}/api/prepare-external-sui-tx`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ txBytesBase64: suiTxBase64 }),
+          });
+          if (!prepareRes.ok) {
+            const errText = await prepareRes.text();
+            let errJson: Record<string, unknown> = {};
+            try {
+              errJson = JSON.parse(errText) as Record<string, unknown>;
+            } catch {
+              // not JSON
+            }
+            const serverMsg = (errJson.error as string) ?? (errText || "Prepare Sui tx failed");
+            if (prepareRes.status === 404) {
+              throw new Error(
+                "Backend prepare-external-sui-tx not available. Start the backend (cd backend && npm run dev) to complete Sui swaps."
+              );
+            }
+            throw new Error(serverMsg);
+          }
+          const prepareJson = await prepareRes.json();
+          const intentMessageHashHex =
+            prepareJson.intentMessageHashHex ?? prepareJson.intent_message_hash_hex;
+          if (!intentMessageHashHex) throw new Error("Missing intentMessageHashHex from backend");
+          const { signature: signatureHex } = await signRawHash({
+            address: suiAddress,
+            chainType: "sui",
+            hash: intentMessageHashHex.startsWith("0x")
+              ? (intentMessageHashHex as `0x${string}`)
+              : (`0x${intentMessageHashHex}` as `0x${string}`),
+          });
+          const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
+          const executeRes = await fetch(`${base}/api/execute-transfer`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              txBytesBase64: suiTxBase64,
+              signatureHex,
+              publicKeyHex: publicKeyHex.startsWith("0x") ? publicKeyHex : "0x" + publicKeyHex,
+              network: "mainnet",
+            }),
+          });
+          const executeJson = await executeRes.json();
+          if (!executeRes.ok) {
+            throw new Error((executeJson.error as string) ?? "Execute failed");
+          }
+          const digest = executeJson.digest;
+          if (digest) {
+            setSwapSuccess(`Transaction submitted. Tx: ${digest}`);
+            setSwapSuccessTxHash(digest);
+            setSwapSuccessIsSui(true);
+            setSwapSuccessIsBridge(toChain != null && toChain.id !== LIFI_SUI_CHAIN_ID);
+            setAmount("");
+            setToAmountDisplay("");
+            refetchBalances();
+            setTimeout(() => refetchBalances(), 2500);
+            if (toChain != null && toChain.id !== LIFI_SUI_CHAIN_ID) {
+              setTimeout(() => refetchBalances(), 5000);
+              setTimeout(() => refetchBalances(), 10000);
+            }
+            setSwapLoading(false);
+            return;
+          }
+        }
       }
 
-      const tx: Record<string, string> = {
-        from,
-        to: txRequest.to,
-        data: txRequest.data,
-        value: txRequest.value ?? "0x0",
-      };
-      if (txRequest.gasLimit) tx.gasLimit = txRequest.gasLimit;
-      if (txRequest.gasPrice) tx.gasPrice = txRequest.gasPrice;
-      if (txRequest.maxFeePerGas) tx.maxFeePerGas = txRequest.maxFeePerGas;
-      if (txRequest.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = txRequest.maxPriorityFeePerGas;
-      if (txRequest.chainId != null) tx.chainId = "0x" + Number(txRequest.chainId).toString(16);
+      if (txRequest.chainId != null && embeddedEthWallet) {
+        const provider = await (embeddedEthWallet as { getProvider?: () => Promise<{ request: (args: { method: string; params?: unknown[] }) => Promise<unknown> }> })?.getProvider?.();
+        if (provider) {
+          const chainIdHex = "0x" + Number(txRequest.chainId).toString(16);
+          const accounts = (await provider.request({ method: "eth_requestAccounts" })) as string[];
+          const from = accounts?.[0];
+          if (from) {
+            if (isBase && isBaseFromToken(fromToken)) {
+              const approvalAddress = (quoteResult as { estimate?: { approvalAddress?: string } })?.estimate?.approvalAddress;
+              const isErc20 = (fromToken as BaseBalanceItem).tokenAddress != null;
+              if (isErc20 && approvalAddress) {
+                const pad64 = (hex: string) => hex.replace(/^0x/, "").padStart(64, "0");
+                const amountHex = BigInt(fromAmountRaw).toString(16);
+                const approveData = "0x095ea7b3" + pad64(approvalAddress) + pad64(amountHex);
+                await provider.request({
+                  method: "eth_sendTransaction",
+                  params: [{
+                    from,
+                    to: (fromToken as BaseBalanceItem).tokenAddress,
+                    data: approveData,
+                    value: "0x0",
+                    gasLimit: "0xfde8",
+                    chainId: currentNetwork.evmChainId,
+                  }],
+                });
+                await new Promise((r) => setTimeout(r, 3000));
+              }
+            }
+            const tx: Record<string, string> = {
+              from,
+              to: txRequest.to!,
+              data: txRequest.data!,
+              value: txRequest.value ?? "0x0",
+            };
+            if (txRequest.gasLimit) tx.gasLimit = txRequest.gasLimit;
+            if (txRequest.gasPrice) tx.gasPrice = txRequest.gasPrice;
+            if (txRequest.maxFeePerGas) tx.maxFeePerGas = txRequest.maxFeePerGas;
+            if (txRequest.maxPriorityFeePerGas) tx.maxPriorityFeePerGas = txRequest.maxPriorityFeePerGas;
+            if (txRequest.chainId != null) tx.chainId = "0x" + Number(txRequest.chainId).toString(16);
+            const txHash = await provider.request({
+              method: "eth_sendTransaction",
+              params: [tx],
+            });
+            const hashStr = String(txHash);
+            setSwapSuccess(`Transaction submitted. Tx: ${hashStr}`);
+            setSwapSuccessTxHash(hashStr);
+            setSwapSuccessIsSui(false);
+            setSwapSuccessIsBridge(toChain != null && toChain.id !== LIFI_BASE_CHAIN_ID);
+            setAmount("");
+            setToAmountDisplay("");
+            refetchBalances();
+            setTimeout(() => refetchBalances(), 2500);
+            if (toChain != null && toChain.id !== LIFI_BASE_CHAIN_ID) {
+              setTimeout(() => refetchBalances(), 5000);
+              setTimeout(() => refetchBalances(), 10000);
+            }
+            setSwapLoading(false);
+            return;
+          }
+        }
+      }
 
-      const txHash = await provider.request({
-        method: "eth_sendTransaction",
-        params: [tx],
-      });
-      const hashStr = String(txHash);
-      setSwapSuccess(`Transaction submitted. Tx: ${hashStr}`);
-      setAmount("");
-      setToAmountDisplay("");
-      refetchBalances();
+      throw new Error("This route requires signing. Use LI.FI Explorer to complete.");
     } catch (err) {
       setSwapError(err instanceof Error ? err.message : "Swap failed");
     } finally {
@@ -482,20 +695,27 @@ export default function SwapScreen() {
     toToken,
     amount,
     evmAddress,
+    suiAddress,
     destinationSameAsSource,
     toAddress,
+    isBase,
+    isSui,
     isToChainSuiOrSolana,
+    isSameTokenSameNetwork,
+    signRawHash,
+    suiWallet?.publicKey,
     embeddedEthWallet,
     currentNetwork.evmChainId,
+    apiUrl,
     refetchBalances,
   ]);
 
-  if (!isBase) {
+  if (!canSwap) {
     return (
       <View style={[styles.container, { paddingTop: insets.top + 24 }]}>
         <Text style={styles.title}>Swap / Bridge</Text>
         <Text style={[styles.muted, { color: colors.tabIconDefault, marginTop: 8, fontSize: 14 }]}>
-          Swap and bridge is only available on Base.
+          Swap and bridge is available on Base or Sui. Switch network to continue.
         </Text>
       </View>
     );
@@ -522,15 +742,21 @@ export default function SwapScreen() {
         </View>
       ) : (
         <View style={[styles.card, { backgroundColor: colors.background, borderColor: "#444" }]}>
-          {/* From box — wraps entire From section */}
+          {/* From box — wraps entire From section (Base or Sui) */}
           <View style={[styles.fromBox, { borderColor: "#888888" }]}>
           <View style={styles.block}>
             <View style={styles.blockHeader}>
               <Text style={[styles.blockLabel, { color: colors.tabIconDefault }]}>From</Text>
               <View style={styles.walletRow}>
-                <Image source={{ uri: BASE_CHAIN_LOGO_URI }} style={styles.walletChainIcon} />
+                {isBase ? (
+                  <Image source={{ uri: BASE_CHAIN_LOGO_URI }} style={styles.walletChainIcon} />
+                ) : (
+                  <View style={[styles.walletChainIcon, { backgroundColor: colors.tabIconDefault + "40" }]} />
+                )}
                 <Text style={[styles.walletAddress, { color: colors.tabIconDefault }]}>
-                  {evmAddress ? truncateAddress(evmAddress) : ""}
+                  {isBase
+                    ? (evmAddress ? truncateAddress(evmAddress) : "")
+                    : (suiAddress ? truncateAddress(suiAddress) : "")}
                 </Text>
                 <FontAwesome name="chevron-down" size={12} color={colors.tabIconDefault} />
               </View>
@@ -548,27 +774,30 @@ export default function SwapScreen() {
                 keyboardType="decimal-pad"
                 editable={!!fromToken}
               />
-              {/* From chain name (fixed Base) */}
-              {!baseChain && chainsLoading ? (
-                <View style={[styles.chainNameNextToAmount, styles.chainIconLoader]}>
-                  <ActivityIndicator size="small" color={colors.tint} />
-                </View>
+              {isBase ? (
+                !baseChain && chainsLoading ? (
+                  <View style={[styles.chainNameNextToAmount, styles.chainIconLoader]}>
+                    <ActivityIndicator size="small" color={colors.tint} />
+                  </View>
+                ) : (
+                  <Text style={[styles.chainNameNextToAmount, { color: colors.tabIconDefault }]}>Base</Text>
+                )
               ) : (
-                <Text style={[styles.chainNameNextToAmount, { color: colors.tabIconDefault }]}>Base</Text>
+                <Text style={[styles.chainNameNextToAmount, { color: colors.tabIconDefault }]}>Sui</Text>
               )}
             </View>
             <View style={styles.tokenRowBlock}>
               <View style={styles.fromTokenSelector}>
                 {balanceLoading ? (
                   <ActivityIndicator size="small" color={colors.tint} />
-                ) : (
+                ) : isBase ? (
                   <ScrollView
                     horizontal
                     showsHorizontalScrollIndicator={false}
                     contentContainerStyle={styles.fromTokenChips}
                   >
                     {baseBalances.map((item) => {
-                      const isSelected = fromToken !== null && addressEq(fromToken.tokenAddress, item.tokenAddress);
+                      const isSelected = fromToken !== null && isBaseFromToken(fromToken) && addressEq(fromToken.tokenAddress, item.tokenAddress);
                       const logoUri = fromToken === item ? (fromTokenLifiDetail?.logoURI ?? item.lifiToken?.logoURI) : undefined;
                       return (
                         <Pressable
@@ -592,6 +821,33 @@ export default function SwapScreen() {
                           ) : (
                             <Text style={[styles.chainNameInChip, { color: colors.tabIconDefault }]}>Base</Text>
                           )}
+                        </Pressable>
+                      );
+                    })}
+                  </ScrollView>
+                ) : (
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.fromTokenChips}
+                  >
+                    {suiBalances.map((item) => {
+                      const isSelected = fromToken !== null && isSuiFromToken(fromToken) && fromToken.coinType === item.coinType;
+                      return (
+                        <Pressable
+                          key={item.coinType}
+                          onPress={() => selectFromToken(item)}
+                          style={[
+                            styles.fromTokenChip,
+                            {
+                              borderColor: isSelected ? colors.tint : "#888888",
+                              borderWidth: isSelected ? 1.5 : 1,
+                              ...(isSelected && { backgroundColor: colors.tint + "20" }),
+                            },
+                          ]}
+                        >
+                          <Text style={[styles.tokenSymbol, { color: colors.text }]}>{item.symbol}</Text>
+                          <Text style={[styles.chainNameInChip, { color: colors.tabIconDefault }]}>Sui</Text>
                         </Pressable>
                       );
                     })}
@@ -716,8 +972,10 @@ export default function SwapScreen() {
             </View>
           </View>
 
-          {/* Destination address: for Sui/Solana always show field (no "same as source"); for EVM show checkbox + optional field */}
-          {!isToChainSuiOrSolana ? (
+          {/* Destination: From Base → checkbox for EVM, always field for Sui/Solana. From Sui → checkbox only when To is Sui; else always field. */}
+          {(
+            isBase ? !isToChainSuiOrSolana : (toChain?.id === LIFI_SUI_CHAIN_ID)
+          ) ? (
             <Pressable
               style={[
                 styles.destinationCheckRow,
@@ -735,7 +993,11 @@ export default function SwapScreen() {
               </Text>
             </Pressable>
           ) : null}
-          {(isToChainSuiOrSolana || !destinationSameAsSource) ? (
+          {(
+            isBase
+              ? (isToChainSuiOrSolana || !destinationSameAsSource)
+              : (toChain?.id !== LIFI_SUI_CHAIN_ID || !destinationSameAsSource)
+          ) ? (
             <View
               style={[
                 styles.toAddressFieldWrap,
@@ -766,14 +1028,132 @@ export default function SwapScreen() {
             </Text>
           ) : null}
           {swapError ? (
-            <Text style={[styles.muted, { color: "#ef4444", marginTop: 8 }]} numberOfLines={2}>
-              {swapError}
-            </Text>
+            <View style={{ marginTop: 8 }}>
+              <Text style={[styles.muted, { color: "#ef4444" }]} numberOfLines={3}>
+                {swapError}
+              </Text>
+              <Text style={[styles.muted, { color: colors.tabIconDefault, fontSize: 11, marginTop: 4 }]}>
+                Cross-chain routes can fail due to liquidity or slippage. Try again or use a different destination chain.
+              </Text>
+            </View>
           ) : null}
           {swapSuccess ? (
-            <Text style={[styles.muted, { color: "#22c55e", marginTop: 8 }]} numberOfLines={3}>
-              {swapSuccess}
-            </Text>
+            <View style={{ marginTop: 8 }}>
+              {swapSuccessIsBridge && (swapLifiStatus || swapSuccessTxHash) ? (
+                <>
+                  <View
+                    style={{
+                      paddingVertical: 8,
+                      paddingHorizontal: 12,
+                      borderRadius: 8,
+                      backgroundColor:
+                        swapLifiStatus?.status === "DONE"
+                          ? "#22c55e22"
+                          : swapLifiStatus?.status === "FAILED"
+                            ? "#ef444422"
+                            : "#eab30822",
+                      borderWidth: 1,
+                      borderColor:
+                        swapLifiStatus?.status === "DONE"
+                          ? "#22c55e"
+                          : swapLifiStatus?.status === "FAILED"
+                            ? "#ef4444"
+                            : "#eab308",
+                    }}
+                  >
+                    <Text
+                      style={[
+                        styles.muted,
+                        {
+                          color:
+                            swapLifiStatus?.status === "DONE"
+                              ? "#22c55e"
+                              : swapLifiStatus?.status === "FAILED"
+                                ? "#ef4444"
+                                : "#eab308",
+                        },
+                      ]}
+                    >
+                      {swapLifiStatus
+                        ? swapLifiStatus.status === "PENDING"
+                          ? "Bridging"
+                          : swapLifiStatus.status === "DONE"
+                            ? "Complete"
+                            : swapLifiStatus.status === "FAILED"
+                              ? "Failed"
+                              : swapLifiStatus.status
+                        : "Checking…"}
+                    </Text>
+                  </View>
+                  {swapLifiStatus?.substatusMessage != null && swapLifiStatus.status === "PENDING" ? (
+                    <Text style={[styles.muted, { color: colors.text, fontSize: 11, marginTop: 6 }]} numberOfLines={2}>
+                      {swapLifiStatus.substatusMessage}
+                    </Text>
+                  ) : null}
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12, marginTop: 8 }}>
+                    {swapLifiStatus?.sending?.txLink ? (
+                      <Pressable
+                        onPress={() => swapLifiStatus?.sending?.txLink && Linking.openURL(swapLifiStatus.sending.txLink)}
+                        style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                      >
+                        <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                          Source tx
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                    {swapLifiStatus?.receiving?.txLink ? (
+                      <Pressable
+                        onPress={() => swapLifiStatus?.receiving?.txLink && Linking.openURL(swapLifiStatus.receiving.txLink)}
+                        style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                      >
+                        <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                          Destination tx
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                    {swapLifiStatus?.lifiExplorerLink ? (
+                      <Pressable
+                        onPress={() => swapLifiStatus?.lifiExplorerLink && Linking.openURL(swapLifiStatus.lifiExplorerLink)}
+                        style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                      >
+                        <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                          Track on LI.FI
+                        </Text>
+                      </Pressable>
+                    ) : swapSuccessTxHash ? (
+                      <Pressable
+                        onPress={() => Linking.openURL(`https://scan.li.fi/tx/${swapSuccessTxHash}`)}
+                        style={({ pressed }) => ({ paddingVertical: 4, opacity: pressed ? 0.8 : 1 })}
+                      >
+                        <Text style={[styles.muted, { fontSize: 12, textDecorationLine: "underline", color: colors.tint }]}>
+                          Track on LI.FI
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                  </View>
+                </>
+              ) : (
+                <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center" }}>
+                  <Text style={[styles.muted, { color: "#22c55e" }]}>Transaction submitted. Tx: </Text>
+                  {swapSuccessTxHash ? (
+                    <Pressable
+                      onPress={() => {
+                        const url = swapSuccessIsSui
+                          ? `https://suiscan.xyz/mainnet/tx/${swapSuccessTxHash}`
+                          : `https://basescan.org/tx/${swapSuccessTxHash}`;
+                        Linking.openURL(url);
+                      }}
+                    >
+                      <Text style={[styles.muted, { color: "#22c55e", textDecorationLine: "underline" }]} numberOfLines={1}>
+                        {swapSuccessTxHash}
+                      </Text>
+                    </Pressable>
+                  ) : (
+                    <Text style={[styles.muted, { color: "#22c55e" }]} numberOfLines={3}>{swapSuccess}</Text>
+                  )}
+                </View>
+              )}
+            </View>
           ) : null}
           <Pressable
             style={[
@@ -796,7 +1176,8 @@ export default function SwapScreen() {
               !toChain ||
               !toToken ||
               !amount.trim() ||
-              (!!isToChainSuiOrSolana && !toAddress.trim()) ||
+              (isBase && !!isToChainSuiOrSolana && !toAddress.trim()) ||
+              (isSui && toChain?.id !== LIFI_SUI_CHAIN_ID && !toAddress.trim()) ||
               swapLoading ||
               isSameTokenSameNetwork
             }
@@ -805,7 +1186,7 @@ export default function SwapScreen() {
               <ActivityIndicator size="small" color={colors.background} />
             ) : (
               <Text style={[styles.primaryButtonText, { color: colors.background }]}>
-                {toChain?.id === LIFI_BASE_CHAIN_ID ? "Swap" : "Bridge"}
+                {toChain && toChain.id === (isBase ? LIFI_BASE_CHAIN_ID : LIFI_SUI_CHAIN_ID) ? "Swap" : "Bridge"}
               </Text>
             )}
           </Pressable>

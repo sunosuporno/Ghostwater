@@ -50,7 +50,7 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: true,
       showPoolsTab: false,
       showLstTab: false,
-      showSwapTab: false,
+      showSwapTab: true,
       showSuiWallet: true,
       showEvmWallet: false,
       showBaseMainnetExclusiveFeature: false,
