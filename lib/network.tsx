@@ -16,6 +16,8 @@ export type NetworkCapabilities = {
   showPoolsTab: boolean;
   /** Whether the LST (Liquid Staking → Lido on Ethereum) tab should be visible. Base mainnet only. */
   showLstTab: boolean;
+  /** Whether the Swap tab should be visible. Base mainnet only. */
+  showSwapTab: boolean;
   /** Whether Sui-specific wallet UI (balances, send) should be rendered. */
   showSuiWallet: boolean;
   /** Whether EVM-style wallet UI (e.g. Base) should be rendered. */
@@ -48,6 +50,7 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: true,
       showPoolsTab: false,
       showLstTab: false,
+      showSwapTab: false,
       showSuiWallet: true,
       showEvmWallet: false,
       showBaseMainnetExclusiveFeature: false,
@@ -65,6 +68,7 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: false,
       showPoolsTab: false,
       showLstTab: false,
+      showSwapTab: false,
       showSuiWallet: false,
       showEvmWallet: true,
       showBaseMainnetExclusiveFeature: false,
@@ -82,6 +86,7 @@ export const NETWORKS: NetworkConfig[] = [
       showMarginTab: false,
       showPoolsTab: true,
       showLstTab: true,
+      showSwapTab: true,
       showSuiWallet: false,
       showEvmWallet: true,
       showBaseMainnetExclusiveFeature: true,

@@ -28,14 +28,19 @@ function FilteredTabBar(props: BottomTabBarProps) {
   const isPoolsRoute = (name: string) =>
     name === "pools" || name.startsWith("pools/");
   const isLstRoute = (name: string) => name === "lst" || name.startsWith("lst/");
+  const isSwapRoute = (name: string) => name === "swap" || name.startsWith("swap/");
   const filteredRoutes = state.routes.filter(
-    (r) => !isPoolsRoute(r.name) && !(isLstRoute(r.name) && !currentNetwork.capabilities.showLstTab)
+    (r) =>
+      !isPoolsRoute(r.name) &&
+      !(isLstRoute(r.name) && !currentNetwork.capabilities.showLstTab) &&
+      !(isSwapRoute(r.name) && !currentNetwork.capabilities.showSwapTab)
   );
   const currentRoute = state.routes[state.index];
   const currentFilteredOut =
     currentRoute &&
     (isPoolsRoute(currentRoute.name) ||
-      (isLstRoute(currentRoute.name) && !currentNetwork.capabilities.showLstTab));
+      (isLstRoute(currentRoute.name) && !currentNetwork.capabilities.showLstTab) ||
+      (isSwapRoute(currentRoute.name) && !currentNetwork.capabilities.showSwapTab));
   const newIndex = currentFilteredOut
     ? 0
     : Math.max(
@@ -83,7 +88,7 @@ function AppTabs() {
         }}
       />
       <Tabs.Screen
-        name="pools"
+        name="pools/index"
         options={{
           title: "Deepbook",
           tabBarLabel: "Deepbook",
@@ -104,12 +109,22 @@ function AppTabs() {
         }}
       />
       <Tabs.Screen
-        name="lst"
+        name="lst/index"
         options={{
           title: "LST",
           tabBarLabel: "LST",
           tabBarIcon: ({ color }) => (
             <TabBarIcon name="tint" color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="swap/index"
+        options={{
+          title: "Swap",
+          tabBarLabel: "Swap",
+          tabBarIcon: ({ color }) => (
+            <TabBarIcon name="exchange" color={color} />
           ),
         }}
       />
