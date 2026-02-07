@@ -8,12 +8,15 @@ import {
   StyleSheet,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
 import { useTicker } from "@/hooks/useDeepBookMargin";
 
 const PRICE_POLL_MS = 5000;
+
+const MARGIN_ENABLED_PAIRS = new Set(["SUI_USDC", "WAL_USDC", "DEEP_USDC"]);
 
 /** "SUI_USDC" → "SUI/USDC" */
 function formatPairLabel(poolName: string): string {
@@ -23,6 +26,7 @@ function formatPairLabel(poolName: string): string {
 export default function TradingListScreen() {
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
+  const insets = useSafeAreaInsets();
   const router = useRouter();
   const { ticker, loading, error } = useTicker(PRICE_POLL_MS);
   const prevPricesRef = useRef<Record<string, number>>({});
@@ -57,11 +61,18 @@ export default function TradingListScreen() {
     );
   }
 
+  const listHeader = (
+    <View style={[styles.header, { paddingTop: insets.top + 24 }]}>
+      <Text style={[styles.title, { color: colors.text }]}>Pools</Text>
+    </View>
+  );
+
   return (
     <FlatList
       data={pairs}
       keyExtractor={(item) => item.poolName}
       contentContainerStyle={styles.list}
+      ListHeaderComponent={listHeader}
       ListEmptyComponent={
         <View style={styles.centered}>
           <Text style={styles.muted}>No pairs available.</Text>
@@ -103,9 +114,18 @@ export default function TradingListScreen() {
               },
             ]}
           >
-            <Text style={styles.pairLabel}>
-              {formatPairLabel(item.poolName)}
-            </Text>
+            <View style={styles.pairLabelRow}>
+              <Text style={styles.pairLabel}>
+                {formatPairLabel(item.poolName)}
+              </Text>
+              {MARGIN_ENABLED_PAIRS.has(item.poolName) && (
+                <View style={[styles.marginBadge, { borderColor: colors.tint }]}>
+                  <Text style={[styles.marginBadgeText, { color: colors.tint }]}>
+                    Margin
+                  </Text>
+                </View>
+              )}
+            </View>
             <View style={styles.priceWithArrow}>
               {direction === "up" && (
                 <Text
@@ -142,7 +162,15 @@ export default function TradingListScreen() {
 }
 
 const styles = StyleSheet.create({
-  list: { padding: 16, paddingBottom: 32 },
+  list: { paddingHorizontal: 16, paddingBottom: 32 },
+  header: {
+    paddingHorizontal: 8,
+    marginBottom: 24,
+  },
+  title: {
+    fontSize: 28,
+    fontWeight: "bold",
+  },
   centered: {
     flex: 1,
     alignItems: "center",
@@ -160,7 +188,24 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "rgba(128,128,128,0.2)",
   },
+  pairLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
   pairLabel: { fontSize: 17, fontWeight: "600" },
+  marginBadge: {
+    borderWidth: 1,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  marginBadgeText: {
+    fontSize: 11,
+    fontWeight: "600",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
   priceWithArrow: { flexDirection: "row", alignItems: "center", gap: 6 },
   priceArrow: { fontSize: 12, fontWeight: "700" },
   price: { fontSize: 16, fontWeight: "500" },
