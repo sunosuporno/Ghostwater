@@ -1314,15 +1314,22 @@ export default function PairDetailScreen() {
       state != null &&
       (Number(state.base_debt) > 0 || Number(state.quote_debt) > 0);
     const latestTrade = chronological[chronological.length - 1];
+    // Prefer margin state (net base sign) for position side when available — it's the source of truth.
+    // Using "latest trade" can show the wrong side when the indexer hasn't indexed the newest trade yet,
+    // or when the last trade was a partial close. Only fall back to latest trade when state is missing.
     const positionSide: "long" | "short" | "none" = !hasPosition
       ? "none"
-      : latestTrade != null
-        ? ourSide(latestTrade) === "sell"
-          ? "short"
-          : "long"
-        : netBaseSigned > 0
+      : state != null
+        ? netBaseSigned > 0
           ? "long"
-          : "short";
+          : "short"
+        : latestTrade != null
+          ? ourSide(latestTrade) === "sell"
+            ? "short"
+            : "long"
+          : netBaseSigned > 0
+            ? "long"
+            : "short";
     const entryForPosition =
       positionSide === "long"
         ? avgEntryLong
@@ -2061,295 +2068,164 @@ export default function PairDetailScreen() {
     refreshTradeHistory,
   ]);
 
+  /** Close position (Sui): same logic as Base. Look at borrowed shares > 0.1 (human);
+   * sell the other token to get everything in the borrow token, then repay exact shares. */
+  const BORROW_THRESHOLD_HUMAN = 0.1;
   const onClosePosition = useCallback(async (options?: { silent?: boolean }) => {
     const silent = options?.silent === true;
-    if (!livePnl.hasPosition || livePnl.positionSide === "none") return;
+    if (!marginManagerId || !decodedPoolName || !suiAddress || !signRawHash || !suiWallet?.publicKey) {
+      if (!silent) Alert.alert("Close position", "Select a margin account and ensure wallet is connected.");
+      return;
+    }
 
-    const MAX_CLOSE_ITERATIONS = 10;
-    // Wait for previous tx to commit so next tx uses fresh object versions (avoids "not available for consumption").
-    const CLOSE_WAIT_MS = 12_000;
-    let currentState: typeof state = state;
-    let iterations = 0;
-    let didPlaceAnyOrder = false;
-    let didRepayAny = false;
-    let dustDeadlock = false;
-    let lastDustDebtQuote = 0;
-
-    while (iterations < MAX_CLOSE_ITERATIONS) {
-      let baseDebt = currentState ? Number(currentState.base_debt) : 0;
-      let quoteDebt = currentState ? Number(currentState.quote_debt) : 0;
-      if (iterations === 0 && marginManagerId && decodedPoolName && (baseDebt > 0 || quoteDebt > 0)) {
-        try {
-          const chain = await fetchMarginBorrowedSharesViaBackend({
-            apiUrl,
-            marginManagerId,
-            poolKey: decodedPoolName,
-            network: "mainnet",
-          });
-          const quoteDecimals = poolInfoForPair?.quote_asset_id
-            ? getDecimalsForCoinType(poolInfoForPair.quote_asset_id)
-            : 6;
-          const baseDecimals = poolInfoForPair?.base_asset_id
-            ? getDecimalsForCoinType(poolInfoForPair.base_asset_id)
-            : 9;
-          if (chain.calculateDebts?.quote_debt)
-            quoteDebt = Number(chain.calculateDebts.quote_debt) / Math.pow(10, quoteDecimals);
-          if (chain.calculateDebts?.base_debt)
-            baseDebt = Number(chain.calculateDebts.base_debt) / Math.pow(10, baseDecimals);
-        } catch (_) {
-          /* keep indexer values */
-        }
-      }
-      const hasDebt = baseDebt > 0 || quoteDebt > 0;
-      const mark =
-        Number(
-          decodedPoolName && ticker[decodedPoolName]?.last_price
-            ? ticker[decodedPoolName].last_price
-            : 0
-        ) || livePnl.currentPrice;
-      const quoteAsset = currentState ? Number(currentState.quote_asset) : 0;
-      const baseAsset = currentState ? Number(currentState.base_asset) : 0;
-      const netBaseSigned =
-        currentState != null
-          ? Number(currentState.base_asset) - Number(currentState.base_debt)
-          : 0;
-      const onChainPositionSize = Math.abs(netBaseSigned);
-      // Derive side from on-chain state only. Do not use livePnl.positionSide:
-      // after a close-sell the latest trade is "sell" so UI would show "short",
-      // but we may still have net long (base_asset > base_debt).
-      const currentPositionSide: "long" | "short" =
-        netBaseSigned > 0 ? "long" : netBaseSigned < 0 ? "short" : "long";
-
-      if (onChainPositionSize < MIN_ORDER_QUANTITY) break;
-
-      console.log("[ClosePosition] inputs from state & livePnl", {
-        iteration: iterations + 1,
-        base_asset: baseAsset,
-        quote_asset: quoteAsset,
-        base_debt: baseDebt,
-        quote_debt: quoteDebt,
-        netBasePosition: netBaseSigned,
-        positionSide: currentPositionSide,
-        mark,
-        hasDebt,
+    if (!silent) setClosePositionLoading(true);
+    try {
+      const publicKeyHex = publicKeyToHex(suiWallet.publicKey);
+      const chain = await fetchMarginBorrowedSharesViaBackend({
+        apiUrl,
+        marginManagerId,
+        poolKey: decodedPoolName,
+        network: "mainnet",
       });
-
-      // Close quantity = size + unrealized, but contract (ENotReduceOnlyOrder = 3) requires:
-      // - Long (ask): quote_quantity from get_quote_quantity_out(quantity) <= quote_debt - quote_asset.
-      //   When net quote debt is 0 (position left after repay), we can still close the full base.
-      // - Short (bid): quantity <= base_debt - base_asset. When net base debt is 0, close with available quote.
-      const unrealizedPnlQuote = livePnl.unrealizedPnlQuote ?? 0;
-      const unrealizedInBase = mark > 0 ? unrealizedPnlQuote / mark : 0;
-      const sizePlusUnrealized = onChainPositionSize + unrealizedInBase;
-      const FEE_BUFFER = 0.99; // stay under contract limit after fees
-
-      let closeQuantity: number;
-      if (currentPositionSide === "long") {
-        const netQuoteDebt = Math.max(0, quoteDebt - quoteAsset);
-        const maxBaseByNetQuoteDebt =
-          netQuoteDebt > 0 && mark > 0
-            ? (netQuoteDebt * FEE_BUFFER) / mark
-            : baseAsset; // no debt => close full base
-        closeQuantity = Math.min(
-          baseAsset,
-          sizePlusUnrealized,
-          maxBaseByNetQuoteDebt
-        );
-        console.log("[ClosePosition] long branch (capped by net quote debt)", {
-          onChainPositionSize,
-          sizePlusUnrealized,
-          baseAsset,
-          quoteDebt,
-          quoteAsset,
-          netQuoteDebt,
-          maxBaseByNetQuoteDebt,
-          closeQuantityRaw: closeQuantity,
-        });
-      } else {
-        const netBaseDebt = Math.max(0, baseDebt - baseAsset);
-        const maxBaseByNetDebt =
-          netBaseDebt > 0 ? netBaseDebt * FEE_BUFFER : Infinity; // no debt => close with quote
-        if (quoteAsset > 0 && mark > 0) {
-          const maxBaseFromQuote = (quoteAsset / mark) * FEE_BUFFER;
-          closeQuantity = Math.min(
-            maxBaseFromQuote,
-            sizePlusUnrealized,
-            maxBaseByNetDebt
-          );
-        } else {
-          closeQuantity = Math.min(sizePlusUnrealized, maxBaseByNetDebt);
-        }
-        console.log("[ClosePosition] short branch (capped by net base debt)", {
-          onChainPositionSize,
-          sizePlusUnrealized,
-          baseDebt,
-          baseAsset,
-          netBaseDebt,
-          maxBaseByNetDebt,
-          closeQuantityRaw: closeQuantity,
-        });
-      }
-      // Slight reserve so we stay under on-chain limit (rounding/fees).
-      const CLOSE_RESERVE_FRACTION = 0.99;
-      closeQuantity = closeQuantity * CLOSE_RESERVE_FRACTION;
       const baseDecimals = poolInfoForPair?.base_asset_id
         ? getDecimalsForCoinType(poolInfoForPair.base_asset_id)
         : 9;
-      const scalar = Math.pow(10, baseDecimals);
-      let rawFloor = Math.floor(closeQuantity * scalar);
-      const safeRaw = Math.max(0, rawFloor - 1);
-      closeQuantity = safeRaw / scalar;
-      const lotSizeRaw = Math.pow(10, baseDecimals);
-      const rawRoundedToLot = Math.floor(safeRaw / lotSizeRaw) * lotSizeRaw;
-      closeQuantity = rawRoundedToLot / scalar;
-      // Only place order if we have at least MIN and a valid lot multiple (pool rejects e.g. 0.1 if min is 1 WAL).
-      const canPlaceCloseOrder = closeQuantity >= MIN_ORDER_QUANTITY;
-      console.log("[ClosePosition] after reserve + 1-raw + lot round & min check", {
-        CLOSE_RESERVE_FRACTION,
-        closeQuantity,
-        rawRoundedToLot,
-        lotSizeRaw,
-        canPlaceCloseOrder,
-        MIN_ORDER_QUANTITY,
-      });
+      const quoteDecimals = poolInfoForPair?.quote_asset_id
+        ? getDecimalsForCoinType(poolInfoForPair.quote_asset_id)
+        : 6;
+      const baseBorrowedHuman =
+        Number(chain.borrowedBaseShares ?? 0) / Math.pow(10, baseDecimals);
+      const quoteBorrowedHuman =
+        Number(chain.borrowedQuoteShares ?? 0) / Math.pow(10, quoteDecimals);
 
-      if (!marginManagerId || !decodedPoolName || !suiAddress) {
-        Alert.alert("Close position", "Select a margin account first.");
-        break;
-      }
-      if (!signRawHash || !suiWallet?.publicKey) {
-        Alert.alert("Close position", "Wallet signing not available.");
-        break;
-      }
+      // Which token has meaningful borrowed shares? We ignore very small values (< 0.1).
+      const closeQuotePath =
+        quoteBorrowedHuman >= BORROW_THRESHOLD_HUMAN &&
+        quoteBorrowedHuman >= baseBorrowedHuman;
+      const closeBasePath =
+        baseBorrowedHuman >= BORROW_THRESHOLD_HUMAN &&
+        baseBorrowedHuman > quoteBorrowedHuman;
 
-      if (iterations === 0 && !silent) setClosePositionLoading(true);
-      try {
-        const publicKeyHex = publicKeyToHex(suiWallet!.publicKey);
-        if (canPlaceCloseOrder) {
-          console.log("[ClosePosition] placing close order", {
-            poolKey: decodedPoolName,
-            isBid: currentPositionSide === "short",
-            quantity: closeQuantity,
-            positionSide: currentPositionSide,
-          });
-          await placeOrderViaBackend({
-            apiUrl,
-            sender: suiAddress,
-            marginManagerId,
-            poolKey: decodedPoolName,
-            orderType: "market",
-            isBid: currentPositionSide === "short",
-            quantity: closeQuantity,
-            payWithDeep: false,
-            reduceOnly: true,
-            signRawHash,
-            publicKeyHex,
-            network: "mainnet",
-          });
-          console.log("[ClosePosition] close order placed successfully");
-          didPlaceAnyOrder = true;
-          // Let the close tx commit before building repay (avoids stale object version).
-          await new Promise((r) => setTimeout(r, 5000));
+      if (!closeQuotePath && !closeBasePath) {
+        if (!silent) {
+          setClosePositionLoading(false);
+          Alert.alert(
+            "Close position",
+            "No borrowed amount above 0.1 to close. Nothing to do."
+          );
         }
-        if (hasDebt) {
-          const stateForRepay = (await refreshMarginState?.()) ?? currentState;
-          if (stateForRepay) {
-            const quoteAvail = Number(stateForRepay.quote_asset);
-            const baseAvail = Number(stateForRepay.base_asset);
-            // Repay only what we have; requesting more than balance causes withdraw_with_proof abort.
-            const baseRepay =
-              baseDebt > 0 ? Math.min(baseDebt, baseAvail) : 0;
-            const quoteRepay =
-              quoteDebt > 0 ? Math.min(quoteDebt, quoteAvail) : 0;
-            console.log("[ClosePosition] repay step", {
-              stateAfterClose: {
-                base_asset: baseAvail,
-                quote_asset: quoteAvail,
-              },
-              debtToRepay: { base: baseRepay, quote: quoteRepay },
-            });
-            if (baseRepay > 0 || quoteRepay > 0) {
-              await repayViaBackend({
-                apiUrl,
-                sender: suiAddress,
-                marginManagerId,
-                poolKey: decodedPoolName,
-                baseAmount: baseRepay > 0 ? baseRepay : undefined,
-                quoteAmount: quoteRepay > 0 ? quoteRepay : undefined,
-                signRawHash,
-                publicKeyHex,
-                network: "mainnet",
-              });
-              console.log("[ClosePosition] repay completed successfully");
-              didRepayAny = true;
-            } else if (
-              !canPlaceCloseOrder &&
-              quoteDebt > 0 &&
-              quoteAvail <= 0
-            ) {
-              dustDeadlock = true;
-              lastDustDebtQuote = quoteDebt;
-              console.log("[ClosePosition] dust deadlock: cannot close (rounds to 0 lots) and cannot repay (no USDC in margin)");
-              break;
-            }
+        return;
+      }
+
+      const lotSize = 1;
+
+      if (closeQuotePath) {
+        // We borrowed quote (USDC). Sell all base to get quote, then repay exact quote.
+        const baseAssetHuman =
+          chain.calculateAssets?.base_asset != null
+            ? Number(chain.calculateAssets.base_asset) / Math.pow(10, baseDecimals)
+            : state != null
+              ? Number(state.base_asset)
+              : 0;
+        const sellQuantity = Math.floor(baseAssetHuman / lotSize) * lotSize;
+        if (sellQuantity < MIN_ORDER_QUANTITY) {
+          if (!silent) {
+            setClosePositionLoading(false);
+            Alert.alert(
+              "Close position",
+              `Not enough base to sell (${baseAssetHuman.toFixed(4)}). Min order: ${MIN_ORDER_QUANTITY}.`
+            );
           }
+          return;
         }
-
-        if (!canPlaceCloseOrder && !hasDebt) break;
-        iterations += 1;
-        if (iterations >= MAX_CLOSE_ITERATIONS) break;
-        await new Promise((r) => setTimeout(r, CLOSE_WAIT_MS));
-        await refreshTradeHistory?.();
-        currentState = (await refreshMarginState?.()) ?? null;
-        if (!currentState) break;
-        const nextNetBase =
-          Number(currentState.base_asset) - Number(currentState.base_debt);
-        if (Math.abs(nextNetBase) < MIN_ORDER_QUANTITY) break;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Close position failed";
-        const stack = err instanceof Error ? err.stack : undefined;
-        console.log("[ClosePosition] error", { message: msg, stack });
-        if (!silent) Alert.alert("Close position", msg);
-        throw err;
+        await placeOrderViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          orderType: "market",
+          isBid: false,
+          quantity: sellQuantity,
+          payWithDeep: false,
+          reduceOnly: false,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+      } else {
+        // We borrowed base. Buy base with quote to cover, then repay exact base.
+        const buyQuantity = Math.floor(baseBorrowedHuman / lotSize) * lotSize;
+        if (buyQuantity < MIN_ORDER_QUANTITY) {
+          if (!silent) {
+            setClosePositionLoading(false);
+            Alert.alert(
+              "Close position",
+              `Borrowed base (${baseBorrowedHuman.toFixed(4)}) rounds below min order ${MIN_ORDER_QUANTITY}.`
+            );
+          }
+          return;
+        }
+        await placeOrderViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          orderType: "market",
+          isBid: true,
+          quantity: buyQuantity,
+          payWithDeep: false,
+          reduceOnly: false,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
       }
-    }
 
-    refreshMarginState?.();
-    refreshOpenOrders?.();
-    refreshOrderHistory?.();
-    refreshTradeHistory?.();
-    if (!silent) {
-      setClosePositionLoading(false);
-      if (didPlaceAnyOrder && didRepayAny) {
+      await new Promise((r) => setTimeout(r, 5000));
+
+      // Repay exact amount of borrowed shares (in human units).
+      if (closeQuotePath && quoteBorrowedHuman > 0) {
+        await repayViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          quoteAmount: quoteBorrowedHuman,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+      } else if (closeBasePath && baseBorrowedHuman > 0) {
+        await repayViaBackend({
+          apiUrl,
+          sender: suiAddress,
+          marginManagerId,
+          poolKey: decodedPoolName,
+          baseAmount: baseBorrowedHuman,
+          signRawHash,
+          publicKeyHex,
+          network: "mainnet",
+        });
+      }
+
+      refreshMarginState?.();
+      refreshOpenOrders?.();
+      refreshOrderHistory?.();
+      refreshTradeHistory?.();
+      if (!silent) {
+        setClosePositionLoading(false);
         Alert.alert("Close position", "Position closed and debt repaid.");
-      } else if (didPlaceAnyOrder) {
-        Alert.alert("Close position", "Position closed.");
-      } else if (didRepayAny) {
-        Alert.alert(
-          "Close position",
-          "Debt repaid. Position size was below minimum order, so no close order was placed; a small position may remain."
-        );
-      } else if (dustDeadlock) {
-        const debtUsd = lastDustDebtQuote.toFixed(2);
-        Alert.alert(
-          "Small debt left — deposit USDC to finish",
-          `A small debt (~$${debtUsd} USDC) remains and there is no USDC in your margin to repay it. The remaining position is too small to close in one order (rounds to 0).\n\nDeposit at least 0.02 USDC to your margin account (from your Sui wallet or bridge from Base), then tap Close again. After repaying, the rest of your position will close and you can withdraw USDC to Base.`
-        );
-      } else if (iterations > 0) {
-        Alert.alert("Close position", "Position closed.");
-      } else if (!didPlaceAnyOrder && !didRepayAny) {
-        Alert.alert(
-          "Close position",
-          `Position size is below minimum order ${MIN_ORDER_QUANTITY}. Nothing to repay.`
-        );
       }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Close position failed";
+      console.log("[ClosePosition] error", { message: msg });
+      if (!silent) {
+        setClosePositionLoading(false);
+        Alert.alert("Close position", msg);
+      }
+      throw err;
     }
   }, [
-    livePnl.hasPosition,
-    livePnl.positionSide,
-    livePnl.netBasePosition,
-    livePnl.unrealizedPnlQuote,
-    livePnl.currentPrice,
     marginManagerId,
     decodedPoolName,
     suiAddress,
@@ -2357,8 +2233,8 @@ export default function PairDetailScreen() {
     suiWallet?.publicKey,
     apiUrl,
     state,
-    ticker,
     poolInfoForPair?.base_asset_id,
+    poolInfoForPair?.quote_asset_id,
     refreshMarginState,
     refreshOpenOrders,
     refreshOrderHistory,

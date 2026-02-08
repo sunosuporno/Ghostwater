@@ -1,6 +1,9 @@
 /**
  * Fetch Base (mainnet or Sepolia) token balances using Alchemy Portfolio "Tokens By Wallet" API.
  *
+ * On base-mainnet, tokens with no CoinGecko USD price are filtered out (scam/spam).
+ * Backend GET /api/base-token-prices is used; set EXPO_PUBLIC_API_URL and COINGECKO_API_KEY on the backend.
+ *
  * This is safe to use in React Native – it uses plain fetch against the
  * Alchemy data API endpoint. Configure EXPO_PUBLIC_ALCHEMY_API_KEY (or
  * EXPO_PUBLIC_ALCHEMY_API_KEY_BASE_SEPOLIA for testnet).
@@ -170,8 +173,46 @@ export async function fetchAllBaseBalances(
     ];
   }
 
+  // On base-mainnet, filter out scam/spam: only show tokens that have a CoinGecko USD price.
+  let filtered = balances;
+  if (networkId === "base-mainnet") {
+    const erc20Addresses = balances
+      .map((b) => b.tokenAddress)
+      .filter((a): a is string => a != null && a !== "");
+    if (erc20Addresses.length > 0) {
+      const apiBase =
+        typeof process !== "undefined" && process.env?.EXPO_PUBLIC_API_URL
+          ? process.env.EXPO_PUBLIC_API_URL.replace(/\/$/, "")
+          : "";
+      if (apiBase) {
+        try {
+          const params = new URLSearchParams({
+            contract_addresses: erc20Addresses.join(","),
+          });
+          const priceRes = await fetch(
+            `${apiBase}/api/base-token-prices?${params.toString()}`
+          );
+          if (priceRes.ok) {
+            const prices = (await priceRes.json()) as Record<
+              string,
+              { usd?: number }
+            >;
+            filtered = balances.filter((b) => {
+              if (b.tokenAddress === null) return true; // always show native ETH
+              const key = b.tokenAddress.toLowerCase();
+              const val = prices[key];
+              return typeof val?.usd === "number";
+            });
+          }
+        } catch {
+          // Backend unavailable: show all tokens (no scam filter)
+        }
+      }
+    }
+  }
+
   // Native ETH-like token first, then others alphabetically
-  return balances.sort((a, b) => {
+  return filtered.sort((a, b) => {
     const isNativeA = a.tokenAddress === null;
     const isNativeB = b.tokenAddress === null;
     if (isNativeA && !isNativeB) return -1;

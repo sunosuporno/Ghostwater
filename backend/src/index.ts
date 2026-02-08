@@ -138,6 +138,60 @@ app.get("/api/owned-margin-managers", async (req, res) => {
 });
 
 /**
+ * GET /api/base-token-prices?contract_addresses=0x...,0x...
+ * Calls CoinGecko simple/token_price/base; returns { "0x...": { "usd": number }, ... }.
+ * Tokens not in the response (or empty {}) have no price → treat as scam/spam on the frontend.
+ * Requires COINGECKO_API_KEY in backend .env.
+ */
+app.get("/api/base-token-prices", async (req, res) => {
+  try {
+    const raw = (req.query.contract_addresses as string)?.trim();
+    if (!raw) {
+      res.status(400).json({
+        error: "Missing query: contract_addresses (comma-separated Base token addresses)",
+      });
+      return;
+    }
+    const apiKey = process.env.COINGECKO_API_KEY?.trim();
+    if (!apiKey) {
+      res.status(503).json({
+        error: "CoinGecko API key not configured (COINGECKO_API_KEY)",
+      });
+      return;
+    }
+    const addresses = raw
+      .split(",")
+      .map((a) => a.trim().toLowerCase())
+      .filter((a) => /^0x[a-f0-9]{40}$/i.test(a));
+    if (addresses.length === 0) {
+      res.json({});
+      return;
+    }
+    const url = new URL("https://api.coingecko.com/api/v3/simple/token_price/base");
+    url.searchParams.set("contract_addresses", addresses.join(","));
+    url.searchParams.set("vs_currencies", "usd");
+    const resp = await fetch(url.toString(), {
+      method: "GET",
+      headers: { "x-cg-demo-api-key": apiKey },
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error("[api/base-token-prices] CoinGecko error", resp.status, text);
+      res.status(502).json({
+        error: `CoinGecko error (${resp.status})`,
+      });
+      return;
+    }
+    const data = (await resp.json()) as Record<string, { usd?: number }>;
+    res.json(data);
+  } catch (err) {
+    console.error("[api/base-token-prices] error", err);
+    const message = err instanceof Error ? err.message : "Token price check failed";
+    res.status(500).json({ error: message });
+  }
+});
+
+/**
  * GET /api/margin-borrowed-shares
  * (Legacy name; same as /api/margin-manager-state.)
  */
