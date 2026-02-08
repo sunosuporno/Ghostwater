@@ -215,6 +215,9 @@ export default function HomeScreen() {
   const [baseAmount, setBaseAmount] = useState("");
   const [baseDestinationInput, setBaseDestinationInput] = useState("");
   const [baseDestinationAddress, setBaseDestinationAddress] = useState<string | null>(null);
+  const [resolvedToAddressDisplay, setResolvedToAddressDisplay] = useState<string | null>(null);
+  const [resolvedToAddressLoading, setResolvedToAddressLoading] = useState(false);
+  const [resolvedToAddressLabel, setResolvedToAddressLabel] = useState<string | null>(null);
   const [baseAmountExceedsBalance, setBaseAmountExceedsBalance] =
     useState(false);
   const [baseSendLoading, setBaseSendLoading] = useState(false);
@@ -225,6 +228,7 @@ export default function HomeScreen() {
   const [baseSendLifiStatus, setBaseSendLifiStatus] = useState<LifiStatusResponse | null>(null);
   const [baseTxHashCopied, setBaseTxHashCopied] = useState(false);
   const [baseQrVisible, setBaseQrVisible] = useState(false);
+  const [baseSendTokenPickerVisible, setBaseSendTokenPickerVisible] = useState(false);
   const [scannedRecipient, setScannedRecipient] = useState<{
     handle: string | null;
     address: string;
@@ -270,6 +274,7 @@ export default function HomeScreen() {
     chain?: string;
   }>();
   const [deepLinkHandled, setDeepLinkHandled] = useState(false);
+  const initialUrlHandledRef = useRef(false);
 
   const scrollViewRef = useRef<ScrollView>(null);
   const hasScrolledForDeepLinkRef = useRef(false);
@@ -402,6 +407,66 @@ export default function HomeScreen() {
     }, 400);
     return () => clearTimeout(t);
   }, [claimLabel, registrarAddress]);
+
+  // Resolve subdomain in send block to show "To address" (EVM or Sui) in readonly field
+  useEffect(() => {
+    const raw = baseDestinationInput.trim().toLowerCase();
+    if (!raw || !isGhostwaterSubdomain(raw)) {
+      setResolvedToAddressDisplay(null);
+      setResolvedToAddressLabel(null);
+      setResolvedToAddressLoading(false);
+      return;
+    }
+    const label = raw.includes(".") ? raw.split(".")[0] : raw;
+    if (label.length < 3) {
+      setResolvedToAddressDisplay(null);
+      setResolvedToAddressLabel(null);
+      setResolvedToAddressLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setResolvedToAddressLoading(true);
+    (async () => {
+      try {
+        const resolved = await resolveSubdomainAddress(raw);
+        if (cancelled) return;
+        if (!resolved) {
+          setResolvedToAddressDisplay(null);
+          setResolvedToAddressLabel(null);
+          setResolvedToAddressLoading(false);
+          return;
+        }
+        const registrarAddr = getRegistrarAddress();
+        if (!registrarAddr) {
+          setResolvedToAddressDisplay(resolved);
+          setResolvedToAddressLabel("EVM address");
+          setResolvedToAddressLoading(false);
+          return;
+        }
+        const status = await fetchSubdomainStatus(registrarAddr, resolved as `0x${string}`);
+        if (cancelled) return;
+        const isSui = status.preferredChain?.trim().toLowerCase() === "sui";
+        const suiAddr = status.suiAddress?.trim();
+        if (isSui) {
+          setResolvedToAddressDisplay(suiAddr || "Not set");
+          setResolvedToAddressLabel("Sui receive address");
+        } else {
+          setResolvedToAddressDisplay(resolved);
+          setResolvedToAddressLabel("EVM address");
+        }
+      } catch {
+        if (!cancelled) {
+          setResolvedToAddressDisplay(null);
+          setResolvedToAddressLabel(null);
+        }
+      } finally {
+        if (!cancelled) setResolvedToAddressLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [baseDestinationInput]);
 
   // Keep selected Base token in sync with balances; default to first balance
   useEffect(() => {
@@ -682,7 +747,44 @@ export default function HomeScreen() {
     ensureEvmWallet();
   }, [user?.id, embeddedEthWallets?.length, createPrivyWallet]);
 
-  // Handle deep links like ghostwater://?type=pay&address=...&token=USDC&handle=...
+  // Cold start: when app was closed and opened via QR/link, useLocalSearchParams may not have the URL yet.
+  // Linking.getInitialURL() returns the URL that launched the app — handle pay link so we open on Base and set destination.
+  useEffect(() => {
+    if (initialUrlHandledRef.current) return;
+    initialUrlHandledRef.current = true;
+
+    Linking.getInitialURL()
+      .then((url) => {
+        if (!url || !url.includes("type=pay")) return;
+        const q = url.indexOf("?");
+        const query = q >= 0 ? url.slice(q + 1) : "";
+        const params = new URLSearchParams(query);
+        const type = params.get("type");
+        const handleParam = params.get("handle") ?? undefined;
+        const addressParam = params.get("address") ?? undefined;
+        const tokenParam = params.get("token") ?? undefined;
+        const chainParam = params.get("chain") ?? undefined;
+
+        if (type !== "pay") return;
+        const hasAddress = typeof addressParam === "string" && addressParam.length > 0;
+        const hasHandle = typeof handleParam === "string" && handleParam.length > 0;
+        if (!hasAddress && !hasHandle) return;
+
+        setCurrentNetworkId("base-mainnet");
+        setBaseDestinationInput(handleParam ?? addressParam ?? "");
+        setBaseDestinationAddress(hasAddress ? addressParam : null);
+        setScannedRecipient({
+          handle: handleParam ?? null,
+          address: addressParam ?? "",
+          preferredChain: chainParam ?? null,
+          preferredToken: tokenParam ?? null,
+        });
+        setDeepLinkHandled(true);
+      })
+      .catch(() => {});
+  }, [setCurrentNetworkId]);
+
+  // Handle deep links when app is already running (or when Expo Router has injected params after cold start).
   useEffect(() => {
     if (deepLinkHandled) return;
     if (!urlParams || urlParams.type !== "pay") return;
@@ -700,15 +802,13 @@ export default function HomeScreen() {
       ? urlParams.chain[0]
       : urlParams.chain;
 
-    if (!addressParam || typeof addressParam !== "string") return;
+    const hasAddress = typeof addressParam === "string" && addressParam.length > 0;
+    const hasHandle = typeof handleParam === "string" && handleParam.length > 0;
+    if (!hasAddress && !hasHandle) return;
 
-    // If deep link says Base mainnet, switch network to Base mainnet so the send form is visible.
-    if (chainParam === "base-mainnet") {
-      setCurrentNetworkId("base-mainnet");
-    }
-
-    setBaseDestinationInput(handleParam ?? addressParam);
-    setBaseDestinationAddress(addressParam);
+    setCurrentNetworkId("base-mainnet");
+    setBaseDestinationInput(handleParam ?? addressParam ?? "");
+    setBaseDestinationAddress(hasAddress ? addressParam : null);
     if (tokenParam && baseBalances.length > 0) {
       const match = baseBalances.find(
         (b) => b.symbol.toUpperCase() === tokenParam.toUpperCase()
@@ -719,7 +819,7 @@ export default function HomeScreen() {
     }
     setScannedRecipient({
       handle: handleParam ?? null,
-      address: addressParam,
+      address: addressParam ?? "",
       preferredChain: chainParam ?? null,
       preferredToken: tokenParam ?? null,
     });
@@ -775,6 +875,7 @@ export default function HomeScreen() {
   }, [logout]);
 
   const handleSendBase = useCallback(async () => {
+    if (baseSendLoading) return;
     if (!evmAddress?.trim()) {
       setBaseSendError("No Base wallet address");
       return;
@@ -789,24 +890,26 @@ export default function HomeScreen() {
       return;
     }
 
-    let recipient = baseDestinationAddress ?? null;
+    let recipient: string | null = null;
     let isSubdomainReceiver = false;
 
-    if (!recipient) {
-      if (isHexAddress(rawInput)) {
-        recipient = rawInput;
-      } else if (isGhostwaterSubdomain(rawInput)) {
-        const resolved = await resolveSubdomainAddress(rawInput);
-        if (!resolved) {
-          setBaseSendError("Ghostwater name not found");
-          return;
-        }
-        recipient = resolved;
-        isSubdomainReceiver = true;
-      } else {
-        setBaseSendError("Enter a valid 0x address or Ghostwater name");
+    // When the user has entered a subdomain, always use subdomain flow (resolve → preferred chain/token/Sui → LI.FI).
+    // Otherwise we might use baseDestinationAddress from a deep link and do a plain send to EVM instead of cross-chain to Sui.
+    if (rawInput && isGhostwaterSubdomain(rawInput)) {
+      const resolved = await resolveSubdomainAddress(rawInput);
+      if (!resolved) {
+        setBaseSendError("Ghostwater name not found");
         return;
       }
+      recipient = resolved;
+      isSubdomainReceiver = true;
+    } else if (rawInput && isHexAddress(rawInput)) {
+      recipient = rawInput;
+    } else if (baseDestinationAddress) {
+      recipient = baseDestinationAddress;
+    } else {
+      setBaseSendError("Enter a valid 0x address or Ghostwater name");
+      return;
     }
     const amountNum = parseFloat(baseAmount);
     if (isNaN(amountNum) || amountNum <= 0) {
@@ -894,6 +997,7 @@ export default function HomeScreen() {
           amount: baseAmount,
           recipientPreferredChain,
           recipientPreferredToken,
+          recipientSuiAddress,
           recipientFavouredTokenAddress: favouredTokenAddress,
           recipientPreferredNetworkId: networkId,
         });
@@ -941,6 +1045,14 @@ export default function HomeScreen() {
             : !isDestinationSui
               ? recipient
               : undefined;
+
+        if (isDestinationSui && !toAddressParam) {
+          setBaseSendError(
+            "Recipient's preferred chain is Sui but they haven't set a Sui receive address. They can add it in their Ghostwater preferences."
+          );
+          setBaseSendLoading(false);
+          return;
+        }
 
         // Same chain + same token → simple direct send (no LI.FI)
         const sameChain = fromChainId === toChainId;
@@ -1004,7 +1116,7 @@ export default function HomeScreen() {
           toTokenAddress: toTokenForQuote,
           fromAmount: amountRaw.toString(),
           fromAddress: evmAddress,
-          ...(toAddressParam ? { toAddress: toAddressParam } : {}),
+          toAddress: toAddressParam ?? recipient,
           slippage: 0.005,
         })) as {
           transactionRequest?: {
@@ -1017,6 +1129,7 @@ export default function HomeScreen() {
             maxPriorityFeePerGas?: string;
             chainId?: number;
           };
+          estimate?: { approvalAddress?: string };
         };
 
         console.log("[Send Base] LI.FI quote result:", quoteResult);
@@ -1027,11 +1140,64 @@ export default function HomeScreen() {
           return;
         }
 
+        // Use explicit nonce so approval + bridge run in order and we avoid "nonce too low" on the second tx.
+        let nextNonce = parseInt(
+          (await provider.request({
+            method: "eth_getTransactionCount",
+            params: [from, "latest"],
+          })) as string,
+          16
+        );
+
+        // ERC20 approval: when sending a token (not native ETH), LI.FI returns estimate.approvalAddress.
+        // We must approve that contract to spend our tokens before the bridge tx (which uses transferFrom).
+        const isErc20 = fromTokenAddress !== "0x0000000000000000000000000000000000000000";
+        const approvalAddress = quoteResult?.estimate?.approvalAddress;
+        if (isErc20 && approvalAddress) {
+          const pad64 = (hex: string) => hex.replace(/^0x/, "").padStart(64, "0");
+          const amountHex = amountRaw.toString(16);
+          const approveData =
+            "0x095ea7b3" + pad64(approvalAddress) + pad64(amountHex);
+          const approveTxHash = (await provider.request({
+            method: "eth_sendTransaction",
+            params: [
+              {
+                from,
+                to: fromTokenAddress,
+                data: approveData,
+                value: "0x0",
+                gasLimit: "0xfde8",
+                chainId: chainIdHex,
+                nonce: "0x" + nextNonce.toString(16),
+              },
+            ],
+          })) as string;
+          nextNonce += 1;
+          const deadline = Date.now() + 60_000;
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 2000));
+            const receipt = (await provider.request({
+              method: "eth_getTransactionReceipt",
+              params: [approveTxHash],
+            })) as { blockNumber?: string } | null;
+            if (receipt?.blockNumber) break;
+          }
+          // Refresh nonce after approval so bridge tx uses the correct one (avoids "nonce too low").
+          nextNonce = parseInt(
+            (await provider.request({
+              method: "eth_getTransactionCount",
+              params: [from, "latest"],
+            })) as string,
+            16
+          );
+        }
+
         const tx: Record<string, string> = {
           from,
           to: txRequest.to,
           data: txRequest.data,
           value: txRequest.value ?? "0x0",
+          nonce: "0x" + nextNonce.toString(16),
         };
         if (txRequest.gasLimit) tx.gasLimit = txRequest.gasLimit;
         if (txRequest.gasPrice) tx.gasPrice = txRequest.gasPrice;
@@ -1056,8 +1222,12 @@ export default function HomeScreen() {
         setBaseAmountExceedsBalance(false);
         refetchBaseBalances();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Cross-chain send failed";
-        setBaseSendError(msg);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/already known|replacement fee too low|nonce too low/i.test(msg)) {
+          setBaseSendError(null);
+        } else {
+          setBaseSendError(msg);
+        }
       } finally {
         setBaseSendLoading(false);
       }
@@ -1154,12 +1324,17 @@ export default function HomeScreen() {
       setBaseAmountExceedsBalance(false);
       refetchBaseBalances();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Send failed";
-      setBaseSendError(msg);
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/already known|replacement fee too low|nonce too low/i.test(msg)) {
+        setBaseSendError(null);
+      } else {
+        setBaseSendError(msg);
+      }
     } finally {
       setBaseSendLoading(false);
     }
   }, [
+    baseSendLoading,
     evmAddress,
     embeddedEthWallet,
     currentNetwork,
@@ -2326,29 +2501,13 @@ export default function HomeScreen() {
               Token
             </Text>
             <Pressable
-              onPress={() => {
-                // Simple picker: cycle through tokens; could be replaced by a modal list later.
-                if (baseBalances.length === 0) return;
-                if (!selectedBaseToken) {
-                  setSelectedBaseToken(
-                    baseBalances[0].tokenAddress ?? "native"
-                  );
-                  return;
-                }
-                const idx = baseBalances.findIndex(
-                  (b) => (b.tokenAddress ?? "native") === selectedBaseToken
-                );
-                const next =
-                  baseBalances[(idx + 1) % baseBalances.length] ??
-                  baseBalances[0];
-                setSelectedBaseToken(next.tokenAddress ?? "native");
-                setBaseAmountExceedsBalance(false);
-              }}
+              onPress={() => baseBalances.length > 0 && setBaseSendTokenPickerVisible(true)}
               style={[
                 styles.input,
                 styles.dropdown,
                 {
                   borderColor: colors.tabIconDefault,
+                  opacity: baseBalances.length === 0 ? 0.6 : 1,
                 },
               ]}
             >
@@ -2368,6 +2527,65 @@ export default function HomeScreen() {
                 color={colors.tabIconDefault}
               />
             </Pressable>
+
+            <Modal
+              visible={baseSendTokenPickerVisible}
+              transparent
+              animationType="fade"
+              onRequestClose={() => setBaseSendTokenPickerVisible(false)}
+            >
+              <Pressable
+                style={styles.modalOverlay}
+                onPress={() => setBaseSendTokenPickerVisible(false)}
+              >
+                <View
+                  style={[
+                    styles.modalContent,
+                    {
+                      backgroundColor: colors.background,
+                      borderColor: colors.tabIconDefault,
+                    },
+                  ]}
+                  onStartShouldSetResponder={() => true}
+                >
+                  <Text style={[styles.inputLabel, { color: colors.text }]}>
+                    Select token
+                  </Text>
+                  <ScrollView style={{ maxHeight: 240 }}>
+                    {baseBalances.length === 0 ? (
+                      <Text style={[styles.muted, { paddingVertical: 12 }]}>
+                        No tokens
+                      </Text>
+                    ) : (
+                      baseBalances.map((b) => (
+                        <Pressable
+                          key={b.tokenAddress ?? "native"}
+                          onPress={() => {
+                            setSelectedBaseToken(b.tokenAddress ?? "native");
+                            setBaseSendTokenPickerVisible(false);
+                            setBaseAmountExceedsBalance(false);
+                          }}
+                          style={({ pressed }) => [
+                            styles.pickerItem,
+                            {
+                              backgroundColor:
+                                (b.tokenAddress ?? "native") === selectedBaseToken
+                                  ? colors.tabIconDefault + "30"
+                                  : "transparent",
+                              opacity: pressed ? 0.8 : 1,
+                            },
+                          ]}
+                        >
+                          <Text style={{ fontSize: 14, color: colors.text }}>
+                            {b.symbol} — {b.formatted} available
+                          </Text>
+                        </Pressable>
+                      ))
+                    )}
+                  </ScrollView>
+                </View>
+              </Pressable>
+            </Modal>
 
             <Text style={[styles.inputLabel, { color: colors.text }]}>
               Amount
@@ -2417,6 +2635,8 @@ export default function HomeScreen() {
               onChangeText={(t) => {
                 setBaseDestinationInput(t);
                 setBaseDestinationAddress(null);
+                setResolvedToAddressDisplay(null);
+                setResolvedToAddressLabel(null);
                 setBaseSendError(null);
                 setBaseSendSuccess(null);
                 setBaseSendTxHash(null);
@@ -2426,6 +2646,39 @@ export default function HomeScreen() {
               autoCapitalize="none"
               autoCorrect={false}
             />
+            {(resolvedToAddressLoading || resolvedToAddressDisplay) && (
+              <View style={{ marginTop: 8 }}>
+                <Text style={[styles.inputLabel, { color: colors.text, marginBottom: 4 }]}>
+                  To address{resolvedToAddressLabel ? ` (${resolvedToAddressLabel})` : ""}
+                </Text>
+                <View
+                  style={[
+                    styles.input,
+                    {
+                      backgroundColor: colors.tabIconDefault + "18",
+                      borderColor: colors.tabIconDefault,
+                      minHeight: 44,
+                      justifyContent: "center",
+                    },
+                  ]}
+                >
+                  {resolvedToAddressLoading ? (
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                      <ActivityIndicator size="small" color={colors.tabIconDefault} />
+                      <Text style={[styles.muted, { color: colors.text }]}>Resolving…</Text>
+                    </View>
+                  ) : resolvedToAddressDisplay ? (
+                    <Text
+                      style={[styles.muted, { color: colors.text }]}
+                      selectable
+                      numberOfLines={2}
+                    >
+                      {resolvedToAddressDisplay}
+                    </Text>
+                  ) : null}
+                </View>
+              </View>
+            )}
             {baseSendError ? (
               <Text style={styles.error}>{baseSendError}</Text>
             ) : null}

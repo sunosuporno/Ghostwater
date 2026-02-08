@@ -244,9 +244,9 @@ export async function fetchSubdomainStatus(
   let preferredChain: string | null = null;
   let preferredToken: string | null = null;
   let suiAddress: string | null = null;
-  const registryForTextAddress = getL2RegistryAddress() ?? registrarRegistryAddress;
+  // Read text (preferred chain/token, Sui address) from the same registry the registrar writes to.
   const registryForText = getContract({
-    address: registryForTextAddress,
+    address: registrarRegistryAddress,
     abi: REGISTRY_ABI,
     client,
   });
