@@ -18,6 +18,9 @@
       }
     },
     "production": {
+      "android": {
+        "buildType": "apk"
+      },
       "env": {
         "EXPO_PUBLIC_API_URL": "https://ghostwater.onrender.com"
       }
