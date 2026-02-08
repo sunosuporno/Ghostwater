@@ -106,6 +106,16 @@ function AppTabs() {
           tabBarIcon: ({ color }) => (
             <TabBarIcon name="line-chart" color={color} />
           ),
+          // Tap tab → show list.
+          ...({
+            listeners: ({
+              navigation,
+            }: {
+              navigation: { navigate: (name: string) => void };
+            }) => ({
+              tabPress: () => navigation.navigate("index"),
+            }),
+          } as Record<string, unknown>),
         }}
       />
       <Tabs.Screen

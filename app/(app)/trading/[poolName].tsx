@@ -151,12 +151,14 @@ function formatCollateralAmount(amountRaw: string, assetType: string): string {
   return `${formatted} ${symbolFromAssetType(assetType)}`;
 }
 
+let lastNetworkIdForPoolDetail: string | null = null;
+
 export default function PairDetailScreen() {
   const { poolName, from } =
     useLocalSearchParams<{ poolName: string; from?: string }>();
   const decodedPoolName = poolName ? decodeURIComponent(poolName) : null;
   const cameFromPools = from === "pools";
-  const { currentNetwork } = useNetwork();
+  const { currentNetwork, currentNetworkId } = useNetwork();
   const showPlaceOrderBlock = currentNetwork.capabilities.showMarginTab;
 
   const colorScheme = useColorScheme();
@@ -2798,6 +2800,15 @@ export default function PairDetailScreen() {
     });
   }, [decodedPoolName, chartInterval]);
 
+  // Switch network → show list (don’t keep a pool open across networks).
+  useEffect(() => {
+    const prev = lastNetworkIdForPoolDetail;
+    lastNetworkIdForPoolDetail = currentNetworkId;
+    if (prev !== null && prev !== currentNetworkId) {
+      (navigation as { navigate: (name: string) => void }).navigate("index");
+    }
+  }, [currentNetworkId, navigation]);
+
   useEffect(() => {
     if (decodedPoolName) {
       navigation.setOptions({ title: displayPoolLabel });
@@ -2829,8 +2840,7 @@ export default function PairDetailScreen() {
                 if (cameFromPools) {
                   router.replace("/(app)/pools");
                 } else {
-                  // Explicit replace so back always works (e.g. on Sui when stack history is missing)
-                  router.replace("/(app)/trading");
+                  (navigation as { navigate: (name: string) => void }).navigate("index");
                 }
               }}
               hitSlop={8}

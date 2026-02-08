@@ -20,6 +20,7 @@ export const MARGIN_REGISTRY_ID_MAINNET =
 /**
  * Supported margin pairs on mainnet (from integration doc).
  * SUI_USDC: 5x leverage; WAL_USDC, DEEP_USDC: 3x leverage.
+ * Single source of truth: both Base (Deepbook tab) and Sui (Margin tab) filter to only these pools.
  */
 export const SUPPORTED_MARGIN_PAIRS_MAINNET = [
   "DEEP_USDC",
@@ -29,6 +30,11 @@ export const SUPPORTED_MARGIN_PAIRS_MAINNET = [
 
 export type SupportedMarginPairMainnet =
   (typeof SUPPORTED_MARGIN_PAIRS_MAINNET)[number];
+
+/** Set of margin pool keys for fast lookup (filter pool lists on both Base and Sui). */
+export const MARGIN_POOL_KEYS_SET = new Set<string>(
+  SUPPORTED_MARGIN_PAIRS_MAINNET as unknown as string[]
+);
 
 /**
  * Minimum deposit/withdraw amount in human units (same for all tokens).
