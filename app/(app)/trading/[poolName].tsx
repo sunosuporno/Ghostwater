@@ -12,7 +12,9 @@ import {
   Alert,
   AppState,
   AppStateStatus,
+  Dimensions,
   Linking,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -22,6 +24,12 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { PriceChart } from "@/components/PriceChart";
+import {
+  TradingViewChart,
+  type ChartTypeOption,
+  type IndicatorOption,
+  type PriceLineOption,
+} from "@/components/TradingViewChart";
 import { useColorScheme } from "@/components/useColorScheme";
 import Colors from "@/constants/Colors";
 import {
@@ -92,10 +100,25 @@ const CHART_INTERVALS: OhlcvInterval[] = [
   "1d",
   "1w",
 ];
-/** Candles shown in chart (smaller = smoother pan). */
+/** Candles shown in line chart (smaller = smoother pan). */
 const CHART_DISPLAY_LIMIT = 100;
 /** Candles fetched on load/poll (buffer for swipes without data lag). */
 const CHART_FETCH_LIMIT = 200;
+/** Trading view chart: more candles, fixed height. */
+const TV_CHART_DISPLAY_LIMIT = 300;
+const TV_CHART_FETCH_LIMIT = 600;
+const TV_CHART_HEIGHT = Math.min(Dimensions.get("window").height * 0.4, 320);
+
+const INDICATOR_PRESETS: {
+  key: string;
+  label: string;
+  ind: IndicatorOption;
+}[] = [
+  { key: "ma9", label: "MA 9", ind: { type: "MA", period: 9 } },
+  { key: "ma20", label: "MA 20", ind: { type: "MA", period: 20 } },
+  { key: "ema9", label: "EMA 9", ind: { type: "EMA", period: 9 } },
+  { key: "ema20", label: "EMA 20", ind: { type: "EMA", period: 20 } },
+];
 
 function poolLabel(info: MarginManagerInfo): string {
   return `${info.base_asset_symbol}/${info.quote_asset_symbol}`;
@@ -627,6 +650,17 @@ export default function PairDetailScreen() {
   }, [livePrice]);
 
   const [chartInterval, setChartInterval] = useState<OhlcvInterval>("1m");
+  const [chartViewMode, setChartViewMode] = useState<"line" | "tradingview">(
+    "line"
+  );
+  const [chartTypeTv, setChartTypeTv] = useState<ChartTypeOption>("candle");
+  const [showVolumeTv, setShowVolumeTv] = useState(true);
+  const [indicatorsTv, setIndicatorsTv] = useState<IndicatorOption[]>([]);
+  const [priceLinesTv, setPriceLinesTv] = useState<PriceLineOption[]>([]);
+  const [indicatorsModalVisible, setIndicatorsModalVisible] = useState(false);
+  const [drawModalVisible, setDrawModalVisible] = useState(false);
+  const [newLinePrice, setNewLinePrice] = useState("");
+
   const {
     candles,
     allCandles,
@@ -645,6 +679,19 @@ export default function PairDetailScreen() {
     refreshIntervalMs: 10_000, // OHLC every 10s; price (ticker) stays 5s via TickerProvider
   });
 
+  const {
+    candles: candlesTv,
+    allCandles: allCandlesTv,
+    loading: ohlcvLoadingTv,
+    error: ohlcvErrorTv,
+    loadOlder: loadOlderTv,
+  } = useOhlcv(decodedPoolName, {
+    interval: chartInterval,
+    displayLimit: TV_CHART_DISPLAY_LIMIT,
+    fetchLimit: TV_CHART_FETCH_LIMIT,
+    refreshIntervalMs: 10_000,
+  });
+
   useEffect(() => {
     if (__DEV__ && decodedPoolName) {
       debugFetchOhlcv(decodedPoolName, { interval: "1m", limit: 10 }).catch(
@@ -652,6 +699,43 @@ export default function PairDetailScreen() {
       );
     }
   }, [decodedPoolName]);
+
+  const toggleIndicatorTv = useCallback(
+    (preset: (typeof INDICATOR_PRESETS)[0]) => {
+      setIndicatorsTv((prev) => {
+        const has = prev.some(
+          (i) => i.type === preset.ind.type && i.period === preset.ind.period
+        );
+        if (has)
+          return prev.filter(
+            (i) =>
+              !(i.type === preset.ind.type && i.period === preset.ind.period)
+          );
+        return [...prev, preset.ind];
+      });
+    },
+    []
+  );
+  const hasIndicatorTv = useCallback(
+    (preset: (typeof INDICATOR_PRESETS)[0]) =>
+      indicatorsTv.some(
+        (i) => i.type === preset.ind.type && i.period === preset.ind.period
+      ),
+    [indicatorsTv]
+  );
+  const addPriceLineTv = useCallback(() => {
+    const p = parseFloat(newLinePrice.trim());
+    if (Number.isFinite(p)) {
+      setPriceLinesTv((prev) => [
+        ...prev,
+        { id: `line-${Date.now()}`, price: p, color: "#94a3b8" },
+      ]);
+      setNewLinePrice("");
+    }
+  }, [newLinePrice]);
+  const removePriceLineTv = useCallback((id: string) => {
+    setPriceLinesTv((prev) => prev.filter((l) => l.id !== id));
+  }, []);
 
   const { pools } = useMarginManagersInfo();
 
@@ -2792,13 +2876,6 @@ export default function PairDetailScreen() {
     : "—";
 
   const navigation = useNavigation();
-  const onOpenFullChart = useCallback(() => {
-    if (!decodedPoolName) return;
-    router.push({
-      pathname: "/trading/chart/[poolName]",
-      params: { poolName: decodedPoolName, interval: chartInterval },
-    });
-  }, [decodedPoolName, chartInterval]);
 
   // Switch network → show list (don’t keep a pool open across networks).
   useEffect(() => {
@@ -2899,62 +2976,236 @@ export default function PairDetailScreen() {
         <View style={styles.card}>
           <View style={styles.chartHeaderRow}>
             <Text style={styles.cardLabel}>Chart</Text>
-            <View style={styles.chartHeaderButtons}>
+            <View style={styles.chartSegmentRow}>
               <Pressable
-                onPress={onOpenFullChart}
-                style={({ pressed }) => [
-                  styles.enlargeHeaderButton,
-                  { opacity: pressed ? 0.8 : 1 },
+                onPress={() => setChartViewMode("line")}
+                style={[
+                  styles.chartSegmentButton,
+                  chartViewMode === "line" && {
+                    backgroundColor: colors.tint,
+                  },
                 ]}
               >
-                <Text style={styles.enlargeHeaderIcon}>⤢</Text>
+                <Text
+                  style={[
+                    styles.chartSegmentButtonText,
+                    {
+                      color:
+                        chartViewMode === "line"
+                          ? colors.background
+                          : colors.text,
+                    },
+                  ]}
+                >
+                  Line
+                </Text>
+              </Pressable>
+              <Pressable
+                onPress={() => setChartViewMode("tradingview")}
+                style={[
+                  styles.chartSegmentButton,
+                  chartViewMode === "tradingview" && {
+                    backgroundColor: colors.tint,
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.chartSegmentButtonText,
+                    {
+                      color:
+                        chartViewMode === "tradingview"
+                          ? colors.background
+                          : colors.text,
+                    },
+                  ]}
+                >
+                  Trading view
+                </Text>
               </Pressable>
             </View>
           </View>
-          <View
-            style={[styles.intervalRow, { borderColor: colors.tabIconDefault }]}
-          >
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              {CHART_INTERVALS.map((int) => (
-                <Pressable
-                  key={int}
-                  onPress={() => setChartInterval(int)}
-                  style={[
-                    styles.intervalButton,
-                    chartInterval === int && { backgroundColor: colors.tint },
-                  ]}
+
+          {chartViewMode === "line" ? (
+            <>
+              <View
+                style={[
+                  styles.intervalRow,
+                  { borderColor: colors.tabIconDefault },
+                ]}
+              >
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                >
+                  {CHART_INTERVALS.map((int) => (
+                    <Pressable
+                      key={int}
+                      onPress={() => setChartInterval(int)}
+                      style={[
+                        styles.intervalButton,
+                        chartInterval === int && {
+                          backgroundColor: colors.tint,
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.intervalButtonText,
+                          {
+                            color:
+                              chartInterval === int
+                                ? colors.background
+                                : colors.text,
+                          },
+                        ]}
+                      >
+                        {int.toUpperCase()}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              </View>
+              <PriceChart
+                candles={candles}
+                interval={chartInterval}
+                loading={ohlcvLoading}
+                loadingOlder={ohlcvLoadingOlder}
+                error={ohlcvError}
+                candleLimit={CHART_DISPLAY_LIMIT}
+                canGoToLatest={canPanRight}
+                onGoToLatest={panToLatest}
+                totalCandles={allCandles.length}
+                windowStart={windowStart}
+                onScrollbarChange={setWindowStartClamped}
+                onReachedStart={ohlcvLoadOlder}
+              />
+            </>
+          ) : (
+            <>
+              <View
+                style={[
+                  styles.tvToolbar,
+                  { borderColor: colors.tabIconDefault },
+                ]}
+              >
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  style={styles.tvToolbarScroll}
                 >
                   <Text
                     style={[
-                      styles.intervalButtonText,
-                      {
-                        color:
-                          chartInterval === int
-                            ? colors.background
-                            : colors.text,
-                      },
+                      styles.tvToolbarInterval,
+                      { color: colors.text },
                     ]}
                   >
-                    {int.toUpperCase()}
+                    {chartInterval.toUpperCase()}
                   </Text>
-                </Pressable>
-              ))}
-            </ScrollView>
-          </View>
-          <PriceChart
-            candles={candles}
-            interval={chartInterval}
-            loading={ohlcvLoading}
-            loadingOlder={ohlcvLoadingOlder}
-            error={ohlcvError}
-            candleLimit={CHART_DISPLAY_LIMIT}
-            canGoToLatest={canPanRight}
-            onGoToLatest={panToLatest}
-            totalCandles={allCandles.length}
-            windowStart={windowStart}
-            onScrollbarChange={setWindowStartClamped}
-            onReachedStart={ohlcvLoadOlder}
-          />
+                  <View style={styles.tvToolbarDivider} />
+                  <Pressable
+                    onPress={() =>
+                      setChartTypeTv((t) =>
+                        t === "candle" ? "line" : "candle"
+                      )
+                    }
+                    style={styles.tvToolbarButton}
+                  >
+                    <Text
+                      style={[
+                        styles.tvToolbarButtonText,
+                        { color: colors.text },
+                      ]}
+                    >
+                      {chartTypeTv === "candle" ? "Candle" : "Line"}
+                    </Text>
+                  </Pressable>
+                  <View style={styles.tvToolbarDivider} />
+                  <Pressable
+                    onPress={() => setIndicatorsModalVisible(true)}
+                    style={styles.tvToolbarButton}
+                  >
+                    <Text
+                      style={[
+                        styles.tvToolbarButtonText,
+                        { color: colors.text },
+                      ]}
+                    >
+                      fₓ Indicators
+                    </Text>
+                  </Pressable>
+                  <View style={styles.tvToolbarDivider} />
+                  <Pressable
+                    onPress={() => setDrawModalVisible(true)}
+                    style={styles.tvToolbarButton}
+                  >
+                    <Text
+                      style={[
+                        styles.tvToolbarButtonText,
+                        { color: colors.text },
+                      ]}
+                    >
+                      ✎ Draw
+                    </Text>
+                  </Pressable>
+                </ScrollView>
+              </View>
+              <View
+                style={[
+                  styles.intervalRow,
+                  { borderColor: colors.tabIconDefault },
+                ]}
+              >
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                >
+                  {CHART_INTERVALS.map((int) => (
+                    <Pressable
+                      key={int}
+                      onPress={() => setChartInterval(int)}
+                      style={[
+                        styles.intervalButton,
+                        chartInterval === int && {
+                          backgroundColor: colors.tint,
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.intervalButtonText,
+                          {
+                            color:
+                              chartInterval === int
+                                ? colors.background
+                                : colors.text,
+                          },
+                        ]}
+                      >
+                        {int.toUpperCase()}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              </View>
+              <View style={styles.tvChartWrap}>
+                <TradingViewChart
+                  candles={
+                    allCandlesTv.length ? allCandlesTv : candlesTv
+                  }
+                  width={Math.round(Dimensions.get("window").width - 32)}
+                  height={TV_CHART_HEIGHT}
+                  loading={ohlcvLoadingTv}
+                  error={ohlcvErrorTv}
+                  chartType={chartTypeTv}
+                  indicators={indicatorsTv}
+                  showVolume={showVolumeTv}
+                  priceLines={priceLinesTv}
+                  onRequestOlderData={loadOlderTv}
+                />
+              </View>
+            </>
+          )}
         </View>
 
         {!suiAddress && (
@@ -5023,6 +5274,190 @@ export default function PairDetailScreen() {
 
       </ScrollView>
 
+      <Modal
+        visible={indicatorsModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setIndicatorsModalVisible(false)}
+      >
+        <Pressable
+          style={styles.chartModalOverlay}
+          onPress={() => setIndicatorsModalVisible(false)}
+        >
+          <Pressable
+            style={[
+              styles.chartModalContent,
+              { backgroundColor: colors.background },
+            ]}
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View style={styles.chartModalHeader}>
+              <Text style={[styles.chartModalTitle, { color: colors.text }]}>
+                Indicators
+              </Text>
+              <Pressable onPress={() => setIndicatorsModalVisible(false)}>
+                <Text style={[styles.chartModalClose, { color: colors.tint }]}>
+                  Done
+                </Text>
+              </Pressable>
+            </View>
+            <View style={styles.chartIndicatorRow}>
+              <Text style={[styles.chartIndicatorLabel, { color: colors.text }]}>
+                Volume
+              </Text>
+              <Pressable
+                onPress={() => setShowVolumeTv((v) => !v)}
+                style={[
+                  styles.chartToggle,
+                  showVolumeTv && { backgroundColor: colors.tint },
+                ]}
+              >
+                <View
+                  style={[
+                    styles.chartToggleThumb,
+                    showVolumeTv && styles.chartToggleThumbOn,
+                    { backgroundColor: colors.background },
+                  ]}
+                />
+              </Pressable>
+            </View>
+            {INDICATOR_PRESETS.map((preset) => (
+              <Pressable
+                key={preset.key}
+                onPress={() => toggleIndicatorTv(preset)}
+                style={[
+                  styles.chartIndicatorRow,
+                  hasIndicatorTv(preset) && {
+                    backgroundColor: colors.tint + "20",
+                  },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.chartIndicatorLabel,
+                    { color: colors.text },
+                  ]}
+                >
+                  {preset.label}
+                </Text>
+                <View
+                  style={[
+                    styles.chartCheckbox,
+                    hasIndicatorTv(preset) && { backgroundColor: colors.tint },
+                  ]}
+                >
+                  {hasIndicatorTv(preset) && (
+                    <Text style={styles.chartCheckmark}>✓</Text>
+                  )}
+                </View>
+              </Pressable>
+            ))}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={drawModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setDrawModalVisible(false)}
+      >
+        <Pressable
+          style={styles.chartModalOverlay}
+          onPress={() => setDrawModalVisible(false)}
+        >
+          <Pressable
+            style={[
+              styles.chartModalContent,
+              { backgroundColor: colors.background },
+            ]}
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View style={styles.chartModalHeader}>
+              <Text style={[styles.chartModalTitle, { color: colors.text }]}>
+                Draw lines
+              </Text>
+              <Pressable onPress={() => setDrawModalVisible(false)}>
+                <Text style={[styles.chartModalClose, { color: colors.tint }]}>
+                  Done
+                </Text>
+              </Pressable>
+            </View>
+            <Text style={[styles.chartDrawLabel, { color: colors.text }]}>
+              Horizontal price line
+            </Text>
+            <View style={styles.chartDrawRow}>
+              <TextInput
+                style={[
+                  styles.chartDrawInput,
+                  {
+                    color: colors.text,
+                    borderColor: colors.tabIconDefault,
+                  },
+                ]}
+                placeholder="Price"
+                placeholderTextColor={colors.tabIconDefault}
+                value={newLinePrice}
+                onChangeText={setNewLinePrice}
+                keyboardType="decimal-pad"
+              />
+              <Pressable
+                onPress={addPriceLineTv}
+                style={[
+                  styles.chartDrawAddButton,
+                  { backgroundColor: colors.tint },
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.chartDrawAddText,
+                    { color: colors.background },
+                  ]}
+                >
+                  Add
+                </Text>
+              </Pressable>
+            </View>
+            {priceLinesTv.length > 0 && (
+              <View style={styles.chartLineList}>
+                <Text
+                  style={[styles.chartLineListTitle, { color: colors.text }]}
+                >
+                  Lines
+                </Text>
+                {priceLinesTv.map((line) => (
+                  <View
+                    key={line.id}
+                    style={[
+                      styles.chartLineItem,
+                      { borderColor: colors.tabIconDefault },
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.chartLineItemPrice,
+                        { color: colors.text },
+                      ]}
+                    >
+                      {line.price.toLocaleString(undefined, {
+                        minimumFractionDigits: 2,
+                        maximumFractionDigits: 6,
+                      })}
+                    </Text>
+                    <Pressable
+                      onPress={() => removePriceLineTv(line.id)}
+                      hitSlop={8}
+                    >
+                      <Text style={styles.chartLineItemRemove}>Remove</Text>
+                    </Pressable>
+                  </View>
+                ))}
+              </View>
+            )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       {/* Always-mounted overlay so opening/closing never adds/removes nodes and the chart keeps its gradient. */}
       <View
         style={[
@@ -5549,9 +5984,21 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: 4,
+    marginBottom: 8,
   },
-  chartHeaderButtons: { flexDirection: "row", gap: 8 },
+  chartSegmentRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(128,128,128,0.2)",
+    borderRadius: 10,
+    padding: 3,
+  },
+  chartSegmentButton: {
+    paddingVertical: 6,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+  },
+  chartSegmentButtonText: { fontSize: 13, fontWeight: "600" },
   intervalRow: { flexDirection: "row", marginBottom: 12, paddingVertical: 4 },
   intervalButton: {
     paddingVertical: 8,
@@ -5562,20 +6009,111 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   intervalButtonText: { fontSize: 12, fontWeight: "600" },
-  enlargeHeaderButton: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.18)",
+  tvToolbar: {
+    flexDirection: "row",
+    alignItems: "center",
+    borderBottomWidth: 1,
+    paddingVertical: 10,
+    marginBottom: 10,
+  },
+  tvToolbarScroll: { flexGrow: 0 },
+  tvToolbarInterval: { fontSize: 13, fontWeight: "600", marginRight: 8 },
+  tvToolbarDivider: {
+    width: 1,
+    height: 16,
+    backgroundColor: "rgba(128,128,128,0.4)",
+    marginHorizontal: 8,
+  },
+  tvToolbarButton: { paddingVertical: 4, paddingHorizontal: 6, marginRight: 4 },
+  tvToolbarButtonText: { fontSize: 13, fontWeight: "600" },
+  tvChartWrap: {
+    marginHorizontal: -20,
+    paddingVertical: 12,
+    paddingHorizontal: 0,
+    borderWidth: 0,
+  },
+  chartModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.5)",
+    justifyContent: "flex-end",
+  },
+  chartModalContent: {
+    borderTopLeftRadius: 16,
+    borderTopRightRadius: 16,
+    padding: 20,
+    paddingBottom: 40,
+  },
+  chartModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 20,
+  },
+  chartModalTitle: { fontSize: 18, fontWeight: "700" },
+  chartModalClose: { fontSize: 16, fontWeight: "600" },
+  chartIndicatorRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 14,
+    paddingHorizontal: 4,
+    borderRadius: 8,
+    marginBottom: 4,
+  },
+  chartIndicatorLabel: { fontSize: 16, fontWeight: "500" },
+  chartToggle: {
+    width: 48,
+    height: 28,
+    borderRadius: 14,
+    padding: 2,
+    justifyContent: "center",
+    backgroundColor: "rgba(128,128,128,0.3)",
+  },
+  chartToggleThumb: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignSelf: "flex-start",
+  },
+  chartToggleThumbOn: { alignSelf: "flex-end" },
+  chartCheckbox: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: "rgba(128,128,128,0.5)",
     alignItems: "center",
     justifyContent: "center",
   },
-  enlargeHeaderIcon: {
-    fontSize: 14,
-    fontWeight: "700",
-    color: "#f9fafb",
+  chartCheckmark: { color: "#fff", fontWeight: "bold", fontSize: 14 },
+  chartDrawLabel: { fontSize: 14, fontWeight: "600", marginBottom: 8 },
+  chartDrawRow: { flexDirection: "row", gap: 12, marginBottom: 20 },
+  chartDrawInput: {
+    flex: 1,
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
   },
+  chartDrawAddButton: {
+    paddingHorizontal: 20,
+    borderRadius: 8,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  chartDrawAddText: { fontSize: 16, fontWeight: "600" },
+  chartLineList: { marginTop: 8 },
+  chartLineListTitle: { fontSize: 14, fontWeight: "600", marginBottom: 8 },
+  chartLineItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+  },
+  chartLineItemPrice: { fontSize: 16, fontWeight: "500" },
+  chartLineItemRemove: { fontSize: 14, color: "#ef4444", fontWeight: "600" },
   row: {
     flexDirection: "row",
     justifyContent: "space-between",

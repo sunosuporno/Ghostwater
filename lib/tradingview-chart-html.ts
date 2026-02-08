@@ -64,23 +64,25 @@ export function getTradingViewChartHtml(w: number, h: number): string {
         return out;
       }
 
+      var INDICATOR_COLORS = ['#818cf8', '#22c55e', '#f59e0b', '#06b6d4'];
       function applyIndicators(candles) {
         if (!candles || !candles.length || !chart) return;
         var data = candles.map(function(c) { return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }; });
-        indicators.forEach(function(ind) {
+        indicators.forEach(function(ind, idx) {
           var key = ind.type + (ind.period || '');
           if (indicatorSeries[key]) {
             try { chart.removeSeries(indicatorSeries[key]); } catch (e) {}
             indicatorSeries[key] = null;
           }
+          var color = INDICATOR_COLORS[idx % INDICATOR_COLORS.length];
           if (ind.type === 'MA' && ind.period) {
             var maData = ma(data, ind.period);
-            var s = chart.addLineSeries({ color: '#818cf8', lineWidth: 2 });
+            var s = chart.addLineSeries({ color: color, lineWidth: 2 });
             s.setData(maData);
             indicatorSeries[key] = s;
           } else if (ind.type === 'EMA' && ind.period) {
             var emaData = ema(data, ind.period);
-            var s = chart.addLineSeries({ color: '#f59e0b', lineWidth: 2 });
+            var s = chart.addLineSeries({ color: color, lineWidth: 2 });
             s.setData(emaData);
             indicatorSeries[key] = s;
           }
@@ -146,8 +148,22 @@ export function getTradingViewChartHtml(w: number, h: number): string {
           });
         }
 
+        var olderDataRequestThrottle = 0;
+        function maybeRequestOlderData() {
+          if (!chart || !currentCandles.length || !window.ReactNativeWebView) return;
+          var range = chart.timeScale().getVisibleLogicalRange();
+          if (!range || range.from == null) return;
+          if (range.from > 5) return;
+          var now = Date.now();
+          if (now - olderDataRequestThrottle < 2000) return;
+          olderDataRequestThrottle = now;
+          window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'requestOlderData' }));
+        }
+
+        var hasFitContentOnce = false;
         window.updateChart = function(candles) {
           if (!candles || !candles.length) return;
+          var isFirstLoad = currentCandles.length === 0;
           currentCandles = candles;
           try {
             candlestickSeries.setData(candles);
@@ -164,12 +180,24 @@ export function getTradingViewChartHtml(w: number, h: number): string {
               });
               volumeSeries.setData(volData);
             }
-            chart.timeScale().fitContent();
+            if (isFirstLoad && !hasFitContentOnce) {
+              chart.timeScale().fitContent();
+              hasFitContentOnce = true;
+            }
             applyIndicators(candles);
           } catch (e) {
             if (window.ReactNativeWebView) window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'error', message: String(e && e.message) }));
           }
         };
+
+        function subscribeVisibleRange() {
+          if (!chart || typeof chart.timeScale !== 'function') return;
+          try {
+            chart.timeScale().subscribeVisibleLogicalRangeChange(function(range) {
+              maybeRequestOlderData();
+            });
+          } catch (e) {}
+        }
 
         window.setChartType = function(type) {
           chartType = type === 'line' ? 'line' : 'candle';
@@ -241,6 +269,7 @@ export function getTradingViewChartHtml(w: number, h: number): string {
           window.updateChart(window.__chartCandles);
           window.__chartCandles = null;
         }
+        subscribeVisibleRange();
         if (window.ReactNativeWebView) {
           window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'chartReady' }));
         }

@@ -23,6 +23,8 @@ interface TradingViewChartProps {
   indicators?: IndicatorOption[];
   showVolume?: boolean;
   priceLines?: PriceLineOption[];
+  /** Called when user pans to the left edge of the chart (request older data). */
+  onRequestOlderData?: () => void;
 }
 
 /** Convert indexer format to Lightweight Charts format (time in seconds, chronological order). Includes volume for histogram. */
@@ -62,6 +64,7 @@ export function TradingViewChart({
   indicators = [],
   showVolume = true,
   priceLines = [],
+  onRequestOlderData,
 }: TradingViewChartProps) {
   const webRef = useRef<WebView>(null);
   const [chartReady, setChartReady] = useState(false);
@@ -139,15 +142,19 @@ export function TradingViewChart({
     );
   }, [chartReady, priceLines]);
 
-  const onMessage = useCallback((event: { nativeEvent: { data: string } }) => {
-    try {
-      const msg = JSON.parse(event.nativeEvent.data);
-      if (msg.type === "chartReady") setChartReady(true);
-      if (msg.type === "error") setChartError(msg.message ?? "Chart error");
-    } catch {
-      // ignore
-    }
-  }, []);
+  const onMessage = useCallback(
+    (event: { nativeEvent: { data: string } }) => {
+      try {
+        const msg = JSON.parse(event.nativeEvent.data);
+        if (msg.type === "chartReady") setChartReady(true);
+        if (msg.type === "error") setChartError(msg.message ?? "Chart error");
+        if (msg.type === "requestOlderData" && onRequestOlderData) onRequestOlderData();
+      } catch {
+        // ignore
+      }
+    },
+    [onRequestOlderData]
+  );
 
   if (error || chartError) {
     return (

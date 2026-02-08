@@ -20,6 +20,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 const FULL_CHART_INTERVALS: OhlcvInterval[] = [
   "1m",
@@ -71,6 +72,7 @@ export default function FullScreenChartScreen() {
 
   const colorScheme = useColorScheme();
   const colors = Colors[colorScheme ?? "light"];
+  const insets = useSafeAreaInsets();
 
   const { ticker } = useTicker(PRICE_POLL_MS);
   const livePrice = decodedPoolName
@@ -153,11 +155,16 @@ export default function FullScreenChartScreen() {
     );
   }
 
+  const topPadding = insets.top + 24;
+
   return (
     <>
       <ScrollView
         style={styles.scroll}
-        contentContainerStyle={styles.container}
+        contentContainerStyle={[
+          styles.container,
+          { paddingTop: topPadding },
+        ]}
         showsVerticalScrollIndicator={false}
       >
         <View style={styles.headerRow}>
@@ -430,7 +437,11 @@ export default function FullScreenChartScreen() {
 
 const styles = StyleSheet.create({
   scroll: { flex: 1 },
-  container: { flexGrow: 1, padding: 16, paddingBottom: 32 },
+  container: {
+    flexGrow: 1,
+    paddingHorizontal: 16,
+    paddingBottom: 32,
+  },
   centered: {
     flex: 1,
     alignItems: "center",
@@ -441,9 +452,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    marginBottom: 12,
+    marginBottom: 20,
   },
-  pairName: { fontSize: 22, fontWeight: "700", marginBottom: 2 },
+  pairName: { fontSize: 22, fontWeight: "700", marginBottom: 4 },
   priceBox: { alignItems: "flex-end" },
   priceValue: { fontSize: 20, fontWeight: "600" },
   muted: { fontSize: 12, opacity: 0.7 },
@@ -451,8 +462,8 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     borderBottomWidth: 1,
-    paddingVertical: 10,
-    marginBottom: 12,
+    paddingVertical: 12,
+    marginBottom: 16,
   },
   toolbarScroll: { flexGrow: 0 },
   toolbarInterval: { fontSize: 13, fontWeight: "600", marginRight: 8 },
@@ -466,8 +477,8 @@ const styles = StyleSheet.create({
   toolbarButtonText: { fontSize: 13, fontWeight: "600" },
   intervalRow: {
     flexDirection: "row",
-    marginBottom: 12,
-    paddingVertical: 6,
+    marginBottom: 16,
+    paddingVertical: 8,
   },
   intervalButton: {
     paddingVertical: 8,
